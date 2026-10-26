@@ -675,7 +675,10 @@ for (int zi = 0; zi < nz; zi++) {
 }
 FvRepresentation fvRep = (FvRepresentation) sim.getRepresentationManager().getObject("Volume Mesh");
 sim.println("CELLS\t" + fvRep.getCellCount());
-// partes de cara de conexión que quedaron como pared: su área frente a la de la interfaz hermana (>2 % = pedir re-export en Flow domain)
+// cara de conexion que quedo como pared tras crear la interfaz: solo cuenta el area NO emparejada. Se compara la frontera Wall
+// (Inflow/Outflow) con las Internal Interface Boundary hermanas (<nombre> [int_...]). Si la interfaz no devuelve area (SumReport
+// sobre una frontera interna da 0: asi dio el falso positivo de BombaRapida, 6 caras al 100 %) NO se avisa: no hay con que comparar,
+// y el balance de masa tras iterar (BALANCE_MASA, > 0,5 % = revisar interfaces) lo cubre.
 try {
   FieldFunction areaMag = sim.getFieldFunctionManager().getFunction("Area").getMagnitudeFunction();
   for (Region rg : rgm.getRegions()) for (Boundary bd : rg.getBoundaryManager().getBoundaries()) {
@@ -683,10 +686,13 @@ try {
     if (bn.indexOf('[') >= 0 || !(bd.getBoundaryType() instanceof WallBoundary) || !(bn.equals("Inflow") || bn.equals("Outflow"))) continue;
     double aPared = 0, aInt = 0;
     SumReport ar0 = repMgr.createReport(SumReport.class); ar0.setFieldFunction(areaMag); ar0.getParts().setObjects(bd); aPared = ar0.getReportMonitorValue(); repMgr.removeObjects(ar0);
-    for (Boundary b2 : rg.getBoundaryManager().getBoundaries()) if (b2.getPresentationName().startsWith(bn + " [")) {
+    for (Boundary b2 : rg.getBoundaryManager().getBoundaries()) if (b2 instanceof DirectBoundaryInterfaceBoundary && b2.getPresentationName().startsWith(bn + " [")) {
       SumReport ar1 = repMgr.createReport(SumReport.class); ar1.setFieldFunction(areaMag); ar1.getParts().setObjects(b2); aInt += ar1.getReportMonitorValue(); repMgr.removeObjects(ar1); }
-    sim.println("PARED_CONEXION\t" + rg.getPresentationName() + "/" + bn + "\t" + aPared * 1e6 + " mm2\t" + (aInt > 0 ? 100 * aPared / (aPared + aInt) : 100.0) + " % de la cara");
-    if (aInt <= 0 || aPared > 0.02 * (aPared + aInt)) sim.println("AVISO\tinterfaz mal emparejada en " + rg.getPresentationName() + "/" + bn + ": exportar de nuevo desde CFturbo en Flow domain");
+    String rn = rg.getPresentationName() + "/" + bn;
+    if (!(aInt > 0)) { sim.println("PARED_CONEXION\t" + rn + "\tno medible (la interfaz no devuelve area): se confia en BALANCE_MASA"); continue; }
+    double pct = 100 * aPared / (aPared + aInt);
+    sim.println("PARED_CONEXION\t" + rn + "\t" + aPared * 1e6 + " mm2 sin emparejar\t" + pct + " % de la cara");
+    if (pct > 2.0) sim.println("AVISO\tinterfaz mal emparejada en " + rn + " (" + pct + " % de pared): exportar de nuevo desde CFturbo en Flow domain");
   }
 } catch (Exception ex) { sim.println("WARN\tno pude medir las paredes de conexión: " + ex); }
 @@PIPE:malla@@

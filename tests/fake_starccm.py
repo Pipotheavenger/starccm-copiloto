@@ -16,7 +16,8 @@ Imita lo justo del CLI real:
                                     cada 0,3 s. Termina con <base>/inbox/STOP. Simulaciones por texto de la macro:
                                     AGENT_FAKE_COMPILE_ERROR (error de compilación, sin AGENT_BEGIN), AGENT_FAKE_HANG
                                     (se cuelga sin resultado), AGENT_FAKE_DIE (el residente muere). Por entorno
-                                    FAKE_RESIDENT_MODE: broken (sale al arrancar) | silent (vive pero no late).
+                                    FAKE_RESIDENT_MODE: broken (sale al arrancar) | silent (vive pero no late). FAKE_RESIDENT_DELAY=<s>: tarda esos
+                    segundos en dar el primer latido.
 Entiende además los marcadores de run_steps (STEP_BEGIN/OK/ERROR/END/SKIPPED, `_stop = true;`) y simula iterate:
 `.step(N)` avanza una iteración falsa, el plot Residuals se exporta a CSV y cada Report imprime su valor. La
 curva sale de la escena que dice el archivo $FAKE_SCEN_FILE: stable | plateau | drift (cambiar de escena
@@ -44,8 +45,15 @@ def main(argv):
         srv.bind(("127.0.0.1", port))
         srv.listen(5)
         print(f"Simcenter STAR-CCM+ FAKE server\nServer::start -host localhost:{port}", flush=True)
+        srv.settimeout(5)
+        t_end = time.time() + 900  # si un selftest muere sin limpiar (los procesos salen del árbol de la CLI), no queda para siempre
         while True:
-            conn, _ = srv.accept()
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                if time.time() > t_end:
+                    return 0
+                continue
             conn.settimeout(5)
             data = b""
             try:
@@ -118,6 +126,7 @@ def resident(host, port, text):
         print("fake residente roto: no arranca", flush=True)
         return 1
     base = re.search(r'new File\("([^"]+)"\)', text).group(1)
+    time.sleep(float(os.environ.get("FAKE_RESIDENT_DELAY", "0") or 0))  # arranque lento: server_start no debe esperarlo
     inbox, out, hb = os.path.join(base, "inbox"), os.path.join(base, "out"), os.path.join(base, "heartbeat")
     run = [True]
 
@@ -128,7 +137,8 @@ def resident(host, port, text):
             time.sleep(0.3)
     threading.Thread(target=beat, daemon=True).start()
     print("RESIDENTE listo", flush=True)
-    while True:
+    t_end = time.time() + 900  # tope por si un selftest muere sin limpiar
+    while time.time() < t_end:
         if os.path.exists(os.path.join(inbox, "STOP")):
             break
         for name in sorted(n for n in os.listdir(inbox) if n.endswith(".java")):

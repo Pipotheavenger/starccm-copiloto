@@ -1,260 +1,96 @@
-# starccm-copiloto — agente que opera Simcenter STAR-CCM+ para turbomáquinas
+# starccm-copiloto — agente que opera STAR-CCM+ para turbomáquinas
 
-Claude es el ingeniero que opera STAR-CCM+; STAR-CCM+ es el solver. Claude nunca resuelve física a mano.
-Diseño y piezas: [ARQUITECTURA.md](ARQUITECTURA.md) (manda). Todo lo heredado del agente anterior vive en
-`conocimiento/` (mapa en [conocimiento/INDICE.md](conocimiento/INDICE.md)); las lecciones del remoto retirado y de
-la interfaz web antigua (`ui/`, puerto 8767) quedan solo en [conocimiento/CLAUDE_agente_anterior.md](conocimiento/CLAUDE_agente_anterior.md).
+Claude es el ingeniero que opera STAR-CCM+; STAR-CCM+ es el solver. Claude nunca resuelve física a mano. Diseño:
+[ARQUITECTURA.md](ARQUITECTURA.md). Detalle y lecciones completas: [conocimiento/lecciones.md](conocimiento/lecciones.md)
+(leer solo la sección que haga falta). Recetas y casos: [conocimiento/INDICE.md](conocimiento/INDICE.md).
 
 ## Velocidad (leer primero)
 
-Objetivo: que todo funcione lo más rápido posible sin depender de los núcleos del solver. Medido el 2026-10-26 con la
-misma bomba: corrida improvisada **45 min** frente a **3 min 45 s** con el guion fijo de BombaRapida (12×). El 65 % de los
-45 min (≈ 29 min) fue la IA pensando entre macros: física configurada 3 veces, 11 macros para los reportes de Euler, 6
-escenas una por una y un criterio de residual < 1e-4 que no se alcanza aunque H y M estén estables desde la iteración 100.
+Medido: corrida improvisada 45 min frente a **3 min 14 s** con el guion fijo (BombaRapida, prueba real 2026-10-26). El 65 % de
+los 45 min fue la IA pensando entre macros.
 
-| # | regla | cifra que la respalda |
-|---|---|---|
-| 1 | **Pipeline primero.** Bomba de CFturbo: `pump_case(case, cad_dir, params={"iterar": true, "post": true})` va de importar a resultados, PNG y validación de Euler en UNA inyección | BombaRapida 3 min 45 s con 300 it; con parada estable (~200 it) ≈ 3 min (estimado, sin correr) |
-| 2 | **`run_steps` agrupa; nunca una macro por escena ni por reporte.** Varios pasos, una llamada (recetas de caso: `conocimiento/plantillas_casos.md`) | 11 macros de Euler = 11 turnos de IA + 95 s de arranque batch; la misma lógica va en el pipeline |
-| 3 | **`iterate(until="stable")`** (o `iterar` del pipeline / receta `iterar-hasta-estable`): para cuando H y M varían < 0,5 % en 100 it; **máximo 1000** (no 2000) | BombaPruebaNR: H 14,145 → 14,082 entre it 100 y 200 (0,45 %), corrió 700 it (430 s) sin cambiar nada |
-| 4 | **El residual < 1e-4 NO es condición de parada**: se reporta (`RESIDUAL`) y la meseta sale como aviso. Frozen rotor se queda en ~1e-2 | BombaPruebaNR: plateau 3e-2 con H y M estables; BombaRapida: H a 0,5 % en it 100 |
-| 5 | **No reconfigurar física ni fronteras ya creadas**: `inspect` una vez antes de tocar; reusar continuo, parámetro `Flujo` y reportes | física configurada 3 veces en la corrida de 45 min |
-| 6 | **Preguntar una sola vez**, todas las dudas juntas con opciones y la cifra de coste; lo demás se decide con los defaults de este archivo y se dice en una línea | cada ida y vuelta con el usuario son minutos |
-| 7 | **Respuestas cortas**: una tabla de números y qué abrir en la GUI; sin narrar pasos ni repetir lo que la GUI ya muestra | |
-| 8 | **Panel en modo Rápido** (sonnet, esfuerzo bajo; es el defecto) salvo diagnóstico difícil (diverge, interfaces, Euler mal): ahí Preciso | la IA es el 65 % del tiempo |
+1. **Pipeline primero**: bomba de CFturbo → `pump_case(case, cad_dir, params={"iterar": true, "post": true})`: importar → resultados, PNG y Euler en UNA macro.
+2. **`run_steps` agrupa**: nunca una macro por escena ni por reporte (recetas de caso: `conocimiento/plantillas_casos.md`).
+3. **Parada**: H y M varían < 0,5 % en 100 it (comprobado cada 50), máx. 1000. Iterar con `iterar` del pipeline O `iterate(n=1000, until="stable")`, no ambos.
+4. **Residual < 1e-4 NO es condición de parada**: se reporta; frozen rotor se queda en ~1e-2.
+5. **No reconfigurar** física ni fronteras ya creadas: `inspect` una vez.
+6. **Preguntar una sola vez**, dudas juntas, con opciones y cifra de coste; lo demás con los defaults y una línea.
+7. **Respuestas cortas**: tabla de números y qué abrir en la GUI.
+8. Panel en **Rápido** (defecto); **Preciso** solo para diagnóstico difícil (diverge, interfaces, Euler mal).
 
-Dos vías equivalentes para iterar un caso nuevo: `params={"iterar": true}` (dentro de la misma macro, ninguna inyección
-más) o `pump_case(until="stable")` (después, por bloques con `iterate`). Usar una, no las dos.
+Si llega a 1000 it sin estabilizarse o diverge, no darlo por convergido. Una media ≈ 0 (Cl a 0°) no sirve de criterio.
 
-Criterio de parada por defecto, para todo caso: H y M estables (< 0,5 % en 100 iteraciones, comprobado cada 50) y máximo
-1000 iteraciones. Si llega a 1000 sin estabilizarse o diverge, no dar el resultado como convergido. Una magnitud con media
-≈ 0 (p. ej. Cl a 0°) no sirve como criterio: la variación es relativa a la media.
+## Modelo de trabajo
 
-### Lecciones de velocidad
-- **Cliente residente** (`poc_residente/RESULTADO.md`, 2026-10-26, solver real): un solo cliente batch `-noexit` vigila una
-  carpeta y ejecuta cada macro con `StarScript`: **0,7–1 s por macro frente a 8,6 s** (≈ 10×; ~50 macros por caso ≈ 7 min).
-  Es la vía por defecto del MCP (`STARCCM_RESIDENT=1`; cada respuesta trae `via`; cae al cliente batch si falla) y no
-  precompila: un error de compilación vuelve en ~0,6 s. Consecuencia: el coste de una macro ya no es el arranque sino el
-  turno de la IA; seguir agrupando.
-- **Carpetas fuera de OneDrive**: `sims/`, `macros/`, `residente/` y `tiempos.csv` viven en `COPILOTO_WORK` (por defecto
-  `%LOCALAPPDATA%\starccm-copiloto`), no en el repo: OneDrive sincronizaría cada `.sim` de 50–150 MB en cada guardado y
-  bloquea archivos mientras se escriben (lecturas fallidas de `.server.json`). En el repo solo cosas pequeñas:
-  `casos/<caso>/` (CAD, reportes, PNG, RESUMEN.md), recetas, `.server.json`, `.inject.lock`. Todo `.sim` o carpeta de
-  resultados grande se guarda fuera de OneDrive.
-
-## Modelo de trabajo (nuevo)
-
-El usuario trabaja con la **GUI real de STAR-CCM+** conectada al MISMO servidor que el agente, y te habla desde el
-**panel flotante** (`panel/chat_panel.py`). Ve los cambios aparecer en el árbol y en el panel Output como si alguien
-operara la GUI. Reglas:
-
-1. **Un solo solver vivo** (licencia PoD de una copia). Hay uno compartido: `server_status` antes de arrancar nada.
-2. **Regla de turnos**: toda inyección toma el candado `.inject.lock` (pid, herramienta, inicio). Si devuelve
-   `{"ok": false, "busy": …}` otro proceso está trabajando: esperar o avisar, nunca forzar ni matar. Mientras una macro
-   corre el usuario NO toca la GUI; avisarle al empezar algo largo («no toques la GUI hasta que termine»).
-3. **Decir qué abrir en la GUI** después de cada hito, con la ruta del árbol: «abre Scenes › presion_alabes»,
-   «Reports › H», «Plots › Residuals». `scene.open()` en una macro abre la escena en el cliente batch, NO en la GUI.
-4. **`pump_case` primero** para una bomba de CFturbo (importar a malla lista en una macro, ~1 min; con
-   `params={"iterar": true, "post": true}` sigue hasta resultados y PNG). `run_java` solo para lo que el pipeline no
-   cubre; antes `recipe_search` y `plantillas_casos.md`, luego `docs_search`, inventar al final.
-5. **Agrupar con `run_steps`**: cada inyección cuesta 8–10 s de arranque del cliente Java; varios pasos = una macro.
-6. **`iterate(n=1000, until="stable")`**: corre por bloques y para cuando H y M varían < 0,5 % en 100 iteraciones; avisa
-   si los residuales están en meseta y dice el motivo. Máximo 1000 por defecto; el residual < 1e-4 no es condición.
-7. **Preguntar antes de lo caro, una sola vez** (todas las dudas juntas): malla fina (> ~400 k celdas), > 1000
-   iteraciones, curvas de caudales, cambiar de caso con otro .sim cargado, apagar con la GUI conectada. Las cifras de
-   coste van en la pregunta.
-8. **Apagar el solver al terminar** (`server_stop`, guarda). Con GUI conectada el vigilante no apaga: deja
-   `idle_warning` en `.server.json` y el panel pregunta. Nunca matar la GUI; al cerrarla el usuario elige
-   «desconectar», no «terminar servidor». `server_stop` avisa si hay GUI conectada.
-9. Trabajar sobre copias en `sims/` (dentro de `COPILOTO_WORK`, fuera de OneDrive), nunca sobre el .sim original del usuario.
+El usuario mira la **GUI real** conectada al MISMO servidor y te habla desde el **panel** (`panel/chat_panel.py`).
+1. **Un solo solver vivo** (licencia PoD de una copia): `server_status` antes de arrancar.
+2. **Turnos**: toda inyección toma `.inject.lock`. `{"ok": false, "busy": …}` = otro proceso trabaja: esperar o avisar, nunca forzar ni matar. Con una macro larga: «no toques la GUI hasta que termine».
+3. **Decir qué abrir en la GUI** tras cada hito: «Scenes › presion_alabes», «Reports › H», «Plots › Residuals».
+4. `run_java` solo para lo que el pipeline no cubre; antes `recipe_search`, `plantillas_casos.md`, `docs_search`; inventar al final.
+5. **Preguntar antes de lo caro**: malla > ~400 k celdas (estimar antes), > 1000 it, curvas de caudal, cambiar de caso, apagar con GUI conectada.
+6. **Apagar al terminar** (`server_stop`, guarda). Con GUI conectada el vigilante solo deja `idle_warning`. Nunca matar la GUI.
+7. Trabajar sobre copias en `sims/` (en `COPILOTO_WORK`), nunca sobre el .sim original.
 
 ## Reglas operativas
 
-- Mensajes al usuario en español, cortos, números en tablas. Lo mínimo que funcione. Atajos marcados `# ponytail:` con su límite.
-- Claves de licencia solo en `.env` (ignorado por git). Nunca en código, recetas, logs, `.server.json` ni commits;
-  el MCP enmascara la clave (`_redact`) en todo lo que escribe.
-- Check ejecutable de cada pieza: `python mcp_server.py --selftest`, `python panel/chat_panel.py --selftest`,
-  `python pipelines/bomba.py --selftest` (sin licencia ni solver; javac del JDK de STAR-CCM+: compila la macro con iterar y post,
-  las recetas generadas y los bloques de `conocimiento/plantillas_casos.md`; prueba el juez de estabilidad con datos de BombaRapida).
-- Python del repo: `.venv\Scripts\python.exe` (3.14, paquete `mcp`). Java: el del JDK de STAR-CCM+, no instalar otro.
-- Memoria del agente: tras cada `run_java` que logre algo nuevo → `recipe_save` (receta `<verbo>-<objeto>.java`, cabecera
-  QUE/VERSION/FECHA/ESTADO). Recetas con `// ESTADO: no verificado…` son de memoria de Claude: probar antes de confiar.
-  Tras un error que costó más de 2 intentos → una línea en «Lecciones» de este archivo. Al cerrar un caso →
-  `casos/<caso>/RESUMEN.md` (geometría, malla, parámetros, resultados, tiempos).
-- Si algo falla dos veces con la misma causa, parar y decir qué se sabe; no iterar a ciegas.
+- Español, corto, números en tablas. Lo mínimo que funcione. Atajos marcados `# ponytail:` con su límite.
+- Claves de licencia solo en `.env` (ignorado por git); nunca en código, recetas, logs, `.server.json` ni commits; no mostrar `.env`.
+- Checks (sin licencia ni solver): `.venv\Scripts\python mcp_server.py --selftest`, `panel\chat_panel.py --selftest`, `pipelines\bomba.py --selftest`. Prueba real (gasta licencia, ~5 min, fuera del sandbox): `tests\real_e2e.py`.
+- Python del repo: `.venv\Scripts\python.exe`. Java: el JDK de STAR-CCM+.
+- Tras un `run_java` que logre algo nuevo → `recipe_save` (cabecera QUE/VERSION/FECHA/ESTADO). Error que costó > 2 intentos → una línea en `conocimiento/lecciones.md`. Al cerrar un caso → `casos/<caso>/RESUMEN.md`.
+- Si algo falla dos veces con la misma causa, parar y decir qué se sabe.
 
 ## Entorno
 
-| | este PC (Windows 11) |
-|---|---|
-| STAR-CCM+ | **2410.0001** (19.06.009-R8, doble precisión), `C:\Program Files\Siemens\19.06.009-R8\STAR-CCM+19.06.009-R8` |
-| CPU | i5-1245U: 2 núcleos P + 8 E; `STARCCM_NP=4` (con 10 avisa de sobresuscripción) |
-| lanzador | `star\bin\starccm+.bat`; javadoc en `doc\client\html\star\...` (tool `docs_search`); guía `doc\UserGuide_19.06.pdf` |
-| licencia | PoD, `ccmppower`, `1999@flex.cd-adapco.com`, por periodo y UNA copia (Sebastián); cobra por hora de sesión |
-| config | `.env` (ver `.env.example`): `STARCCM_PODKEY`, `STARCCM_LICPATH`, `STARCCM_PORT` 47827, `STARCCM_NP`, `STARCCM_IDLE_MIN` 30, `STARCCM_HOME`, `STARCCM_EXE`, `STARCCM_PRECOMPILE` |
-
-El servidor Linux (2502) es opción manual del agente anterior; el agente no lo usa. Remoto retirado el 2026-10-24.
-
-## Cómo se inyecta
-
-`mcp_server.py` levanta UN `starccm+ -server -port 47827` con el .sim en memoria; cada tool inyecta una macro con
-`starccm+ -host localhost:PORT -batch Macro.java -noexit` (el `-noexit` evita que el cliente apague el servidor).
-El cuerpo va envuelto entre `AGENT_BEGIN/AGENT_END` con imports estándar (star.common, base.neo, base.report, meshing,
-flow, kwturb, vis, cadmodeler, prismmesher, surfacewrapper, material, segregatedflow, turbulence, motion, metrics,
-resurfacer, dualmesher, java.util, java.io); `sim` ya existe. Antes de inyectar compila con el `javac` de STAR-CCM+
-(2 s, sin licencia): un nombre de API equivocado vuelve sin tocar el servidor. El stdout del cliente se escribe en vivo
-en `macros/<macro>.out` (el Output de la GUI también lo muestra).
-
-| paso | segundos |
-|---|---|
-| `server_start` (licencia + MPI, sim nueva) | 4,5–19 (con .sim de 158 MB en frío 33) |
-| macro trivial | 8–10 |
-| primera macro que carga módulos (CAD, malla, física) | 50–75 en cursocfturbo; 14 en BombaRapida ya caliente |
-| precompilación javac | 2–6 |
-
-GUI: `gui_attach()` lanza `starccm+.bat -host localhost:47827` (fuera del sandbox, sin `-podkey`, no reserva otra
-licencia, ~770 MB); `gui_status()` dice si hay una conectada. Verificado 2026-10-26 con BombaPruebaNR: el árbol se
-actualiza solo, Output en vivo, iterar no se frena (0,5 s/iteración con o sin GUI).
+STAR-CCM+ **2410** (19.06.009-R8, doble precisión) en este PC (i5-1245U, `STARCCM_NP=4`); solver en `C:\Program Files\Siemens\…`.
+Licencia PoD (`ccmppower`, `1999@flex.cd-adapco.com`), por periodo, UNA copia, cobra por hora: `.env` (ver `.env.example`).
+Trabajo pesado en `COPILOTO_WORK` (por defecto `%LOCALAPPDATA%\starccm-copiloto`, fuera de OneDrive): `sims/`, `macros/`,
+`residente/`, `tiempos.csv`, `.server.json`, `.inject.lock`. En el repo: `casos/<caso>/`, recetas, conocimiento.
+Inyección: **cliente residente** (0,7-1 s por macro; cada respuesta trae `via`) con respaldo batch (8-10 s). `gui_attach()` abre la GUI (sin licencia extra).
 
 ## Flujo estándar: bomba centrífuga, estacionario
 
-Caso nuevo por etapas: preparar → ~100 iteraciones de prueba con resultados completos → preguntar antes de seguir.
-Ante una duda (fronteras, modelos, fluido, seguir o no) preguntar con opciones y detenerse.
-
-| etapa | cómo |
-|---|---|
-| 1 datos | `.cfturbo-ccm` (caudal másico, rpm con signo, eje, origen, ρ, μ, zonas y fronteras) y STEP en «Flow domain» |
-| 2 pipeline | `pump_case(case, cad_dir, mode)`: importar STEP (una parte por zona), regiones por parte, interfaces en cadena, malla, física, MRF, fronteras, reportes y Euler |
-| 3 malla | `rapida`: base d2/30, 3 prismas (≈180 k celdas); `normal`: d2/60, 5 prismas. Una operación por parte |
-| 4 física | 3D, estacionario, líquido, segregado, densidad constante, SST all-y+, Cell Quality Remediation. Gravedad: máquinas grandes/verticales/NPSH. Gamma: Re bajos, y+≈1, +10–20 % por iteración. Decir en una línea cuáles se activan |
-| 5 rotor | MRF (frozen rotor) con las rpm y el eje del ccm |
-| 6 fronteras | presión total 0 Pa en la entrada; caudal en la SALIDA con parámetro global `Flujo` (`-${Flujo}`); resto paredes |
-| 7 reportes | `pt_in`, `pt_out`, `Q_in`, `Q_out`, `M`, `H`, `P_hid`, `P_eje`, `eta` + Euler (U, Vu, Vr, `UVu`, `H_Euler`, `eta_Euler`, factor de deslizamiento si hay β2) |
-| 8 correr | `iterate(until="stable")` o `params={"iterar": true}` del pipeline: H y M < 0,5 % en 100 it, aviso de meseta de residuales, máximo 1000 |
-| 9 cierre | `params={"post": true}` o receta `post-bomba` (una macro): planos auto, PNG de presión en álabes, velocidad relativa en plano medio y y+ en `casos/<caso>/images`, `RESULT`, balance de masa < 0,5 %, validación de Euler; luego `RESUMEN.md`, guardar, apagar |
-| 10 curva | 5 caudales entre 0,6 y 1,3 del nominal reusando malla y solución: basta cambiar `Flujo`; un solo `run_steps` (receta de caso 3 en `plantillas_casos.md`) |
-
-Alternativa de mallado de las plantillas: trimmer en una sola operación (`mallar-trimmer-una-operacion.java`, no probada).
-Turbina (o bomba como turbina): mismo flujo; cambia el signo del momento; η = P_eje/P_hid; Euler con MODO turbina.
+Caso nuevo: preparar → ~100 it de prueba con resultados completos → preguntar antes de seguir. Duda → preguntar con opciones.
+`pump_case` hace: STEP en «Flow domain» + `.cfturbo-ccm` → regiones por parte, interfaces, malla (`rapida` d2/30 3 prismas ≈ 180 k; `normal` d2/60 5 prismas), física
+(3D, estacionario, líquido, segregado, SST all-y+), MRF con rpm y eje del ccm, presión total 0 Pa en la entrada y caudal en la SALIDA (`-${Flujo}`),
+reportes (`H`, `M`, `eta`, `P_hid`, `P_eje`, Q, Euler). `post`: planos, 3 PNG, y+, balance de masa, validación de Euler. Curva: 5 caudales cambiando `Flujo` (`plantillas_casos.md`).
 
 ### Criterios de «no sirve»
-- Desbalance de masa > 1 %: revisar interfaces (¿caras de conexión como pared?) y fugas.
-- Residuales planos altos: presión 0,2 y velocidad 0,5 de under-relaxation, 300 it, reevaluar. Plateau MRF ~1e-2 es normal en frozen rotor.
-- Residual < 1e-4 sin alcanzar con H y M estables: no es fallo; se reporta y se para. Bajarlo pide malla más fina o transitorio.
-- H oscila: malla gruesa en la lengua de la voluta o caso transitorio. Refinar primero.
-- Celdas malas > 0,1 %: mesh repair o más shrink de prismas.
-- Diverge (residuales suben, H o M sin sentido): parar y avisar; no seguir iterando.
-- Euler: `AVISO` o `EULER_MAL` en la salida = las fronteras del rotor están mal leídas; no confiar en `eta_Euler`.
+- Balance de masa > 0,5-1 %: revisar interfaces (¿caras de conexión como pared?) y fugas.
+- Residuales planos altos: under-relaxation presión 0,2 / velocidad 0,5, 300 it. Plateau ~1e-2 en frozen rotor es normal.
+- H oscila: malla gruesa en la lengua o caso transitorio; refinar primero. Celdas malas > 0,1 %: mesh repair o más shrink de prismas.
+- Diverge: parar y avisar. `AVISO`/`EULER_MAL` en la salida: fronteras del rotor mal leídas, no confiar en `eta_Euler`.
+- **y+ en álabes (all-y+)**: vale < 5 o 30–300; en 5–30 afinar prismas antes de fiarse de η y del par.
 
-## Lecciones vigentes
+### Geometría que no viene de CFturbo
+Sin `.cfturbo-ccm` no hay `pump_case`. `inspect`; superficie sucia → surface wrapper + leak detection + extraer volumen; caras agrupadas o genéricas →
+**separar por ángulo** (`separar-caras-por-angulo`, por verificar); **pedir al usuario que marque entrada y salida** (una pregunta); resto pared. Detalle: lecciones.md §5.
 
-Fechas 2026-10-23 salvo indicación. Las del remoto y la UI web: `conocimiento/CLAUDE_agente_anterior.md`.
+## Lecciones críticas (una línea; detalle en `conocimiento/lecciones.md`)
 
-### Entorno, licencia y sandbox
-- El sandbox del tool Bash bloquea las DLL de STAR-CCM+ («Una directiva de Control de aplicaciones bloqueó este
-  archivo»). El solver arranca fuera del sandbox: desde el MCP o con el tool Bash sin sandbox. No es política de Windows.
-- Sin `-podkey` el solver pide `ccmpsuite` a `1999@flex.cd-adapco.com` y aborta (rc 8, ~60 s). La clave va en `.env`.
-- `doc/api` de la instalación es la API de co-simulación (C); el javadoc Java está en `doc/client/html`. `StarMacro` y
-  `Simulation` viven en `starbase.jar`; `MeshOperationManager` en `meshing.jar`.
-- 2026-10-24 · Git Bash no trae `bc`: medir tiempos con `$SECONDS`.
-- 2026-10-24 · La consola de Windows es cp1252: un «Δ», «≈» o «→» en un `print` de un guion revienta DESPUÉS de hacer
-  el trabajo (BombaRapida dejó el solver vivo y sin guardar). Imprimir ASCII o `sys.stdout.reconfigure(encoding="utf-8")`.
-- Las herramientas de Claude Code corren en serie: para observar la GUI mientras itera, lanzar `iterate` en segundo
-  plano sin sandbox y sondear.
-- 2026-10-26 · Un fallo transitorio de MPI («init called when another process has exited…») justo tras apagar otro
-  servidor no es de licencia; reintentar tras un rato.
-
-### Macros Java y API
-- El cliente batch apaga el servidor al acabar la macro: siempre `-noexit`.
-- Expresiones entre reportes: `${nombreReport}` (p. ej. `${pt_outReport}`).
-- `MonitorManager.export` falla en batch («StarUpdate unexpectedly missing»). Residuales: exportar el plot `Residuals`
-  (`sim.getPlotManager().getPlot("Residuals").export(csv, ",")`); valores de reportes: `getReportMonitorValue()`.
-  Así lo hace `iterate`.
-- javac caza nombres equivocados en 2 s: `ThreeDimensionalModel` vive en `star.metrics`; no existe `AreaReport`
-  (área = `SumReport` con la magnitud del field function `Area`).
-- `getCurrentIteration()` en `sim.getSimulationIterator()`: 0 antes de iterar; los reportes de campo no valen sin solución.
-- `Class[]` crudo con `pc.enable(c)` compila y es el patrón verificado para activar modelos.
-
-### Geometría, regiones y malla
-- `newRegionsFromParts` crea solo un continuo «Physics 1»; crear otro deja dos. Reusarlo (o crear si no existe).
-- Autoguardado «batch» activo por defecto: deja `<sim>@meshed.sim` y `<sim>@00050.sim`. `server_start` lo apaga.
-- `importCadPart(ruta, "SharpEdges", 30.0, 2, 1e-5)` conserva los nombres de cara de CFturbo
-  (`[Impeller_1]-Flow domain-BladePS`); con `OneBoundaryPerPartSurface` pasan a fronteras con el mismo nombre
-  (renombrar por el sufijo tras el último `-`).
-- **Una operación de malla POR PARTE** y añadir `star.resurfacer.AutomaticSurfaceRepairAutoMesher`: las 3 partes en
-  una sola fallan en el remallador («Surface intersects self» en r = D2/2 por caras coincidentes).
-- Interfaces: `createBoundaryInterface` deja la parte no emparejada de cada cara de conexión como **Wall**
-  (`estator/Outflow → Wall` junto a `estator/Outflow [int_entrada 1]`). Esa pared bloquea el flujo (Q_out ≈ 0, diverge).
-  Comprobar tras crear interfaces y medir el área que quedó como pared (el pipeline imprime `PARED_CONEXION`).
-  Causa de raíz: exportar de CFturbo en modo «virtual» (BombaFinal25: 5 617 frente a 14 830 mm², desfase 13 mm);
-  en «Flow domain» coinciden (13 370 frente a 13 371 mm²; BombaRapida: residuos ≤ 0,16 %). Fronteras con «(virtual)» en
-  el nombre = pedir re-export en «Flow domain» antes de mallar. En NQ25Q159H91 la causa fueron `RSIConnectionOutHub`
-  y `RSIConnectionOutShroud` del estator, fuera de la interfaz.
-- Fronteras de interfaz: `b instanceof DirectBoundaryInterfaceBoundary`; su nombre lleva `[int_…]`. Fuera de las
-  escenas de malla y de la exportación de superficies (duplican discos internos).
-- Antes de mallar, `ImportManager.export` (EnSight) falla («There is no volume mesh»). La geometría recién importada
-  sale con `MeshPart.exportStlPart(archivo, false)` (receta `exportar-geometria-stl`).
-- Geometría con caras agrupadas o nombres genéricos: separar por ángulo (`separar-caras-por-angulo`, por verificar) y
-  pedir al usuario que marque entrada y salida; no seguir iterando si diverge.
-
-### Física, MRF y fronteras
-- MRF en 2410: `ReferenceFrameManager.createReferenceFrame(RotatingReferenceFrame.class, n)` +
-  `getRotationRate().setValueAndUnits(rpm, "rpm")` + `getAxisDirection/Origin`; se asigna con
-  `region.getValues().get(MotionSpecification.class).setReferenceFrame(frame)`. `RotatingMotion` no expone la velocidad.
-- CFturbo da la velocidad en rev/s (−48,333 = −2900 rpm sobre +Z): signo y eje tal cual al marco.
-- Presión total en la entrada + caudal en la salida converge mejor que lo contrario, fija la presión de entrada
-  (NPSH) y el caudal es exacto. La salida es un Mass Flow con caudal NEGATIVO (`-${Flujo}`).
-- Frozen rotor con interfaces no conformes: balance de masa exacto sin ajuste alguno.
-- La H incluye la extensión de salida (presión total en su salida), que el 1D de CFturbo no cuenta: la diferencia con
-  la predicción 1D no es solo deslizamiento (BombaRapida −19 %, cursocfturbo −6,7 %).
-
-### Reportes de Euler
-- 2026-10-26 · En BombaPruebaNR los reportes de salida del rotor leían la frontera de ENTRADA (UVu1 = UVu2, H_Euler 0 o
-  menor que H): la elección «de menor y mayor radio entre las no-pared» no es fiable cuando quedan piezas de interfaz o
-  paredes de conexión. La receta nueva elige POR NOMBRE (Inflow/Outflow de la región rotor, incluidas «… [int_…]»),
-  promedia ponderando por caudal másico sobre el conjunto y valida al final (H_Euler > H, UVu2 ≠ UVu1, U2 > U1) con
-  `AVISO`/`EULER_MAL`. ESTADO: no verificado con solver hasta la prueba real. Euler solo vale con solución.
-- Triángulos: Vu positiva en el sentido de giro (sirve con rpm negativas); U = |ω|·r; `H_Euler = (UVu2 − UVu1)/g`;
-  `eta_Euler = H/H_Euler`; σ = Vu2/Vu2∞ con β2 (Vm2 ≈ Vr2, salida radial).
-
-### Escenas y superficies
-- `createScene("X")` deja la escena como «X 1». Para que el PNG no salga en blanco en batch: `PartDisplayer` con las
-  **fronteras** como entrada (no la región), `initialize()`, `setRepresentation(getDefaultFvRepresentation())` y
-  `resetCamera(true)`.
-- Vectores en un plano: `getGlyphSettings().setRelativeToModelLength(x)` es un porcentaje (1.0 invisibles; 6.0 bien);
-  `setSpacingMode(0)` = GEOMETRIC con `getGeometricSpacing().setOnRatio(6)`. `PartManager` no tiene `getParts()`.
-- En una pared sin deslizamiento la velocidad es la de la pared, no el flujo: el fluido se ve en PLANOS. El plano medio
-  se coloca a media salida del rotor (Min/Max de `dot($$Position, eje)` en sus Outflow), no a cota fija (z = 30 mm
-  cortó Bomba_NQ15, D ≈ 1,4 m, por el ojo del impulsor). Líneas de corriente 12×12 semillas (25×25 tapan el color).
-- Exportar superficies con campo: `ImportManager.export(String, Collection<Region>, Collection<Boundary>, Collection<Part>,
-  Collection<PartSurface>, Collection<FieldFunction>, boolean append, boolean dataAtVerts)` con `.case` = EnSight Gold
-  (`docs_search` no lo encuentra: grep en `doc/client/html/star/common/ImportManager.html`). Vectores →
-  `getMagnitudeFunction()`. Trampas: variables con asteriscos en el `.case`; binarios sin cabecera «C Binary».
-- 2026-10-24 · AutoExport: `getStarUpdate().getUpdateModeOption().setSelected(StarUpdateModeOption.Type.ITERATION)` +
-  `getIterationUpdateFrequency().setIterations(N)`; receta `activar-autoexport`.
-- 2026-10-24 · Edge `--headless=new --print-to-pdf` puede salir con 0 antes de escribir el PDF: esperar a que el
-  archivo exista y deje de crecer (informe PDF = receta `informe-detalle`, reflexión + try/catch).
-
-### Servidor y operación
-- Un servidor viejo con un vigilante que no detecta macros largas guardó y mató el solver de otra sesión a los 7 min de
-  una malla (2,7 M celdas). Regla: una sola instancia de cada vigilante; antes de probar, mirar procesos
-  `Get-CimInstance Win32_Process | ? CommandLine -match 'mcp_server|chat_panel'` y parar las viejas.
-- Los selftests nunca tocan `sims/`, `macros/`, `.server.json` reales ni apagan un solver registrado (temporales).
-- Si el cliente que lanzó una macro muere, la macro sigue en el solver (p. ej. una malla): queda vivo y cobrando.
-  `server_start` se niega con otro .sim cargado; apagar antes con `server_stop()`.
-- Apagar sin guardar pierde la solución (BombaRapida quedó sin guardar): `save` antes de `server_stop(save=false)`.
-- 2026-10-26 · GUI conectada: el vigilante de 30 min solo cuenta macros del agente y apagaría el servidor mientras el
-  usuario mira; por eso con GUI solo avisa. El usuario no toca nada mientras corre una macro.
+- Sandbox del tool Bash bloquea las DLL de STAR-CCM+: el solver arranca desde el MCP o fuera del sandbox. Sin `-podkey` aborta (rc 8).
+- Consola cp1252: solo ASCII en `print` de guiones; un «Δ» revienta después de hacer el trabajo.
+- Cliente batch sin `-noexit` apaga el servidor. `MonitorManager.export` falla en batch: usar plot `Residuals` y `getReportMonitorValue()`.
+- Expresiones entre reportes: `${nombreReport}`. División en reportes: `(abs(den) > 1e-9 ? num/den : 0)` (cero en iteración 1 aborta `StepSimulation`).
+- `newRegionsFromParts` crea un solo continuo: reusarlo. Autoguardado batch deja `@meshed.sim`: `server_start` lo apaga.
+- Una operación de malla POR PARTE con `AutomaticSurfaceRepairAutoMesher`; las 3 partes juntas fallan.
+- Interfaces dejan la parte no emparejada como **Wall** (Q_out ≈ 0, diverge). Causa: CFturbo exportado «virtual»; re-exportar en «Flow domain». `PARED_CONEXION` solo es fiable si dice área medida; si «no medible», manda `BALANCE_MASA`.
+- Fronteras de interfaz (`DirectBoundaryInterfaceBoundary`, `[int_…]`) fuera de escenas de malla y exportaciones.
+- Antes de mallar, `ImportManager.export` falla: la geometría sale con `MeshPart.exportStlPart`.
+- MRF: `ReferenceFrameManager.createReferenceFrame(RotatingReferenceFrame.class, n)`; rpm de CFturbo en rev/s con signo (−48,333 = −2900 rpm), tal cual al marco.
+- Presión total en la entrada + caudal en la salida converge mejor y fija NPSH. H incluye la extensión de salida: difiere del 1D de CFturbo (BombaRapida −19 %).
+- Euler: fronteras del rotor POR NOMBRE (Inflow/Outflow, incluidas `[int_…]`), ponderadas por caudal; vale con solución. Validar H_Euler > H.
+- Escenas en batch: `PartDisplayer` con las FRONTERAS, `initialize()`, representación Fv por defecto, `resetCamera(true)`; el fluido se ve en PLANOS a media salida del rotor, no en paredes.
+- `scene.open()` en macro abre en el cliente batch, no en la GUI. Edge `--print-to-pdf` puede salir antes de escribir: esperar al archivo.
+- Una sola instancia de cada vigilante/panel; si el cliente que lanzó una macro muere, la macro sigue en el solver (vivo y cobrando).
+- Apagar sin guardar pierde la solución: `save` antes de `server_stop(save=false)`. Los selftests solo usan temporales.
+- Fallo transitorio de MPI tras apagar otro servidor no es de licencia: reintentar tras un rato.
 
 ## Casos de referencia (cifras en `conocimiento/INDICE.md`)
 
-`BombaRapida` (d2 137 mm, 50 m³/h, 2900 rpm): importar a resultados en 3 min 45 s, H 16,76 m, η 88,7 %.
-`cursocfturbo` (D2 270 mm, 250 m³/h): 370 k celdas, H 78,8 m, η 89,4 %. `BombaPruebaNR`: 214 k celdas, H 14,02 m,
-η 76,5 %, Euler mal leído. `cilindro`: fontanería, 11 k celdas.
+`BombaRapida` (d2 137 mm, 50 m³/h, 2900 rpm): prueba real 3 min 14 s, H 16,74 m, η 88,6 %, H_Euler 18,75 m. `cursocfturbo` (D2 270 mm):
+370 k celdas, H 78,8 m, η 89,4 %. `BombaPruebaNR`: H 14,02 m, η 76,5 %. `cilindro`: fontanería, 11 k celdas.
 
-## Pendiente de verificar con solver real
+## Pendiente de verificar con solver
 
-`pipelines/bomba.py` (compila con javac, nunca corrió contra el solver) y, dentro de él, `iterar` y `post` (planos, 3 PNG, y+,
-validación de Euler); recetas `iterar-hasta-estable` y `post-bomba`; las tres recetas de `plantillas_casos.md` (la del
-cilindro corrió con pasos fijos; NACA con STL no corrió nunca); receta de Euler nueva, medida de `PARED_CONEXION`
-(SumReport), `gui_attach` desde el MCP, `run_steps`, `iterate until=stable`.
+Medida corregida de `PARED_CONEXION`; receta NACA con STL; `gui_attach` en uso largo; curva de 5 caudales; `run_steps` con recetas de caso.

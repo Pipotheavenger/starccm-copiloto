@@ -20,15 +20,17 @@ REPO = HERE.parent
 ESTADO = HERE / ".estado.json"
 
 ESTILO = (
-    "Copiloto de STAR-CCM+ de Sebastián. Español, 1-3 frases, números en tablas. Velocidad: cada turno del modelo cuesta "
-    "más que el solver. Bomba de CFturbo: pump_case, no pasos sueltos. Agrupa pasos con run_steps. iterate con "
-    "until=\"stable\". No verifiques con macros aparte lo que el resultado ya trae; no repitas pasos que ya funcionaron. "
-    "Si falta un dato, UNA sola pregunta. El usuario mira la GUI real: di qué abrir (p. ej. «Scenes › presion_alabes»). "
-    "No toques nada mientras edita en la GUI. Pregunta antes de lo caro (mallas grandes, apagar). Cierra con qué quedó hecho."
+    "Copiloto de STAR-CCM+ de Sebastián. Español, 1-3 frases, números en tablas. Cada turno del modelo cuesta más que "
+    "el solver. Bomba de CFturbo: pump_case; agrupa pasos con run_steps; iterate con until=\"stable\". No re-verifiques "
+    "lo que el resultado ya trae ni repitas pasos que funcionaron. Si falta un dato, UNA pregunta. El usuario mira la "
+    "GUI real: di qué abrir. No toques nada mientras edita en la GUI. Pregunta antes de lo caro (mallas grandes, "
+    "apagar). Lee conocimiento/ solo cuando lo necesites. NUNCA muestres claves, licencias ni el contenido de .env. "
+    "Cierra con qué quedó hecho."
 )
 
 MODOS = {"rapido": ("Rápido", "PANEL_MODEL_RAPIDO", "sonnet", "low"),
          "preciso": ("Preciso", "PANEL_MODEL_PRECISO", "opus", "medium")}
+MSG_APAGAR = "Guarda y apaga el solver con server_stop"
 PREFIJO_COLA = "MENSAJE DEL USUARIO MIENTRAS TRABAJABAS:\n"
 
 
@@ -111,9 +113,28 @@ def claude_bin() -> str | None:
 
 
 DEFAULT_TOOLS = "mcp__starccm__*,Read,Glob,Grep"
+# La CLI no puede leer la clave PoD: reglas de denegación (sintaxis de permisos de Claude Code, rutas tipo gitignore;
+# las de Read también cubren Grep/Glob, y se repiten por si acaso). .env.example sigue legible.
+DENY_PATHS = (".env", "**/.env", "~/.starccm-agent.env")
+DENIED_TOOLS = [f"{t}({pth if pth.startswith(('*', '~')) else './' + pth})" for t in ("Read", "Grep", "Glob") for pth in DENY_PATHS]
 
 
-def build_cmd(msg: str, sid: str | None, allowed: str = DEFAULT_TOOLS, modo: str = "rapido") -> list[str] | None:
+def ensure_mcp_config(repo: Path = REPO) -> tuple[Path, bool]:
+    """Devuelve (.mcp.json, creado). Si falta, lo crea desde .mcp.json.example con rutas absolutas del .venv y mcp_server.py."""
+    dst = repo / ".mcp.json"
+    if dst.is_file():
+        return dst, False
+    cfg = _json(repo / ".mcp.json.example") or {"mcpServers": {"starccm": {}}}
+    srv = cfg.setdefault("mcpServers", {}).setdefault("starccm", {})
+    vpy = repo / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    srv["command"] = str(vpy if vpy.is_file() else sys.executable)
+    srv["args"] = [str(repo / "mcp_server.py")]
+    dst.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    return dst, True
+
+
+def build_cmd(msg: str, sid: str | None, allowed: str = DEFAULT_TOOLS, modo: str = "rapido",
+              mcp: Path | None = None) -> list[str] | None:
     b = claude_bin()
     if not b:
         return None
@@ -122,16 +143,64 @@ def build_cmd(msg: str, sid: str | None, allowed: str = DEFAULT_TOOLS, modo: str
     if sid:
         cmd += ["--resume", sid]
     cmd += modo_flags(modo)
-    cmd += ["--mcp-config", str(REPO / ".mcp.json"), "--strict-mcp-config", "--allowedTools", allowed,
-            "--append-system-prompt", ESTILO]
+    cmd += ["--mcp-config", str(mcp or REPO / ".mcp.json"), "--strict-mcp-config", "--allowedTools", allowed,
+            "--disallowedTools", ",".join(DENIED_TOOLS), "--append-system-prompt", ESTILO]
     return cmd
 
 
-def kill_tree(p: subprocess.Popen) -> None:
+def _descendants(pid: int) -> list[tuple[int, int]]:
+    """(pid, ppid) de todos los descendientes de `pid` (Windows: una consulta CIM)."""
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                              "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    kids: dict[int, list[int]] = {}
+    for ln in out.splitlines():
+        a = ln.split()
+        if len(a) == 2 and a[0].isdigit() and a[1].isdigit():
+            kids.setdefault(int(a[1]), []).append(int(a[0]))
+    res, todo = [], [pid]
+    while todo:
+        x = todo.pop()
+        for k in kids.get(x, []):
+            res.append((k, x))
+            todo.append(k)
+    return res
+
+
+def protected_pids(dirs) -> set[int]:
+    """Procesos que Detener nunca toca: el solver y el residente (de .server.json y residente/residente.json)."""
+    out: set[int] = set()
+    for d in dirs:
+        st, rj = _json(Path(d) / ".server.json"), _json(Path(d) / "residente" / "residente.json")
+        for v in (st.get("pid"), rj.get("pid"), rj.get("server_pid")):
+            try:
+                out.add(int(v))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def kill_tree(p: subprocess.Popen, protect=()) -> None:
+    """Mata la CLI y su MCP, pero NO el solver ni el residente (`protect`), aunque cuelguen del árbol:
+    `taskkill /T` mata también a los hijos lanzados 'desacoplados' mientras el padre siga vivo."""
     if p.poll() is not None:
         return
+    protect = {int(x) for x in protect}
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, timeout=30)
+        if protect:
+            kids = _descendants(p.pid)
+            safe = set(protect)
+            for _ in kids:  # todo lo que cuelga de un protegido también queda a salvo
+                safe |= {c for c, par in kids if par in safe}
+            for c, _par in reversed(kids):
+                if c not in safe:
+                    subprocess.run(["taskkill", "/PID", str(c), "/F"], capture_output=True, timeout=30)
+            p.kill()
+        else:
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, timeout=30)
     if p.poll() is None:
         p.kill()
 
@@ -139,22 +208,30 @@ def kill_tree(p: subprocess.Popen) -> None:
 class Runner:
     """Una conversación por vez: un hilo lee la CLI y mete eventos en `q`. El último evento es ('done', rc, detenido)."""
 
-    def __init__(self, q: queue.Queue):
-        self.q, self.proc, self.stopped = q, None, False
+    def __init__(self, q: queue.Queue, repo: Path = REPO, sdir: Path | None = None):
+        self.q, self.proc, self.stopped, self.repo, self.sdir = q, None, False, Path(repo), sdir
 
     @property
     def busy(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
     def send(self, msg: str, sid: str | None, allowed: str = DEFAULT_TOOLS, modo: str = "rapido") -> bool:
-        cmd = build_cmd(msg, sid, allowed, modo)
+        try:
+            mcp, creado = ensure_mcp_config(self.repo)
+        except OSError as e:
+            mcp, creado = self.repo / ".mcp.json", False
+            self.q.put(("error", f"no pude crear .mcp.json: {e}"))
+        if creado:
+            self.q.put(("aviso", "No existía .mcp.json: lo creé desde .mcp.json.example con las rutas de este equipo "
+                                 f"({mcp.name})."))
+        cmd = build_cmd(msg, sid, allowed, modo, mcp)
         if not cmd:
             self.q.put(("error", "no encuentro la CLI `claude` (PATH o PANEL_CLAUDE_BIN)"))
             self.q.put(("done", -1, False))
             return False
         self.stopped = False
         try:
-            self.proc = subprocess.Popen(cmd, cwd=REPO, env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            self.proc = subprocess.Popen(cmd, cwd=self.repo, env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
         except OSError as e:
             self.q.put(("error", f"no pude lanzar la CLI: {e}"))
@@ -179,7 +256,7 @@ class Runner:
     def stop(self):
         self.stopped = True
         if self.proc:
-            kill_tree(self.proc)
+            kill_tree(self.proc, protected_pids(state_dirs(self.repo, self.sdir)))
 
 
 # ---------- sesión y estado ----------
@@ -248,26 +325,85 @@ def _json(path: Path) -> dict:
         return {}
 
 
-def read_status(repo: Path = REPO) -> dict:
+def state_dir() -> Path:
+    """Carpeta de estado del MCP: panel_estado.json (lo escribe el MCP) -> COPILOTO_WORK -> %LOCALAPPDATA%/starccm-copiloto."""
+    cfg = _json(REPO / "panel_estado.json").get("estado_dir")
+    if cfg:
+        return Path(str(cfg))
+    if os.environ.get("COPILOTO_WORK"):
+        return Path(os.environ["COPILOTO_WORK"])
+    base = os.environ.get("LOCALAPPDATA") if os.name == "nt" else None
+    return (Path(base) if base else Path.home() / (("AppData/Local") if os.name == "nt" else ".local/share")) / "starccm-copiloto"
+
+
+def state_dirs(repo: Path | None = None, sdir: Path | None = None) -> list[Path]:
+    """Dónde buscar .server.json/.inject.lock: la carpeta de estado y, por compatibilidad, el repo. Sin argumentos usa las reales."""
+    if repo is None and sdir is None:
+        return [state_dir(), REPO]
+    return [Path(x) for x in (sdir, repo) if x]
+
+
+def _first(name: str, dirs) -> Path:
+    for d in dirs:
+        if (d / name).is_file():
+            return d / name
+    return dirs[0] / name
+
+
+def warning_text(w, idle_min=None) -> str | None:
+    """idle_warning puede ser texto o un dict {msg, idle_min, ...}."""
+    if isinstance(w, dict):
+        w = w.get("msg") or (f"{w.get('idle_min', idle_min)} min sin actividad: ¿apagar el solver?" if w else None)
+    return str(w) if w else None
+
+
+def lock_info(repo: Path | None = None, sdir: Path | None = None) -> dict | None:
+    """.inject.lock vigente (menos de 2 h): {tool, pid, alive}. Sirve aunque el dueño ya haya muerto (la macro sigue en el solver)."""
+    lf = _first(".inject.lock", state_dirs(repo, sdir))
+    try:
+        if time.time() - lf.stat().st_mtime > 2 * 3600:
+            return None
+    except OSError:
+        return None
+    lk = _json(lf)
+    return {"tool": lk.get("tool") or lk.get("herramienta") or "?", "pid": lk.get("pid"), "alive": pid_alive(lk.get("pid"))}
+
+
+def stop_warning(repo: Path | None = None, sdir: Path | None = None) -> str | None:
+    """Tras Detener: aviso si el solver sigue vivo con una macro en curso."""
+    s = read_status(repo, sdir)
+    lk = lock_info(repo, sdir)
+    if s["solver"] and lk:
+        return (f"Detuve la CLI y el MCP, pero el solver sigue vivo ({s['caso']}) y la macro «{lk['tool']}» puede seguir "
+                "corriendo en él. Cobra por hora: apágalo si ya no lo necesitas.")
+    return None
+
+
+def read_status(repo: Path | None = None, sdir: Path | None = None) -> dict:
     """Lee .server.json y .inject.lock (sin importar mcp_server). Devuelve campos + `texto` para la barra."""
-    sf, lf = repo / ".server.json", repo / ".inject.lock"
+    dirs = state_dirs(repo, sdir)
+    sf = _first(".server.json", dirs)
     st = _json(sf)
     alive = bool(st.get("pid")) and pid_alive(st["pid"])
-    out = {"solver": alive, "caso": None, "idle_min": None, "idle_warning": None, "gui": "?", "busy": None}
+    out = {"solver": alive, "caso": None, "idle_min": None, "idle_warning": None, "gui": False, "busy": None}
     parts = []
     if alive:
         out["caso"] = Path(st["sim"]).stem if st.get("sim") else "(sin .sim)"
-        try:
-            out["idle_min"] = int((time.time() - sf.stat().st_mtime) // 60)
-        except OSError:
-            pass
+        im = st.get("idle_min")
+        if isinstance(im, (int, float)) and not isinstance(im, bool):
+            out["idle_min"] = int(im)
+        else:
+            try:
+                out["idle_min"] = int((time.time() - sf.stat().st_mtime) // 60)
+            except OSError:
+                pass
         parts.append(f"Solver vivo · {out['caso']}" + (f" · {out['idle_min']} min inactivo" if out["idle_min"] is not None else ""))
-        out["idle_warning"] = st.get("idle_warning") or None
+        out["idle_warning"] = warning_text(st.get("idle_warning"), out["idle_min"])
     else:
         parts.append("Solver apagado")
-    g = st.get("gui")
-    out["gui"] = "?" if g is None else bool(g)
-    parts.append("GUI " + {"?": "?", True: "conectada", False: "no conectada"}[out["gui"]])
+    out["gui"] = bool(st.get("gui")) if alive else False
+    parts.append("GUI conectada" if out["gui"] else "GUI no conectada")
+    lf = _first(".inject.lock", dirs)
     lk = _json(lf)
     try:
         lk_old = time.time() - lf.stat().st_mtime > 2 * 3600
@@ -287,12 +423,16 @@ BTN_BG = "SystemButtonFace" if os.name == "nt" else "#d9d9d9"
 
 
 class Panel:
-    def __init__(self, root, runner_q=None):
+    def __init__(self, root, runner_q=None, repo: Path | None = None, sdir: Path | None = None):
         import tkinter as tk
         from tkinter import ttk
         self.tk, self.root = tk, root
+        self.repo, self.sdir = repo, sdir  # None = ubicaciones reales (panel_estado.json / COPILOTO_WORK / LOCALAPPDATA)
+        self.closed = self.closing = False
+        self.aft: dict[str, str] = {}
+        self.close_timeout, self.dlg = 60.0, None
         self.q = runner_q or queue.Queue()
-        self.runner = Runner(self.q)
+        self.runner = Runner(self.q, repo or REPO, sdir)
         self.sid = load_sid()
         self.last_msg = ""
         self.tools: dict[str, tuple[str, float]] = {}
@@ -316,7 +456,7 @@ class Panel:
         self.status.pack(side="left", fill="x", expand=True, padx=6, pady=3)
         tk.Checkbutton(bar, text="Encima", variable=self.top, command=self.toggle_top, bg="#e8ebf0", font=FONT).pack(side="right", padx=4)
         bar.bind("<Configure>", lambda e: self.status.config(wraplength=max(e.width - 100, 100)))
-        mbar = tk.Frame(root, bg="#e8ebf0")
+        mbar = self.modo_bar = tk.Frame(root, bg="#e8ebf0")
         mbar.pack(fill="x")
         tk.Label(mbar, text="Modo:", bg="#e8ebf0", font=FONT).pack(side="left", padx=(6, 2))
         self.modo = tk.StringVar(value=load_modo())
@@ -326,6 +466,9 @@ class Panel:
         self.modo_info = tk.Label(mbar, text="", bg="#e8ebf0", fg="#666", font=(FONT[0], 9))
         self.modo_info.pack(side="left", padx=6)
         self.on_modo(save=False)
+        self.warn = tk.Label(root, text="", anchor="w", justify="left", bg="#fde68a", fg="#7a4100", font=(FONT[0], FONT[1], "bold"),
+                             wraplength=380, padx=8, pady=3)  # banda ámbar: idle_warning (solo visible si hay aviso)
+        root.bind("<Configure>", lambda e: self.warn.config(wraplength=max(root.winfo_width() - 24, 100)) if e.widget is root else None)
 
         foot = tk.Frame(root, bg="#f5f6f8")
         foot.pack(side="bottom", fill="x")
@@ -456,6 +599,22 @@ class Panel:
             self.pending.clear()
             self.runner.stop()
             self.say("Detenido." + (f" Descarté {n} mensaje(s) en cola." if n else ""), "sys")
+            self.root.after(self.stop_delay_ms, self.check_after_stop)
+
+    stop_delay_ms = 1200
+
+    def check_after_stop(self):
+        w = stop_warning(self.repo, self.sdir)
+        if not w or self.closed:
+            return
+        self.say(w, "err")
+        self.hist.config(state="normal")
+        b = self.tk.Button(self.hist, text="Apagar solver", font=FONT, bg="#ffd6d6", command=self.on_off_now)
+        self.hist.window_create("end", window=b, padx=4, pady=2)
+        self.hist.insert("end", "\n")
+        self.hist.config(state="disabled")
+        self.hist.see("end")
+        self.stop_btn = b
 
     def twice(self, key, button, normal, action):
         """Confirmación dentro del panel: el primer clic pide confirmar; el segundo (en 4 s) ejecuta."""
@@ -489,12 +648,74 @@ class Panel:
     def on_gui(self):
         self.on_send("Abre la GUI con gui_attach")
 
+    def on_off_now(self):
+        self.on_send(MSG_APAGAR)
+
     def on_off(self):
-        self.twice("apagar", self.btn["apagar"], "Apagar solver", lambda: self.on_send("Guarda y apaga el solver con server_stop"))
+        self.twice("apagar", self.btn["apagar"], "Apagar solver", self.on_off_now)
+
+    # --- cerrar: si el solver está vivo, pregunta dentro del panel
+    def status_now(self):
+        return read_status(self.repo, self.sdir)
 
     def on_close(self):
+        if self.closing or self.dlg:
+            return
+        if self.status_now()["solver"]:
+            self.show_dlg()
+        else:
+            self.finish()
+
+    def finish(self):
         self.runner.stop()
+        self.closed = True
+        for a in self.aft.values():
+            try:
+                self.root.after_cancel(a)
+            except Exception:
+                pass
         self.root.destroy()
+
+    def show_dlg(self):
+        tk = self.tk
+        f = tk.Frame(self.root, bg="#ffffff", bd=2, relief="solid", padx=14, pady=12)
+        tk.Label(f, text="¿Apagar el solver antes de salir?\n(cobra por hora)", bg="#ffffff", font=(FONT[0], 11, "bold"),
+                 justify="center").pack(pady=(0, 10))
+        row = tk.Frame(f, bg="#ffffff")
+        row.pack()
+        self.dlg_btn = {}
+        for key, txt in (("si", "Sí"), ("no", "No"), ("cancelar", "Cancelar")):
+            b = tk.Button(row, text=txt, font=FONT, width=9, command=lambda k=key: self.dlg_answer(k))
+            b.pack(side="left", padx=3)
+            self.dlg_btn[key] = b
+        f.place(relx=0.5, rely=0.45, anchor="center")
+        f.lift()
+        self.dlg = f
+
+    def dlg_answer(self, a):
+        if self.dlg:
+            self.dlg.destroy()
+            self.dlg = None
+        if a == "cancelar":
+            return
+        if a == "no":
+            self.finish()
+            return
+        self.closing, self.close_t0 = True, time.time()
+        self.say("Apagando el solver antes de salir… (máx. %d s)" % self.close_timeout, "sys")
+        self.on_send(MSG_APAGAR)  # si la CLI está ocupada se encola y sale al terminar el turno
+        self.root.after(300, self.close_poll)
+
+    def close_poll(self):
+        if self.closed:
+            return
+        if not self.runner.busy and not self.pending and not self.status_now()["solver"]:
+            self.finish()
+        elif time.time() - self.close_t0 > self.close_timeout:
+            self.closing = False
+            self.say("El solver no se apagó a tiempo: sigue vivo. No cerré el panel; usa «Apagar solver» o ciérralo con «No».", "err")
+        else:
+            self.root.after(300, self.close_poll)
 
     # --- eventos
     def handle(self, ev):
@@ -535,6 +756,8 @@ class Panel:
                 self.turn_t0 = 0.0
         elif k == "error":
             self.say(ev[1], "err")
+        elif k == "aviso":
+            self.say("⚠ " + ev[1], "sys")
         elif k == "raw":
             self.say(ev[1], "sys")
         elif k == "done":
@@ -551,7 +774,7 @@ class Panel:
         except queue.Empty:
             pass
         self.tick()
-        self.root.after(100, self.pump)
+        self.aft["pump"] = self.root.after(100, self.pump)
 
     def tick(self):
         if self.tools:
@@ -563,10 +786,17 @@ class Panel:
             self.live.config(text="")
 
     def refresh(self):
-        s = read_status()
-        self.status.config(text=s["texto"] + (f"\n⚠ {s['idle_warning']}" if s["idle_warning"] else ""),
-                           fg="#8a4b00" if s["idle_warning"] else "#222222")
-        self.root.after(3000, self.refresh)
+        s = self.status_now()
+        self.status.config(text=s["texto"])
+        if s["idle_warning"]:
+            self.warn.config(text="⚠ " + s["idle_warning"])
+            if self.warn.winfo_manager() != "pack":
+                self.warn.pack(fill="x", after=self.modo_bar)
+        elif self.warn.winfo_manager() == "pack":
+            self.warn.pack_forget()
+        if "refresh" in self.aft:
+            self.root.after_cancel(self.aft["refresh"])
+        self.aft["refresh"] = self.root.after(3000, self.refresh)
 
 
 def main():
@@ -578,7 +808,7 @@ def main():
 
 # ---------- selftest ----------
 def selftest():
-    global ESTADO
+    global ESTADO, REPO
     ok_all = True
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -623,8 +853,11 @@ def selftest():
     os.environ["CLAUDE_CODE_X"] = "1"
     check(not any(k.startswith("CLAUDE") for k in clean_env()), "entorno sin CLAUDE*")
 
+    trepo = tmp / "repo0"  # repo de mentira: Runner.send crea ahí su .mcp.json
+    trepo.mkdir()
+    (trepo / ".mcp.json.example").write_text(json.dumps({"mcpServers": {"starccm": {"command": "C:\\viejo\\python.exe", "args": ["C:\\viejo\\mcp_server.py"]}}}), encoding="utf-8")
     q: queue.Queue = queue.Queue()
-    r = Runner(q)
+    r = Runner(q, trepo)
     r.send("hola", None)
     evs = []
     while True:
@@ -633,6 +866,13 @@ def selftest():
         if e[0] == "done":
             break
     kinds = [e[0] for e in evs]
+    cfgp = trepo / ".mcp.json"
+    cj = _json(cfgp).get("mcpServers", {}).get("starccm", {})
+    check(cfgp.is_file() and any(e[0] == "aviso" for e in evs) and cj.get("args") == [str(trepo / "mcp_server.py")]
+          and Path(cj.get("command", "")).is_absolute() and "viejo" not in json.dumps(cj),
+          "sin .mcp.json: el panel lo crea desde el .example con rutas absolutas y avisa en el chat")
+    check(ensure_mcp_config(trepo)[1] is False, "con .mcp.json existente no lo vuelve a crear")
+    kinds = [k for k in kinds if k != "aviso"]
     check(kinds[0] == "init" and "tool" in kinds and "tool_result" in kinds and kinds.count("text") == 2
           and "result" in kinds and evs[-1] == ("done", 0, False), f"eventos de la CLI falsa: {kinds}")
     save_sid("fake-0001")
@@ -641,7 +881,7 @@ def selftest():
 
     q2: queue.Queue = queue.Queue()
     os.environ["FAKE_PAUSE"] = "5"
-    r2 = Runner(q2)
+    r2 = Runner(q2, trepo)
     r2.send("lento", None)
     q2.get(timeout=10)  # init
     time.sleep(0.3)
@@ -658,12 +898,40 @@ def selftest():
     repo = tmp / "repo"
     repo.mkdir()
     s = read_status(repo)
-    check(s["texto"].startswith("Solver apagado") and s["gui"] == "?", "estado sin archivos")
+    check(s["texto"].startswith("Solver apagado") and s["gui"] is False and "GUI no conectada" in s["texto"], "estado sin archivos: GUI no conectada (no «?»)")
     (repo / ".server.json").write_text(json.dumps({"pid": os.getpid(), "sim": "C:/x/Bomba1.sim", "idle_warning": "N min sin actividad: ¿apagar?", "gui": True}))
     old = time.time() - 7 * 60
     os.utime(repo / ".server.json", (old, old))
     s = read_status(repo)
-    check(s["solver"] and s["caso"] == "Bomba1" and s["idle_min"] == 7 and s["idle_warning"] and s["gui"] is True, f"estado con solver: {s['texto']}")
+    check(s["solver"] and s["caso"] == "Bomba1" and s["idle_min"] == 7 and s["idle_warning"] and s["gui"] is True
+          and "GUI conectada" in s["texto"] and "?" not in s["texto"], f"estado con solver: {s['texto']}")
+    base = {"pid": os.getpid(), "sim": "C:/x/Bomba1.sim"}
+    (repo / ".server.json").write_text(json.dumps({**base, "gui": False, "idle_min": 31,
+                                                   "idle_warning": {"idle_min": 31, "gui": True, "msg": "31 min sin actividad"}}))
+    s2 = read_status(repo)
+    check(s2["idle_warning"] == "31 min sin actividad" and s2["idle_min"] == 31 and s2["gui"] is False and "GUI no conectada" in s2["texto"],
+          "idle_min del vigilante y idle_warning en dict -> texto (no un dict en la barra)")
+    # nueva ubicación: estado_dir > repo; panel_estado.json > COPILOTO_WORK > %LOCALAPPDATA%
+    sd = tmp / "estado"
+    sd.mkdir()
+    (sd / ".server.json").write_text(json.dumps({**base, "sim": "C:/x/Nueva.sim", "gui": True}))
+    check(read_status(repo, sd)["caso"] == "Nueva" and read_status(repo, sd)["gui"] is True, "lee .server.json de la carpeta de estado (antes que el repo)")
+    check(read_status(repo, tmp / "vacia")["caso"] == "Bomba1", "compatibilidad: si no está en la carpeta de estado, mira el repo")
+    repo_real, REPO = REPO, tmp / "repo_pe"
+    REPO.mkdir()
+    try:
+        (REPO / "panel_estado.json").write_text(json.dumps({"estado_dir": str(sd)}))
+        c1 = state_dir() == sd
+        (REPO / "panel_estado.json").unlink()
+        os.environ["COPILOTO_WORK"] = str(tmp / "w")
+        c2 = state_dir() == tmp / "w"
+        del os.environ["COPILOTO_WORK"]
+        c3 = state_dir().name == "starccm-copiloto"
+        check(c1 and c2 and c3 and state_dirs()[0] == state_dir(), "state_dir: panel_estado.json > COPILOTO_WORK > %LOCALAPPDATA%/starccm-copiloto")
+    finally:
+        REPO = repo_real
+    (repo / ".server.json").write_text(json.dumps({**base, "idle_warning": "N min sin actividad: ¿apagar?", "gui": True}))
+    os.utime(repo / ".server.json", (old, old))
     sp = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     (repo / ".inject.lock").write_text(json.dumps({"pid": sp.pid, "tool": "iterate", "started": time.time()}))
     s = read_status(repo)
@@ -680,7 +948,9 @@ def selftest():
         print("OMITE parte visual:", str(e)[:60])
     else:
         os.environ["FAKE_PAUSE"] = "0.4"
-        p = Panel(root)
+        tmp_sd = tmp / "estado_panel"
+        tmp_sd.mkdir()
+        p = Panel(root, repo=trepo, sdir=tmp_sd)
 
         def spin(cond, secs=15):
             end = time.time() + secs
@@ -703,6 +973,7 @@ def selftest():
         check(load_estado().get("modo") == "preciso", "modo sigue guardado")
         p.on_send("otro")
         p.on_send("y otro")
+        p.stop_delay_ms = 10
         p.on_stop()
         spin(lambda: not p.runner.busy)
         check(not p.pending, "Detener descarta la cola")
@@ -712,7 +983,81 @@ def selftest():
         check(load_sid() == "fake-0001", "ventana: sesión guardada")
         p.agent_text("**fuerte** y `cod`\n| a | b |\n|---|---|")
         check("fuerte y cod" in p.hist.get("1.0", "end"), "markdown renderizado")
-        root.destroy()
+        # banda ámbar con idle_warning y GUI sí/no en la barra
+        sj = tmp_sd / ".server.json"
+        sj.write_text(json.dumps({"pid": os.getpid(), "sim": "C:/x/Nueva.sim", "gui": False, "idle_warning": {"msg": "40 min sin actividad: ¿apagar?"}}))
+        p.refresh()
+        check(p.warn.winfo_manager() == "pack" and "40 min sin actividad" in p.warn.cget("text") and "GUI no conectada" in p.status.cget("text"),
+              "ventana: idle_warning en banda ámbar y «GUI no conectada»")
+        sj.write_text(json.dumps({"pid": os.getpid(), "sim": "C:/x/Nueva.sim", "gui": True}))
+        p.refresh()
+        check(p.warn.winfo_manager() == "" and "GUI conectada" in p.status.cget("text"), "ventana: sin aviso la banda se oculta; GUI conectada")
+        # Detener: avisa si el solver sigue vivo con una macro en curso
+        check(stop_warning(trepo, tmp_sd) is None, "tras Detener sin macro en curso: sin aviso")
+        lock = tmp_sd / ".inject.lock"
+        lock.write_text(json.dumps({"pid": 999999, "tool": "iterate", "start": "x"}))
+        w = stop_warning(trepo, tmp_sd)
+        check(w and "iterate" in w and "sigue vivo" in w, "tras Detener con .inject.lock: aviso de solver vivo con macro en curso")
+        p.check_after_stop()
+        check(hasattr(p, "stop_btn") and p.stop_btn.cget("text") == "Apagar solver" and "sigue vivo" in p.hist.get("1.0", "end"),
+              "aviso en el chat con botón «Apagar solver»")
+        lock.unlink()
+        # cerrar el panel con el solver vivo: diálogo Sí / No / Cancelar dentro del panel
+        p.on_close()
+        check(p.dlg is not None and set(p.dlg_btn) == {"si", "no", "cancelar"} and not p.closed, "cerrar con solver vivo pregunta «¿Apagar el solver antes de salir?»")
+        p.dlg_btn["cancelar"].invoke()
+        check(p.dlg is None and not p.closed, "Cancelar no cierra")
+        p.close_timeout = 1.0
+        p.on_close()
+        p.dlg_btn["si"].invoke()
+        check(spin(lambda: "no se apagó a tiempo" in p.hist.get("1.0", "end"), 10) and not p.closed and not p.closing,
+              "Sí con solver que no se apaga: espera el máximo y no cierra a ciegas")
+        spin(lambda: not p.runner.busy and not p.pending, 10)
+        check("Apagando el solver antes de salir" in p.hist.get("1.0", "end") and p.last_msg == MSG_APAGAR, "Sí manda server_stop por el chat")
+        root2 = tk.Tk()  # No: cierra sin apagar
+        root2.withdraw()
+        p2 = Panel(root2, repo=trepo, sdir=tmp_sd)
+        p2.on_close()
+        p2.dlg_btn["no"].invoke()
+        check(p2.closed, "No: cierra sin apagar el solver")
+        p.close_timeout = 20.0  # Sí con apagado real (el .server.json desaparece al segundo)
+        threading.Timer(1.0, lambda: sj.unlink()).start()
+        p.on_close()
+        p.dlg_btn["si"].invoke()
+        t_si = time.time()
+        while time.time() - t_si < 15 and not p.closed:
+            try:
+                root.update()
+            except Exception:
+                break
+            time.sleep(0.02)
+        check(p.closed and time.time() - t_si < 14, f"Sí: server_stop, espera a que el solver muera y cierra ({time.time() - t_si:.1f} s)")
+        root3 = tk.Tk()  # solver apagado: cierra directo
+        root3.withdraw()
+        p3 = Panel(root3, repo=trepo, sdir=tmp_sd)
+        p3.on_close()
+        check(p3.closed and p3.dlg is None, "cerrar con el solver apagado: cierra directo, sin preguntar")
+    # Detener no mata solver/residente aunque cuelguen del árbol de la CLI (taskkill /T los alcanzaría)
+    if os.name == "nt":
+        pf = tmp / "hijos.txt"
+        code = ("import subprocess,sys,time;c=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],creationflags=0x200);"
+                f"open(r'{pf}','w').write(str(c.pid));time.sleep(60)")
+        par = subprocess.Popen([sys.executable, "-c", code])
+        for _ in range(100):
+            if pf.exists() and pf.read_text():
+                break
+            time.sleep(0.1)
+        hijo = int(pf.read_text())
+        kill_tree(par, protect={hijo})
+        time.sleep(0.4)
+        check(par.poll() is not None and pid_alive(hijo), "kill_tree mata la CLI/MCP pero respeta el solver (pid protegido)")
+        subprocess.run(["taskkill", "/PID", str(hijo), "/F"], capture_output=True)
+    check(all(x in DENIED_TOOLS for x in ("Read(./.env)", "Read(**/.env)", "Grep(./.env)", "Grep(**/.env)", "Glob(./.env)", "Glob(**/.env)")),
+          "reglas de denegación Read/Grep/Glob para .env y **/.env")
+    c = build_cmd("x", None)
+    check("--disallowedTools" in c and c[c.index("--disallowedTools") + 1] == ",".join(DENIED_TOOLS), "la CLI se lanza con --disallowedTools")
+    check("nunca muestres claves" in ESTILO.lower() and "conocimiento/" in ESTILO and len(ESTILO) < 900,
+          f"prompt: prohíbe mostrar credenciales, lee conocimiento/ solo si hace falta, < 900 car. ({len(ESTILO)})")
     print("TODO OK" if ok_all else "HAY FALLAS", f"({time.time() - t0:.1f} s)")
     return 0 if ok_all else 1
 

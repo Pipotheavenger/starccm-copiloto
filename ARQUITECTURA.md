@@ -25,12 +25,13 @@ panel/chat_panel.py (tkinter, siempre encima) │                          │ c
       tools mcp__starccm__* y muestra eventos ├── conocimiento/   recetas Java verificadas, lecciones, casos, memoria
                                               ├── pipelines/      guiones fijos (bomba estándar en UNA macro)
                                               ├── casos/<caso>/   cad, reportes, imágenes, RESUMEN.md
-                                              └── sims/, macros/  de trabajo (ignorados por git)
+                                              └── COPILOTO_WORK/  sims, macros, residente, tiempos.csv, .server.json, .inject.lock
 ```
 
 ### 1. `mcp_server.py` (un archivo, FastMCP; base: `conocimiento/mcp_server_anterior.py`)
 
-Herramientas heredadas: `server_start`, `server_stop`, `server_status`, `run_java`, `inspect`, `iterate`,
+Herramientas (15): `server_start`, `server_stop`, `server_status`, `gui_attach`, `gui_status`, `inspect`, `run_java`,
+`run_steps`, `iterate`, `pump_case`, `export_scene`, `save`, `recipe_search`, `recipe_save`, `docs_search`. Heredadas: `server_start`, `server_stop`, `server_status`, `run_java`, `inspect`, `iterate`,
 `export_scene`, `save`, `recipe_search`, `recipe_save`, `docs_search`. Cambios obligatorios:
 
 1. **Turnos entre procesos**: candado de archivo `.inject.lock` (pid, herramienta, inicio). Toda inyección lo toma; si
@@ -71,9 +72,47 @@ Corre en un hilo; la ventana nunca se congela. `--selftest` con `tests/fake_clau
 
 ### 3. Conocimiento (`conocimiento/`) y `CLAUDE.md`
 
-Todo lo aprendido por el agente anterior se conserva: recetas (34), lecciones, casos de referencia y memoria.
+Todo lo aprendido por el agente anterior se conserva: recetas (35), lecciones, casos de referencia y memoria.
 `CLAUDE.md` del repo nuevo = reglas operativas condensadas + flujo de bomba + lecciones vigentes (las del remoto
 retirado y de la UI web antigua quedan solo en `conocimiento/CLAUDE_agente_anterior.md`).
+
+### 4. Carpeta de trabajo, cliente residente y vigilante
+
+- **`COPILOTO_WORK`** (por defecto `%LOCALAPPDATA%\starccm-copiloto`, fuera del repo y de OneDrive): `sims/` (copias de trabajo y
+  logs del solver), `macros/` (cada macro inyectada con su salida `.out`), `residente/` (inbox, salida, latido y log del cliente
+  residente), `tiempos.csv` (fecha, herramienta, ms, `via`, ok, inyecciones), `.server.json` (estado: pid, puerto, caso,
+  `idle_warning`) y `.inject.lock` (turno). Motivo: OneDrive sincronizaría cada `.sim` de 50-150 MB y bloquea archivos
+  mientras escribe. En el repo solo cosas pequeñas: `casos/`, recetas, conocimiento, `.env` y `.venv`.
+- **Cliente residente** (`STARCCM_RESIDENT=1`, defecto; `poc_residente/RESULTADO.md`): un solo cliente batch `-noexit`
+  (`Residente.java`) vigila `residente/inbox` y ejecuta cada macro con `StarScript`: 0,7-1 s por macro frente a 8,6 s del
+  cliente batch (~10x). No precompila: el error de compilación vuelve en ~0,6 s con el texto de javac. Se relanza si muere; tras
+  2 intentos fallidos cae al cliente batch (con `javac` previo, `STARCCM_PRECOMPILE`). Cada respuesta trae `via` y `ms`.
+- **Vigilante de inactividad independiente**: cada turno del panel es un `claude -p` nuevo que arranca y mata su MCP, así que
+  el vigilante no puede vivir solo dentro de él: trabaja sobre `.server.json` (mtime = última actividad) y los candados.
+  Sin GUI guarda y apaga a los `STARCCM_IDLE_MIN` (30; PoD cobra por hora); con GUI solo escribe `idle_warning` y el panel
+  pregunta. Una macro en marcha cuenta como actividad.
+- **Panel**: modo Rápido (sonnet, esfuerzo bajo) / Preciso (opus), cola de mensajes mientras el agente trabaja, cronómetro por
+  herramienta, línea de tiempos por turno, Abrir GUI, Detener (solo la CLI), Apagar con confirmación.
+
+## Medido
+
+Prueba real de punta a punta (`tests/real_e2e.py`, BombaRapida_v1 de CFturbo, modo rápido, `iterar` + `post`, 4 procesos,
+2026-10-26; `casos/BombaRapida_e2e_174159/e2e.json`):
+
+| fase | segundos |
+|---|---|
+| `server_start` (licencia, MPI) | 44,2 |
+| `pump_case` | 142,8 |
+| · importar, regiones, interfaces, malla, física, fronteras, reportes (resto del pipeline) | 37,5 |
+| · iterar (250 it, parada por estabilidad) | 100,8 |
+| · post (planos, 3 PNG, y+, Euler) | 3,2 |
+| `server_stop` (guarda) | 7,3 |
+| **total** | **194,3 (3 min 14 s)** |
+
+Todo por la vía residente (`via=residente`). Resultados: H 16,74 m, M 8,454 N·m, η 88,6 %, H_Euler 18,75 m, η_Euler 0,892,
+balance de masa 0,0002 %, Q_in −13,864 / Q_out 13,864, estable en 250 iteraciones, 3 PNG. Referencia anterior: 3 min 45 s con 300 it
+y 45 min con una corrida improvisada. Las divisiones entre reportes van protegidas `(abs(den) > 1e-9 ? num/den : 0)`: sin eso
+`eta_Euler` aborta en la iteración 1 (`H_Euler = 0`).
 
 ## Reglas de diseño
 

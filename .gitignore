@@ -10,3 +10,4 @@ casos/*/
 .inject.lock
 .mcp.json
 panel/.estado.json
+panel_estado.json

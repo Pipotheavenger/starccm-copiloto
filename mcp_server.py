@@ -14,7 +14,8 @@ vivo lo tiene, se espera `wait_s` y si no se devuelve {"ok": false, "busy": "...
 latido en 2 h) se limpia solo.
 
 Uso:   python mcp_server.py            (stdio, lo lanza Claude Code desde .mcp.json)
-       python mcp_server.py --selftest (starccm+ falso de tests/, sin licencia ni solver, < 30 s)
+       python mcp_server.py --selftest (starccm+ falso de tests/, sin licencia ni solver, < 45 s)
+       python mcp_server.py --vigilante <puerto>  (lo lanza server_start; no se llama a mano)
 
 Env (se leen también de .env en la raíz del repo y de ~/.starccm-agent.env, formato KEY=VALUE):
   STARCCM_HOME     carpeta STAR-CCM+<ver> (default: la más nueva en C:\\Program Files\\Siemens)
@@ -23,8 +24,9 @@ Env (se leen también de .env en la raíz del repo y de ~/.starccm-agent.env, fo
   STARCCM_LICPATH  servidor de licencias (default 1999@flex.cd-adapco.com)
   STARCCM_PORT     puerto del servidor (default 47827)
   STARCCM_NP       procesos paralelos (default: núcleos - 2)
-  STARCCM_IDLE_MIN minutos sin tools antes de guardar y apagar (default 30; PoD cobra por hora).
-                   Con GUI conectada NO apaga: deja `idle_warning` en .server.json.
+  STARCCM_IDLE_MIN minutos sin actividad antes de guardar y apagar (default 30; PoD cobra por hora). Lo hace el
+                   VIGILANTE (proceso aparte, sobrevive al MCP). Con GUI conectada NO apaga: deja `idle_warning`
+                   (texto) en .server.json. STARCCM_VIGILANTE=0 lo desactiva.
   STARCCM_LOCK_WAIT_S segundos que una tool espera el turno (default 120)
   STARCCM_PRECOMPILE 1 (default) compila la macro con el javac del JDK de STAR-CCM+ antes de
                    inyectarla SOLO en la vía batch (fallback): un error de sintaxis o de nombre de clase vuelve en
@@ -39,7 +41,8 @@ Env (se leen también de .env en la raíz del repo y de ~/.starccm-agent.env, fo
 Carpetas: en COPILOTO_WORK sims/ (.sim de trabajo, nunca el original del usuario), macros/ (cada macro inyectada,
 con su salida .out), residente/, logs del solver (sims/*.server.log), tiempos.csv. En la raíz del repo: casos/<caso>/
 (cad, reportes, imágenes, RESUMEN.md), conocimiento/recetas/ (snippets Java que funcionaron), pipelines/ (guiones
-fijos). Estado del servidor en .server.json y turnos en .inject.lock (pequeños, en la raíz: el panel los lee).
+fijos). Estado del servidor (.server.json), turnos (.inject.lock) y vigilante-<puerto>.json viven en estado_dir() = la
+carpeta de trabajo (fuera de OneDrive); el repo solo guarda panel_estado.json, que dice dónde (el panel lo lee).
 
 Medición: cada respuesta de tool trae `ms` (total) y `via` (residente | batch | mixto | ninguno); además se anota
 en WORK/tiempos.csv (fecha, herramienta, ms, via, ok, inyecciones).
@@ -86,9 +89,18 @@ TIEMPOS = WORK / "tiempos.csv"
 CASES = HERE / "casos"
 RECIPES = HERE / "conocimiento" / "recetas"
 PIPELINE_BOMBA = HERE / "pipelines" / "bomba.py"
-STATE_FILE = HERE / ".server.json"
-LOCK_FILE = HERE / ".inject.lock"
-AGENT_LOG = HERE / "agent.log"
+
+
+def estado_dir() -> Path:
+    """Carpeta del estado compartido entre procesos (.server.json, .inject.lock, vigilante): la de trabajo, FUERA de OneDrive
+    (que bloquea archivos mientras sincroniza y dejaba candados huérfanos). El panel la encuentra por panel_estado.json."""
+    return WORK
+
+
+STATE_FILE = estado_dir() / ".server.json"
+LOCK_FILE = estado_dir() / ".inject.lock"
+AGENT_LOG = Path(os.environ.get("COPILOTO_AGENT_LOG") or HERE / "agent.log")
+PANEL_ESTADO = HERE / "panel_estado.json"  # único archivo de estado que queda en el repo: dice dónde está lo demás
 KEEP_MACROS = 200
 
 
@@ -158,9 +170,10 @@ def _scrub(o):
     return o
 
 
-def _javac() -> tuple[str, str] | None:
-    """(javac, classpath) del JDK que trae STAR-CCM+, o None si no está o el exe es el falso."""
-    if not HOME or not PRECOMPILE or EXE.lower().endswith(".py"):
+def _javac(real: bool = False) -> tuple[str, str] | None:
+    """(javac, classpath) del JDK que trae STAR-CCM+, o None si no está o el exe es el falso. real=True ignora el falso y
+    STARCCM_PRECOMPILE (lo usa el selftest para compilar macros reales aunque el solver sea el de mentira)."""
+    if not HOME or (not real and (not PRECOMPILE or EXE.lower().endswith(".py"))):
         return None
     jdks = sorted(glob.glob(str(HOME.parent / "jdk" / "*" / "jdk*" / "bin" / "javac.exe")))
     if not jdks:
@@ -173,7 +186,6 @@ def _javac() -> tuple[str, str] | None:
 # ----------------------------------------------------------------------------- estado
 _lock = threading.RLock()
 _last_tool = time.time()
-_proc: subprocess.Popen | None = None
 
 
 def _state() -> dict:
@@ -190,6 +202,7 @@ def _state() -> dict:
 
 
 def _write_state(d: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(d, indent=1, ensure_ascii=False), encoding="utf-8")
     tmp.replace(STATE_FILE)
@@ -244,6 +257,86 @@ def _kill_tree(pid: int) -> None:
             os.kill(pid, 9)
         except OSError:
             pass
+
+
+# Lanzamiento FUERA del árbol de la CLI. «Detener» y cerrar el panel hacen `taskkill /T /F` sobre el claude.exe, que es el
+# padre del MCP: todo hijo (y nieto) vivo del MCP muere con él, solver incluido. Con un proceso intermedio que lanza el
+# destino y termina enseguida, el padre del destino queda muerto y ningún árbol que parta de claude.exe lo alcanza.
+# CREATE_NEW_PROCESS_GROUP|CREATE_BREAKAWAY_FROM_JOB (el breakaway solo si el job de la CLI lo permite: si no, se reintenta
+# sin él) y CREATE_NO_WINDOW (consola oculta PROPIA). OJO: con DETACHED_PROCESS (sin consola) un .bat como starccm+.bat lanza
+# hijos de consola que pierden la salida redirigida (medido: el log del servidor quedaba vacío y nunca salía «Server::start»);
+# con consola oculta llega todo. COPILOTO_DETACHED=1 cambia CREATE_NO_WINDOW por DETACHED_PROCESS.
+_LAUNCHER = r"""
+import json, os, subprocess, sys
+a = json.loads(sys.stdin.read())
+kw = dict(stdin=subprocess.DEVNULL, close_fds=True, cwd=a.get("cwd") or None)
+kw["stdout"] = open(a["log"], "ab") if a.get("log") else subprocess.DEVNULL
+kw["stderr"] = subprocess.STDOUT
+brk = None
+if os.name == "nt":
+    fl = (0x00000008 if a.get("detached") else 0x08000000) | 0x00000200  # (DETACHED_PROCESS|CREATE_NO_WINDOW) | NEW_PROCESS_GROUP
+    try:
+        p = subprocess.Popen(a["cmd"], creationflags=fl | 0x01000000, **kw)  # CREATE_BREAKAWAY_FROM_JOB
+        brk = True
+    except OSError:
+        p = subprocess.Popen(a["cmd"], creationflags=fl, **kw)
+        brk = False
+else:
+    p = subprocess.Popen(a["cmd"], start_new_session=True, **kw)
+print(json.dumps({"pid": p.pid, "breakaway": brk}), flush=True)
+"""
+
+
+def _spawn_detached(cmd: list[str], log: Path | str | None = None, cwd: Path | str | None = None) -> dict:
+    """Lanza `cmd` desacoplado del árbol del MCP (doble lanzamiento). stdout y stderr a `log` (o a la nada), stdin a la nada.
+    Devuelve {pid, breakaway}. No espera al destino: el intermedio termina en cuanto lo ha creado."""
+    arg = {"cmd": cmd, "log": str(log) if log else None, "cwd": str(cwd) if cwd else None,
+           "detached": os.environ.get("COPILOTO_DETACHED") == "1"}
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    p = subprocess.Popen([sys.executable, "-I", "-c", _LAUNCHER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, creationflags=flags)
+    try:
+        out, err = p.communicate(json.dumps(arg), timeout=60)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        raise RuntimeError("el lanzador intermedio no respondió en 60 s")
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise RuntimeError(f"no pude lanzar {Path(cmd[0]).name}: {_redact((err or out or 'sin salida').strip()[-400:])}")
+
+
+def _write_panel_estado() -> None:
+    """panel_estado.json (en el repo) dice al panel dónde están .server.json e .inject.lock. Solo se reescribe si cambia."""
+    d = {"estado_dir": str(estado_dir()), "state_file": str(STATE_FILE), "lock_file": str(LOCK_FILE),
+         "work": str(WORK), "residente_dir": str(RES_DIR)}
+    try:
+        if json.loads(PANEL_ESTADO.read_text(encoding="utf-8")) == d:
+            return
+    except (OSError, ValueError):
+        pass
+    try:
+        tmp = PANEL_ESTADO.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=1, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, PANEL_ESTADO)
+    except OSError:
+        pass
+
+
+def _migrate_legacy(old_dir: Path, new_state: Path, new_lock: Path) -> list[str]:
+    """Antes .server.json e .inject.lock vivían en el repo (OneDrive). Si aún están allí y en la carpeta de estado no,
+    se mueven (un solver vivo no se pierde de vista). Devuelve lo movido."""
+    moved = []
+    for name, dst in ((".server.json", new_state), (".inject.lock", new_lock)):
+        src = Path(old_dir) / name
+        if src.is_file() and src.resolve() != Path(dst).resolve() and not Path(dst).exists():
+            try:
+                Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+                moved.append(name)
+            except OSError:
+                pass
+    return moved
 
 
 def alive(st: dict | None = None) -> bool:
@@ -302,6 +395,7 @@ def lock_holder() -> dict | None:
 def _acquire(tool: str, wait_s: float) -> dict | None:
     """Toma .inject.lock (O_EXCL). None si lo logra; si no, el dueño (dict) tras esperar wait_s."""
     deadline = time.time() + max(0.0, wait_s)
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)  # la carpeta de estado puede no existir aún (primer uso)
     while True:
         try:
             fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -385,6 +479,7 @@ def last_activity() -> float | None:
         ts += [p.stat().st_mtime for p in MACROS.glob("Agent_*") if p.is_file()]
     if STATE_FILE.is_file():
         ts.append(STATE_FILE.stat().st_mtime)
+        # (el log del solver NO cuenta: el simple sondeo del puerto, que hace el propio vigilante, ya escribe una línea en él)
     return max(ts) if ts else None
 
 
@@ -441,63 +536,155 @@ def idle_seconds() -> float:
     return min(idle_disk_seconds(), time.time() - _last_tool)
 
 
-def _set_warning(st: dict, w: dict | None) -> None:
-    """Escribe/borra idle_warning en .server.json SIN contar como actividad (se restaura el mtime)."""
+def _publish_idle(st: dict, gui: bool, idle_min: float, warning: str | None) -> None:
+    """Escribe gui, idle_min, idle_warning (TEXTO legible) e idle_checked en .server.json SIN contar como actividad
+    (se restaura el mtime). No toca nada si el servidor ya es otro o ya se apagó."""
     try:
         s = STATE_FILE.stat()
     except OSError:
         return
-    st = dict(st)
-    if w:
-        st["idle_warning"] = w
+    cur = _state()
+    if not cur.get("pid") or cur.get("pid") != st.get("pid"):
+        return
+    cur.update(gui=bool(gui), idle_min=idle_min, idle_checked=datetime.now().isoformat(timespec="seconds"))
+    if warning:
+        cur["idle_warning"] = warning
     else:
-        st.pop("idle_warning", None)
-    _write_state(st)
+        cur.pop("idle_warning", None)
+    _write_state(cur)
     os.utime(STATE_FILE, ns=(s.st_atime_ns, s.st_mtime_ns))
 
 
-def _idle_stop() -> None:
+def idle_warning_text(mins: int) -> str:
+    return f"solver encendido {mins} min sin actividad; GUI conectada: no se apaga"
+
+
+def _idle_stop() -> str:
+    """Un chequeo de inactividad (lo hace el vigilante cada 30 s): publica gui/idle_min/idle_warning en .server.json y,
+    sin GUI y pasado STARCCM_IDLE_MIN, guarda y apaga. Solo mira el DISCO (macros en marcha o recientes y .server.json), que es
+    lo que ven todos los procesos. Devuelve "sin_servidor" | "ok" | "aviso" | "apagado" | "no_apagado"."""
     st = _state()
     if not (st.get("pid") and alive(st)):
-        return
-    idle = idle_seconds()
-    if idle <= IDLE_MIN * 60:
-        if st.get("idle_warning"):
-            _set_warning(st, None)  # hubo actividad: el aviso ya no vale
-        return
-    if _gui()["connected"]:
-        # con la GUI conectada alguien está mirando: no se apaga, se avisa al panel (que pregunta «¿apagar?»)
-        mins = int(idle // 60)
-        if (st.get("idle_warning") or {}).get("idle_min") != mins:
-            _set_warning(st, {"idle_min": mins, "gui": True, "at": datetime.now().isoformat(timespec="seconds"),
-                              "msg": f"solver encendido {mins} min sin actividad: ¿apagar?"})
-        return
+        return "sin_servidor"
+    idle = idle_disk_seconds()
+    mins = int(idle // 60)
+    over = idle > IDLE_MIN * 60
+    gui = bool(_gui(fresh=True)["connected"])
+    if over and gui:  # alguien mira: no se apaga, se avisa (el panel lo muestra)
+        _publish_idle(st, gui, round(idle / 60, 1), idle_warning_text(mins))
+        return "aviso"
+    _publish_idle(st, gui, round(idle / 60, 1), None)
+    if not over:
+        return "ok"
     with _lock:  # si una tool de este proceso tenía el candado, se reevalúa al liberarse
-        if idle_seconds() <= IDLE_MIN * 60:
-            return
+        if idle_disk_seconds() <= IDLE_MIN * 60:
+            return "ok"
         r = server_stop(save=True)
         if r.get("save_error") or r.get("busy"):
-            _log(f"watchdog: no apago: {r.get('save_error') or r.get('busy')}")
+            _log(f"vigilante: no apago: {r.get('save_error') or r.get('busy')}")
+            return "no_apagado"
+        _log(f"vigilante: solver apagado por {mins} min sin actividad (guardado: {r.get('saved')})")
+        return "apagado"
 
 
-def _idle_watchdog() -> None:
-    """Apagado por inactividad: PoD cobra por hora de sesión. Lo corre el MCP (proceso de larga vida)."""
-    while True:
-        time.sleep(60)
-        try:
-            _idle_stop()
-        except Exception as e:  # noqa: BLE001
-            _log(f"watchdog: {e}")
+# ----------------------------------------------------------------------------- vigilante independiente
+# Un proceso pequeño (`python mcp_server.py --vigilante <puerto>`) lanzado por server_start FUERA del árbol de la CLI. En el
+# panel cada turno es un `claude -p` nuevo que arranca y mata su MCP: un hilo del MCP no vigila nada entre turnos y PoD
+# cobra por hora. El vigilante vive mientras viva el servidor: cada VIGILANTE_S (30 s) hace _idle_stop(); termina cuando
+# el servidor muere. Uno por puerto: vigilante-<puerto>.json en la carpeta de estado (pid + latido).
+VIGILANTE_S = float(os.environ.get("COPILOTO_VIGILANTE_S", "30"))
+VIGILANTE_ON = os.environ.get("STARCCM_VIGILANTE", "1") != "0"
+VIG_GONE_S = float(os.environ.get("COPILOTO_VIG_GONE_S", "3"))  # s seguidos sin servidor antes de terminar (un server_start que reinicia no lo mata)
 
 
-_wd_started = False
+def _vig_file(port: int) -> Path:
+    return estado_dir() / f"vigilante-{port}.json"
+
+
+def _vig_info(port: int) -> dict:
+    try:
+        d = json.loads(_vig_file(port).read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _vigilante_pid(port: int) -> int | None:
+    """Pid del vigilante vivo de ese puerto (proceso vivo y latido reciente) o None."""
+    d = _vig_info(port)
+    pid = int(d.get("pid") or 0)
+    if pid and pid != os.getpid() and _pid_alive(pid) and time.time() - float(d.get("t") or 0) < 3 * VIGILANTE_S + 30:
+        return pid
+    return None
+
+
+def _vigilante_ensure(port: int) -> dict:
+    """Garantiza UN vigilante para el puerto: si no hay, lo lanza desacoplado. No espera a que arranque."""
+    if not VIGILANTE_ON:
+        return {"vigilante": "desactivado"}
+    pid = _vigilante_pid(port)
+    if pid:
+        return {"vigilante": pid, "nuevo": False}
+    py = HERE / ".venv" / "Scripts" / "python.exe"
+    cmd = [str(py) if py.is_file() else sys.executable, str(Path(__file__).resolve()), "--vigilante", str(port)]
+    try:
+        estado_dir().mkdir(parents=True, exist_ok=True)
+        sp = _spawn_detached(cmd, log=estado_dir() / f"vigilante-{port}.log", cwd=estado_dir())
+    except Exception as e:  # noqa: BLE001
+        _log(f"vigilante: no pude lanzarlo: {e}")
+        return {"vigilante": None, "error": str(e)[:200]}
+    _log(f"vigilante lanzado pid {sp['pid']} (puerto {port}, breakaway {sp.get('breakaway')})")
+    return {"vigilante": sp["pid"], "nuevo": True}
+
+
+def _vigilante_main(port: int) -> int:
+    me = os.getpid()
+    if _vigilante_pid(port):
+        return 0  # ya hay uno
+    f = _vig_file(port)
+
+    def beat() -> None:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"pid": me, "port": port, "t": time.time(), "every_s": VIGILANTE_S}), encoding="utf-8")
+        os.replace(tmp, f)
+
+    beat()
+    _log(f"vigilante {me} vigila el puerto {port} (cada {VIGILANTE_S:g} s, apaga a los {IDLE_MIN:g} min sin GUI)")
+    last, gone_since = 0.0, None
+    try:
+        while True:
+            st = _state()
+            up = bool(st.get("pid")) and st.get("port") == port and _pid_alive(st["pid"])
+            if up:
+                gone_since = None
+            else:
+                gone_since = gone_since or time.time()
+                if time.time() - gone_since >= VIG_GONE_S:
+                    break
+            if up and time.time() - last >= VIGILANTE_S:
+                last = time.time()
+                try:
+                    beat()
+                    _idle_stop()
+                except Exception as e:  # noqa: BLE001
+                    _log(f"vigilante: {type(e).__name__}: {e}")
+            time.sleep(min(1.0, VIGILANTE_S))
+    finally:
+        if _vig_info(port).get("pid") == me:
+            f.unlink(missing_ok=True)
+    _log(f"vigilante {me} termina: el servidor del puerto {port} ya no está")
+    return 0
 
 
 def start_watchdog() -> None:
-    global _wd_started
-    if not _wd_started:
-        _wd_started = True
-        threading.Thread(target=_idle_watchdog, daemon=True).start()
+    """Al arrancar el MCP: si ya hay un solver vivo (de otra sesión o de antes), asegura su vigilante."""
+    try:
+        st = _state()
+        if st.get("pid") and alive(st):
+            _vigilante_ensure(int(st["port"]))
+    except Exception as e:  # noqa: BLE001
+        _log(f"watchdog: {e}")
 
 
 def _log(msg: str) -> None:
@@ -506,14 +693,97 @@ def _log(msg: str) -> None:
 
 
 # ----------------------------------------------------------------------------- GUI conectada
-GUI_TTL = 10.0  # s de caché: listar procesos con PowerShell cuesta ~1,6 s
+GUI_TTL = 10.0  # s de caché del listado de procesos (nativo ~20 ms; el respaldo de PowerShell ~1,6 s)
 _gui_cache: tuple[float, dict] | None = None
 
 
+def _procs_native(needle: str) -> list[dict]:
+    """Procesos de Windows cuya línea de comandos contiene `needle`, SIN lanzar PowerShell ni wmic (~1,6 s por llamada):
+    CreateToolhelp32Snapshot para listarlos y la línea de comandos leída del PEB de cada uno (ctypes, ~20 ms). Los que no
+    se pueden abrir (de otro usuario o del sistema) se saltan. Lanza si algo falla: el llamador cae a PowerShell."""
+    import ctypes
+    from ctypes import wintypes as w
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        raise OSError("solo Python de 64 bits")
+    k32, nt = ctypes.WinDLL("kernel32", use_last_error=True), ctypes.WinDLL("ntdll")
+
+    class PE(ctypes.Structure):
+        _fields_ = [("dwSize", w.DWORD), ("cntUsage", w.DWORD), ("th32ProcessID", w.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", w.DWORD), ("cntThreads", w.DWORD), ("th32ParentProcessID", w.DWORD),
+                    ("pcPriClassBase", w.LONG), ("dwFlags", w.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    class PBI(ctypes.Structure):
+        _fields_ = [("Reserved1", ctypes.c_void_p), ("PebBaseAddress", ctypes.c_void_p), ("Reserved2", ctypes.c_void_p * 2),
+                    ("UniqueProcessId", ctypes.c_void_p), ("Reserved3", ctypes.c_void_p)]
+
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    k32.Process32FirstW.argtypes = k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PE)]
+    k32.ReadProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    nt.NtQueryInformationProcess.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        raise OSError("CreateToolhelp32Snapshot")
+    rows = []
+
+    def rpm(h, addr, n):
+        buf = ctypes.create_string_buffer(n)
+        got = ctypes.c_size_t(0)
+        if not k32.ReadProcessMemory(h, ctypes.c_void_p(addr), buf, n, ctypes.byref(got)) or got.value != n:
+            raise OSError("ReadProcessMemory")
+        return buf.raw
+
+    try:
+        pe = PE()
+        pe.dwSize = ctypes.sizeof(PE)
+        ok = k32.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            pid, name = pe.th32ProcessID, pe.szExeFile
+            ok = k32.Process32NextW(snap, ctypes.byref(pe))
+            if pid in (0, 4):
+                continue
+            h = k32.OpenProcess(0x1000 | 0x0010, False, pid)  # QUERY_LIMITED_INFORMATION | VM_READ
+            if not h:
+                h = k32.OpenProcess(0x0400 | 0x0010, False, pid)  # QUERY_INFORMATION | VM_READ
+            if not h:
+                continue
+            try:
+                pbi = PBI()
+                if nt.NtQueryInformationProcess(h, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), None) != 0 or not pbi.PebBaseAddress:
+                    continue
+                params = int.from_bytes(rpm(h, pbi.PebBaseAddress + 0x20, 8), "little")  # PEB.ProcessParameters
+                us = rpm(h, params + 0x70, 16)  # RTL_USER_PROCESS_PARAMETERS.CommandLine (UNICODE_STRING)
+                length, buf = int.from_bytes(us[:2], "little"), int.from_bytes(us[8:16], "little")
+                if not length or not buf or length > 65_000:
+                    continue
+                cmd = rpm(h, buf, length).decode("utf-16-le", "replace")
+                if needle in cmd:
+                    rows.append({"pid": pid, "name": name, "cmd": cmd})
+            except OSError:
+                continue
+            finally:
+                k32.CloseHandle(h)
+    finally:
+        k32.CloseHandle(snap)
+    return rows
+
+
 def _list_procs() -> list[dict]:
-    """Procesos con «-host» en la línea de comandos: [{pid, name, cmd}]. [] si no se puede listar."""
+    """Procesos con «-host» en la línea de comandos: [{pid, name, cmd}]. [] si no se puede listar.
+    STARCCM_TEST_PROCS=<archivo.json> sustituye el listado (gancho de pruebas: el vigilante es otro proceso)."""
+    hook = os.environ.get("STARCCM_TEST_PROCS")
+    if hook:
+        try:
+            return json.loads(Path(hook).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
     try:
         if os.name == "nt":
+            try:
+                return _procs_native("-host")
+            except Exception:  # noqa: BLE001  (sin ctypes/PEB: PowerShell, una sola llamada)
+                pass
             ps = ("Get-CimInstance Win32_Process -Filter \"CommandLine like '%-host%'\" | "
                   "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress")
             out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
@@ -568,8 +838,9 @@ POLL_S = 1.0  # s entre sondeos al arrancar/apagar/esperar la GUI (el selftest l
 
 
 def _wrap(body: str, imports: str, tag: str) -> str:
-    extra = [i.strip().rstrip(";").removeprefix("import ").strip()
-             for i in imports.replace("\n", ",").split(",") if i.strip()]
+    # (defensa: «['a', 'b']» de un str(lista) daba «import 'a';» y la macro no compilaba: se quitan comillas y corchetes)
+    extra = [i.strip().strip("[]'\" ").rstrip(";").removeprefix("import ").strip()
+             for i in imports.replace("\n", ",").split(",") if i.strip().strip("[]'\" ")]
     imps = "\n".join(f"import {i};" for i in IMPORTS + [e for e in extra if e not in IMPORTS])
     cls = f"Agent_{tag}"
     return f"""{imps}
@@ -656,6 +927,9 @@ def _inject_locked(body: str, imports: str, timeout: float, expect_death: bool) 
     st = _state()
     if not st.get("pid") or not _pid_alive(st["pid"]):
         raise RuntimeError("No hay servidor de STAR-CCM+ vivo. Usa server_start primero.")
+    if st.get("init") == "pendiente":  # server_start no la corre (no espera al residente): la primera inyección la hace antes
+        _run_init(st)
+        st = _state()
     if not _port_open(st.get("port", 0)):
         raise RuntimeError(f"El proceso del servidor (pid {st['pid']}) sigue pero no responde en el puerto {st.get('port')}: "
                            "si acaba de arrancar espera; si está colgado, server_stop() lo mata.")
@@ -700,8 +974,8 @@ RES_START_WAIT = 60.0     # s esperando el primer latido tras lanzarlo
 RES_POLL = 0.03
 RES_PAUSE_S = 300.0       # tras fallar el residente dos veces, el batch directo durante este tiempo
 _res_off_until = 0.0
-_res_proc: subprocess.Popen | None = None
 _res_launches = 0
+_res_waits = 0            # veces que una inyección esperó el primer latido de un residente recién lanzado (lo prueba el selftest)
 
 _RESIDENTE_JAVA = """import star.common.*;
 import java.io.*;
@@ -776,14 +1050,12 @@ def _res_healthy(st: dict) -> bool:
 
 def _res_kill(why: str) -> None:
     """Mata el residente (nunca el servidor) y borra su estado."""
-    global _res_proc
     ri = _res_info()
     if ri.get("pid") and _pid_alive(ri["pid"]):
         _log(f"residente {ri['pid']} matado: {why}")
         _kill_tree(ri["pid"])
     (RES_DIR / "residente.json").unlink(missing_ok=True)
     (RES_DIR / "heartbeat").unlink(missing_ok=True)
-    _res_proc = None
 
 
 def _res_stop(wait: float = 8.0) -> bool:
@@ -804,9 +1076,10 @@ def _res_stop(wait: float = 8.0) -> bool:
     return had
 
 
-def _res_launch(st: dict) -> tuple[bool, str]:
-    """Lanza el residente desacoplado y espera su primer latido. (ok, motivo del fallo)."""
-    global _res_proc, _res_launches
+def _res_spawn(st: dict) -> dict:
+    """Lanza el residente desacoplado (fuera del árbol de la CLI) y vuelve SIN esperar su latido. Devuelve lo que
+    escribe en residente.json (pid, server_pid, log, t de lanzamiento)."""
+    global _res_launches
     inbox, out = RES_DIR / "inbox", RES_DIR / "out"
     for d in (inbox, out):
         d.mkdir(parents=True, exist_ok=True)
@@ -817,20 +1090,28 @@ def _res_launch(st: dict) -> tuple[bool, str]:
     java.write_text(_RESIDENTE_JAVA.replace("%BASE%", _jpath(RES_DIR)), encoding="utf-8")
     log = RES_DIR / f"residente-{st.get('port')}-{st.get('pid')}.log"
     cmd = _starccm_cmd() + ["-host", f"localhost:{st['port']}", "-batch", str(java), "-noexit"] + _lic_flags()
-    flags = (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0
     t_launch = time.time()
-    with open(log, "ab") as lf:  # el hijo hereda el manejador: aquí se puede cerrar
-        _res_proc = p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, cwd=str(RES_DIR),
-                                         creationflags=flags, close_fds=True, start_new_session=(os.name != "nt"))
+    sp = _spawn_detached(cmd, log=log, cwd=RES_DIR)
     _res_launches += 1
-    (RES_DIR / "residente.json").write_text(json.dumps({
-        "pid": p.pid, "server_pid": st.get("pid"), "port": st.get("port"), "log": str(log),
-        "started": datetime.now().isoformat(timespec="seconds")}), encoding="utf-8")
-    _log(f"residente lanzado pid {p.pid} (servidor {st.get('pid')}): {_redact(' '.join(cmd))}")
+    info = {"pid": sp["pid"], "server_pid": st.get("pid"), "port": st.get("port"), "log": str(log), "t": t_launch,
+            "started": datetime.now().isoformat(timespec="seconds"), "breakaway": sp.get("breakaway")}
+    (RES_DIR / "residente.json").write_text(json.dumps(info), encoding="utf-8")
+    _log(f"residente lanzado pid {sp['pid']} (servidor {st.get('pid')}): {_redact(' '.join(cmd))}")
+    return info
+
+
+def _res_wait_beat(info: dict) -> tuple[bool, str]:
+    """Espera el primer latido de un residente recién lanzado. (ok, motivo del fallo)."""
+    global _res_waits
+    _res_waits += 1
+    t_launch, pid, log = info.get("t", time.time()), info["pid"], Path(info.get("log") or "")
     while time.time() - t_launch < RES_START_WAIT:
-        if p.poll() is not None:
-            tail = _redact(log.read_text(encoding="utf-8", errors="replace")[-600:])
-            return False, f"el residente terminó con código {p.returncode} al arrancar: {tail}"
+        if not _pid_alive(pid):
+            try:
+                tail = _redact(log.read_text(encoding="utf-8", errors="replace")[-600:])
+            except OSError:
+                tail = ""
+            return False, f"el residente terminó al arrancar: {tail}"
         try:
             if (RES_DIR / "heartbeat").stat().st_mtime >= t_launch - 0.5:
                 return True, ""
@@ -840,14 +1121,38 @@ def _res_launch(st: dict) -> tuple[bool, str]:
     return False, f"el residente no dio latido en {RES_START_WAIT:.0f} s"
 
 
+def _res_launch(st: dict) -> tuple[bool, str]:
+    """Lanza el residente y espera su primer latido. (ok, motivo del fallo)."""
+    return _res_wait_beat(_res_spawn(st))
+
+
+def _res_booting(ri: dict, st: dict) -> bool:
+    """¿Residente de ESTE servidor, vivo, lanzado hace poco y aún sin su primer latido? (server_start no lo espera)"""
+    if not (ri.get("pid") and ri.get("server_pid") == st.get("pid") and _pid_alive(ri["pid"])):
+        return False
+    t = ri.get("t") or 0
+    if time.time() - t >= RES_START_WAIT:
+        return False
+    try:
+        return (RES_DIR / "heartbeat").stat().st_mtime < t - 0.5
+    except OSError:
+        return True
+
+
 def _res_ensure(st: dict) -> tuple[bool, str]:
-    """Residente sano para este servidor: lo reutiliza, o lo (re)lanza una vez más si falla. (ok, motivo)."""
+    """Residente sano para este servidor: lo reutiliza, espera al que está arrancando, o lo (re)lanza una vez más si falla."""
     global _res_off_until
     if time.time() < _res_off_until:
         return False, "residente en pausa tras fallar dos veces (se reintenta en unos minutos)"
     if _res_healthy(st):
         return True, ""
-    if _res_info().get("pid"):
+    ri = _res_info()
+    if _res_booting(ri, st):  # lanzado por server_start sin esperar: la primera inyección espera su latido
+        ok, why = _res_wait_beat(ri)
+        if ok:
+            return True, ""
+        _res_kill(why)
+    elif ri.get("pid"):
         _res_kill("sin latido, muerto o de otro servidor")
     why = ""
     for _ in range(2):  # lanzar y, si falla, una vez más
@@ -1050,10 +1355,18 @@ def _tail_log(st: dict, n: int = 200_000) -> str:
 
 
 # ----------------------------------------------------------------------------- MCP
-try:
-    from mcp.server.fastmcp import FastMCP  # mcp 1.x
-except ImportError:  # mcp 2.x
-    from mcp.server.mcpserver import MCPServer as FastMCP  # type: ignore
+if "--vigilante" in sys.argv:  # el vigilante no sirve MCP: no paga el import (~1,7 s)
+    class FastMCP:  # type: ignore
+        def __init__(self, *a, **k):
+            pass
+
+        def tool(self, *a, **k):
+            return lambda fn: fn
+else:
+    try:
+        from mcp.server.fastmcp import FastMCP  # mcp 1.x
+    except ImportError:  # mcp 2.x
+        from mcp.server.mcpserver import MCPServer as FastMCP  # type: ignore
 
 mcp = FastMCP("starccm")
 
@@ -1131,11 +1444,15 @@ _INIT_AUTOSAVE = ("AutoSave as = sim.getSimulationIterator().getAutoSave();\n"
 def _run_init(st: dict) -> None:
     """Primera macro tras arrancar: apaga el autoguardado en batch (en 2410 viene activo y deja <sim>@meshed.sim y
     @NNNNN.sim, gigas en una bomba). Su resultado queda en st["init"]; no tumba el arranque."""
+    _write_state({**st, "init": "en curso"})  # (la inyección de abajo vuelve a pasar por _inject_locked: no repetir)
     try:
-        st["init"] = _inject(_INIT_AUTOSAVE, timeout=600, tool="server_start")["stdout"][-200:]
+        res = _inject(_INIT_AUTOSAVE, timeout=600, tool="server_start")["stdout"][-200:]
     except Exception as e:  # noqa: BLE001
-        st["init"] = f"init falló: {e}"
-    _write_state(st)
+        res = f"init falló: {e}"
+    cur = _state()
+    if cur.get("pid") == st.get("pid"):
+        _write_state({**cur, "init": res})
+        _log(f"init: {res}")
 
 
 def _save_macro(sp: str) -> str:
@@ -1174,7 +1491,9 @@ def server_start(sim_path: str = "", name: str = "") -> dict:
             if want and want != have:  # otro caso cargado: no trabajar sobre la simulación equivocada
                 raise RuntimeError(f"Hay un servidor vivo con otro .sim cargado ({have or 'sin .sim'}). "
                                    f"Guarda y apágalo con server_stop() antes de abrir {want}.")
-            return {"reused": True, **st}
+            _write_panel_estado()
+            vig = _vigilante_ensure(int(st["port"])).get("vigilante")  # un solver vivo de antes también queda vigilado
+            return {"reused": True, **st, "vigilante": vig}
         if st.get("pid"):
             if _pid_alive(st["pid"]) and _pid_is_ours(st["pid"]):
                 # proceso vivo con el puerto cerrado: otro proceso (panel o chat) lo está arrancando, o está colgado
@@ -1212,35 +1531,41 @@ def server_start(sim_path: str = "", name: str = "") -> dict:
         if sim and sim.is_file():
             cmd += ["-load", str(sim)]
         t0 = time.time()
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        global _proc
-        with open(log, "ab") as logf:  # el hijo hereda el manejador: aquí se puede cerrar
-            _proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=str(SIMS), creationflags=flags)
-        st = {"pid": _proc.pid, "port": PORT, "host": "localhost", "sim": str(sim) if sim else None,
+        sp = _spawn_detached(cmd, log=log, cwd=SIMS)  # fuera del árbol de la CLI: «Detener» del panel no lo alcanza
+        spid = sp["pid"]
+        st = {"pid": spid, "port": PORT, "host": "localhost", "sim": str(sim) if sim else None,
               "log": str(log), "started": datetime.now().isoformat(timespec="seconds"), "np": NP,
               "cmd": _redact(" ".join(cmd))}
         _write_state(st)
+        _write_panel_estado()
         deadline = t0 + 600
         while time.time() < deadline:
-            if _proc.poll() is not None:
+            if not _pid_alive(spid):
                 tail = _redact(_tail_log(st, 6000))
                 STATE_FILE.unlink(missing_ok=True)
                 hint = "\nFalta STARCCM_PODKEY en .env (sin clave pide licencia a flex y aborta)." if not os.environ.get("STARCCM_PODKEY") else ""
-                raise RuntimeError(f"El servidor terminó con código {_proc.returncode} a los "
-                                   f"{time.time()-t0:.0f}s. Cola del log:\n{tail[-3000:]}{hint}")
+                raise RuntimeError(f"El servidor terminó a los {time.time()-t0:.0f}s. Cola del log:\n{tail[-3000:]}{hint}")
             if _port_open(PORT) and "Server::start" in _tail_log(st, 20000):
                 break
-            time.sleep(POLL_S)
+            time.sleep(min(POLL_S, 0.25))
         else:
-            _kill_tree(_proc.pid)
+            _kill_tree(spid)
             STATE_FILE.unlink(missing_ok=True)
             raise RuntimeError("El servidor no abrió el puerto en 600 s")
         st["startup_seconds"] = round(time.time() - t0, 1)
+        # El residente se lanza y NO se espera (~10 s en serie antes): la primera inyección espera su latido si hace falta y
+        # corre antes la macro de init (autoguardado y AutoExport apagados). (Simulation no tiene setPresentationName: lo da save().)
+        st["init"] = "pendiente"
         _write_state(st)
-        _run_init(st)  # (Simulation no tiene setPresentationName: el nombre lo da save())
+        if RES_ON and time.time() >= _res_off_until:
+            try:
+                _res_spawn(st)
+            except Exception as e:  # noqa: BLE001
+                _log(f"residente: no pude lanzarlo en server_start: {e}")
+        st["vigilante"] = _vigilante_ensure(PORT).get("vigilante")
         if not alive(st):
-            raise RuntimeError(f"El servidor murió justo al arrancar ({st.get('init')}). Cola del log:\n{_redact(_tail_log(st, 3000))}")
-        _log(f"servidor pid={st['pid']} puerto={PORT} sim={sim} en {st['startup_seconds']}s; {st['init']}")
+            raise RuntimeError(f"El servidor murió justo al arrancar. Cola del log:\n{_redact(_tail_log(st, 3000))}")
+        _log(f"servidor pid={st['pid']} puerto={PORT} sim={sim} en {st['startup_seconds']}s; residente lanzado sin esperar")
         return st
 
 
@@ -1325,11 +1650,9 @@ def gui_attach(wait_s: int = 0) -> dict:
     if g["connected"]:
         return {"ok": True, "already": True, **g}
     cmd = _starccm_cmd() + ["-host", f"localhost:{st['port']}"]  # sin _lic_flags(): la GUI no reserva licencia
-    flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
     SIMS.mkdir(parents=True, exist_ok=True)
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         cwd=str(SIMS), creationflags=flags, close_fds=True, start_new_session=(os.name != "nt"))
-    _log(f"gui_attach: lanzada pid {p.pid}: {_redact(' '.join(cmd))}")
+    gpid = _spawn_detached(cmd, cwd=SIMS)["pid"]  # fuera del árbol de la CLI: la GUI del usuario sobrevive a «Detener»
+    _log(f"gui_attach: lanzada pid {gpid}: {_redact(' '.join(cmd))}")
     deadline = time.time() + max(0, wait_s)
     g = {"connected": False, "pids": []}
     while time.time() < deadline:
@@ -1337,7 +1660,7 @@ def gui_attach(wait_s: int = 0) -> dict:
         g = _gui(fresh=True)
         if g["connected"]:
             break
-    return {"ok": True, "launched": p.pid, "connected": g["connected"], "pids": g["pids"],
+    return {"ok": True, "launched": gpid, "connected": g["connected"], "pids": g["pids"],
             "note": "" if g["connected"] else "la GUI tarda ~30 s en conectar; confirma con gui_status()"}
 
 
@@ -1682,15 +2005,17 @@ def _short(hist: list[dict], n: int = 12) -> list[dict]:
 
 
 @_tool
-def iterate(n: int = 100, until: str = "stable", reports: list[str] = ["H", "M"], window: int = 100,
+def iterate(n: int = 0, until: str = "stable", reports: list[str] = ["H", "M"], window: int = 100,
             tol: float = 0.005, block: int = 50, timeout_s: int = 7200, plateau_its: int = 300) -> dict:
     """Corre hasta n iteraciones por bloques de `block`. until="stable": para cuando cada reporte de `reports`
     (nombres de Report del .sim) varía < tol (0,5 %) en `window` iteraciones; stopped="plateau" si además el mayor
-    residual no bajó un 10 % en plateau_its (300); stopped="max" si llega a n. until="n": un solo bloque de n, sin
-    criterio. Devuelve stopped, iterations_run, iteration, reports y residuals (última fila), variation, history
+    residual no bajó un 10 % en plateau_its (300); stopped="max" si llega a n. n=0 (por defecto): 1000 con
+    until="stable" (con 100 nunca da «stable»: pide ≥ window + block) y 100 con until="n". until="n": un solo bloque
+    de n, sin criterio. Devuelve stopped, iterations_run, iteration, reports y residuals (última fila), variation, history
     (corta) y segundos. timeout_s es por bloque."""
     global _iter_hist, _iter_pid
-    n, block = max(1, int(n)), max(1, int(block))
+    n = int(n) if int(n) > 0 else (1000 if until == "stable" else 100)
+    block = max(1, int(block))
     with _turn("iterate") as busy:
         if busy:
             return _busy_only(busy)
@@ -1738,9 +2063,64 @@ def iterate(n: int = 100, until: str = "stable", reports: list[str] = ["H", "M"]
 
 
 # ----------------------------------------------------------------------------- pipeline de bomba
-def _load_pipeline():
+def _pump_imports(mod) -> str:
+    """IMPORTS del pipeline como texto para _wrap. Es una LISTA: se une con comas (str(lista) daba «import 'star.x.*';»,
+    visto con el solver real). pump_case y el selftest usan esta misma función."""
+    imp = getattr(mod, "IMPORTS", "") or ""
+    return ",".join(imp) if isinstance(imp, (list, tuple)) else str(imp)
+
+
+def _parse_pump(stdout: str) -> dict:
+    """Líneas de la macro de la bomba -> dict. RESULT<TAB>nombre<TAB>valor, PIPE fase segundos, BALANCE_MASA<TAB>N %,
+    AVISO<TAB>texto, EULER_OK|EULER_MAL<TAB>detalle (y cualquier EULER_*), más CELLS, MESH_SECONDS<TAB>zona<TAB>s,
+    ITER_STOP, YPLUS, PLANOS, POST_SECONDS y PNG. Las claves vacías no salen."""
+    def num(v):
+        try:
+            return float(v.replace(",", "."))
+        except ValueError:
+            return v
+    out: dict = {"RESULT": {}, "PIPE": {}, "AVISO": [], "EULER": {}, "MESH_SECONDS": {}, "PNG": []}
+    for raw in (stdout or "").splitlines():
+        line = raw.strip("\r")
+        if not line.strip():
+            continue
+        tag, _, rest = line.partition("\t")
+        tag = tag.strip()
+        if tag == "RESULT":
+            k, _, v = rest.partition("\t")
+            out["RESULT"][k.strip()] = num(v.strip())
+        elif tag.startswith("PIPE "):
+            m = re.match(r"PIPE (.+?) ([0-9.eE+-]+)\s*$", line.strip())
+            if m:
+                out["PIPE"][m.group(1)] = num(m.group(2))
+        elif tag == "BALANCE_MASA":
+            m = re.match(r"\s*([0-9.eE+-]+)\s*%?(?:\t(.*))?", rest)
+            if m:
+                out["BALANCE_MASA"] = {"pct": num(m.group(1)), **({"aviso": m.group(2).strip()} if m.group(2) else {})}
+                if m.group(2):
+                    out["AVISO"].append(f"BALANCE_MASA {m.group(1)} %: {m.group(2).strip()}")
+        elif tag == "AVISO":
+            out["AVISO"].append(rest.strip())
+        elif tag.startswith("EULER_"):
+            out["EULER"][tag] = rest.strip()
+        elif tag == "CELLS":
+            v = num(rest.strip())
+            out["CELLS"] = int(v) if isinstance(v, float) else v
+        elif tag == "MESH_SECONDS":
+            k, _, v = rest.partition("\t")
+            out["MESH_SECONDS"][k.strip()] = num(v.strip())
+        elif tag == "POST_SECONDS":
+            out[tag] = num(rest.strip())
+        elif tag in ("ITER_STOP", "YPLUS", "PLANOS"):
+            out[tag] = rest.strip()
+        elif tag == "PNG":
+            out["PNG"].append(rest.strip())
+    return {k: v for k, v in out.items() if v not in ({}, [])}
+
+
+def _load_pipeline(path: Path | str | None = None):
     """Importa pipelines/bomba.py en cada llamada (así una edición se nota sin reiniciar el MCP)."""
-    p = Path(PIPELINE_BOMBA)
+    p = Path(path or PIPELINE_BOMBA)
     if not p.is_file():
         raise FileNotFoundError(f"No existe {p}: el pipeline de bomba (parse_ccm, macro_body) aún no está escrito")
     spec = importlib.util.spec_from_file_location("pipelines_bomba", p)
@@ -1761,7 +2141,9 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
     Euler), vía pipelines/bomba.py. Arranca el servidor con el nombre del caso si no hay uno. ccm vacío = el
     *.cfturbo-ccm de cad_dir. params se pasa tal cual al pipeline. dry_run: solo genera la macro y la describe.
     Va por el cliente residente en UNA macro. until="stable" (o "n"): tras la macro, si salió bien, itera hasta n con
-    el criterio de iterate (bloques de `block`, reportes `reports`) en el mismo turno, sin crear un cliente por bloque."""
+    el criterio de iterate (bloques de `block`, reportes `reports`) en el mismo turno, sin crear un cliente por bloque.
+    Devuelve `parsed` (RESULT, PIPE, BALANCE_MASA, AVISO, EULER, CELLS, MESH_SECONDS, ITER_STOP, YPLUS, PNG ya leídos de la
+    salida), la cola de stdout y `salida_completa` = casos/<caso>/salida_pump.txt con toda la salida."""
     if mode not in ("rapida", "normal"):
         return {"ok": False, "error": f"mode debe ser 'rapida' o 'normal', no '{mode}'"}
     cad = Path(cad_dir)
@@ -1778,9 +2160,7 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
         body = mod.macro_body(_jpath(case_dir), _jpath(cad), ccm_d, mode, dict(params or {}))
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"pipeline de bomba: {type(e).__name__}: {e}"}
-    imp = getattr(mod, "IMPORTS", "") or ""
-    # IMPORTS del pipeline es una lista: unirla con comas (str(lista) daba «import 'star.x.*';», visto con el solver real)
-    imports = ",".join(imp) if isinstance(imp, (list, tuple)) else str(imp)
+    imports = _pump_imports(mod)
     info = {"case": case, "mode": mode, "ccm_file": str(ccm_path), "ccm": ccm_d, "macro_chars": len(body)}
     if dry_run:
         return {"ok": True, "dry_run": True, **info, "macro_head": body[:600]}
@@ -1794,8 +2174,16 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
         r = _inject(body, imports, timeout=timeout_s, tool="pump_case")
         steps = _parse_steps(r["stdout"])
         failed = next((s["i"] for s in steps if s.get("ok") is False), None)
+        # salida COMPLETA a casos/<caso>/salida_pump.txt (la cola de 3000 car. pierde PIPE, CELLS y AVISO del principio)
+        salida = case_dir / "salida_pump.txt"
+        try:
+            salida.write_text(r["stdout"] + (f"\n--- error\n{r.get('exception')}\n{r.get('trace') or ''}" if not r["ok"] else "") + "\n",
+                              encoding="utf-8")
+        except OSError:
+            salida = None
         out = {**info, "ok": bool(r["ok"]) and failed is None, "steps": steps, "failed_at": failed, "seconds": r["seconds"],
-               "macro": r["macro"], "stdout": r["stdout"][-3000:], **_err(r)}
+               "macro": r["macro"], "parsed": _parse_pump(r["stdout"]), "salida_completa": str(salida) if salida else None,
+               "stdout": r["stdout"][-3000:], **_err(r)}
         if until in ("stable", "n") and out["ok"]:
             it = iterate(n=n, until=until, reports=list(reports), block=block)  # mismo turno (re-entrante)
             out["iterate"] = {k: it.get(k) for k in ("ok", "stopped", "iterations_run", "iteration", "blocks", "seconds",
@@ -2021,14 +2409,23 @@ _HOLD = ("import json,os,sys,time;p=sys.argv[1];"
          "print('HELD',flush=True);time.sleep(float(sys.argv[2]));os.path.exists(p) and os.remove(p)")
 
 _FAKE_BOMBA = '''
-IMPORTS = ""
+IMPORTS = ["star.common.*", "star.meshing.*"]
+EXTRA = r"""
+sim.println("RESULT\\tH\\t16.5");
+sim.println("RESULT\\tM\\t8.4");
+sim.println("PIPE total 12.5");
+sim.println("BALANCE_MASA\\t0.0002 %");
+sim.println("AVISO\\talgo raro");
+sim.println("EULER_OK\\tH_Euler 18 m, H 16 m");
+sim.println("CELLS\\t1234");
+"""
 def parse_ccm(path):
     return {"rpm": 1450, "caudal_m3h": 36.0, "nombre": "bomba falsa"}
 def macro_body(case_dir, cad_dir, ccm, mode, params):
     fail = 'sim.println("AGENT_FAKE_FAIL");' if params.get("fallar") else ""
     return ('sim.println("STEP_BEGIN 0");\\nsim.println("importado %s %s");\\nsim.println("STEP_END 0");\\n'
             'sim.println("STEP_BEGIN 1");\\n%s\\nsim.println("regiones listas");\\nsim.println("STEP_END 1");'
-            % (ccm["rpm"], mode, fail))
+            % (ccm["rpm"], mode, fail)) + EXTRA
 '''
 
 
@@ -2036,8 +2433,10 @@ def _selftest() -> int:
     global EXE, PORT, SIMS, MACROS, CASES, RECIPES, STATE_FILE, LOCK_FILE, AGENT_LOG, IDLE_MIN, LOCK_WAIT
     global PIPELINE_BOMBA, GUI_TTL, POLL_S, _inject_local, _gui_cache, _list_procs, _iter_hist, _iter_pid
     global WORK, RES_DIR, TIEMPOS, RES_ON, RES_HB_STALE, RES_START_WAIT, _res_off_until, _javac, _run_javac, _precompile
+    global PANEL_ESTADO, VIGILANTE_ON, VIGILANTE_S
     import tempfile
     t_all = time.time()
+    VIGILANTE_ON = False  # el vigilante real solo se prueba en su sección (es un proceso aparte con su propio entorno)
     fake = HERE / "tests" / "fake_starccm.py"
     os.environ["STARCCM_EXE"] = str(fake)
     EXE = str(fake)
@@ -2049,16 +2448,17 @@ def _selftest() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="starccm-selftest-"))
     # Todo lo que escribe el falso va al temporal: ni sims/, ni macros/, ni .server.json, ni .inject.lock reales
     # (un selftest antiguo borró el .server.json de un solver vivo de otra sesión).
-    real_lock = LOCK_FILE
+    real_lock, real_state, real_panel = LOCK_FILE, STATE_FILE, PANEL_ESTADO
+    real_panel_before = real_panel.stat().st_mtime_ns if real_panel.is_file() else None
     real = (SIMS, MACROS, STATE_FILE, RES_DIR)
     real_work = _work_dir()
     _real_files = lambda: {(str(p), p.stat().st_mtime_ns) for d in real for p in ([d] if d.is_file() else d.glob("*") if d.is_dir() else [])}
     real_before = _real_files()
     WORK = tmp / "work"
     SIMS, MACROS, RES_DIR, TIEMPOS = WORK / "sims", WORK / "macros", WORK / "residente", WORK / "tiempos.csv"
-    STATE_FILE, AGENT_LOG = tmp / ".server.json", tmp / "agent.log"
+    STATE_FILE, AGENT_LOG, PANEL_ESTADO = estado_dir() / ".server.json", tmp / "agent.log", tmp / "panel_estado.json"
     RES_HB_STALE, RES_START_WAIT = 2.0, 8.0
-    LOCK_FILE, CASES, RECIPES = tmp / ".inject.lock", tmp / "casos", tmp / "recetas"
+    LOCK_FILE, CASES, RECIPES = estado_dir() / ".inject.lock", tmp / "casos", tmp / "recetas"
     RECIPES.mkdir()
     (RECIPES / "paso-ok.java").write_text('// QUE: paso de prueba\n// PARAMS: nombre\nsim.println("hola ${nombre} y ${Flujo}");\n', encoding="utf-8")
     (RECIPES / "paso-falla.java").write_text('sim.println("AGENT_FAKE_FAIL");\nsim.println("no llega");\n', encoding="utf-8")
@@ -2082,17 +2482,108 @@ def _selftest() -> int:
         if age_s:
             os.utime(LOCK_FILE, (time.time() - age_s, time.time() - age_s))
 
+    # --- pruebas lentas e independientes del resto: en hilos, para no sumar al tiempo del selftest
+    bg: dict = {}
+    jc_real = _javac(real=True)  # (se resuelve ya: más abajo se sustituyen _javac y _run_javac)
+
+    def bg_detached() -> None:
+        """Procesos fuera del árbol de la CLI: un padre falso lanza un destino con _spawn_detached y otro hijo normal; un
+        `taskkill /T /F` REAL sobre el padre mata al hijo normal y NO al desacoplado."""
+        sleeper = "import time;time.sleep(120)"
+        code = (f"import sys,time,subprocess; sys.path.insert(0, {str(HERE)!r}); import mcp_server as m; "
+                f"d=m._spawn_detached([sys.executable,'-I','-c',{sleeper!r}]); "
+                f"c=subprocess.Popen([sys.executable,'-I','-c',{sleeper!r}]); "
+                "print(d['pid'], c.pid, d['breakaway'], flush=True); time.sleep(120)")
+        par = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        try:
+            line = par.stdout.readline().split()
+            dpid, cpid = int(line[0]), int(line[1])
+            time.sleep(0.4)
+            before = (_pid_alive(dpid), _pid_alive(cpid), _pid_alive(par.pid))
+            subprocess.run(["taskkill", "/PID", str(par.pid), "/T", "/F"], capture_output=True, timeout=30)
+            time.sleep(0.6)
+            bg["detached"] = (before, _pid_alive(par.pid), _pid_alive(cpid), _pid_alive(dpid), line[2])
+            _kill_tree(dpid)
+            # un .bat desacoplado que lanza un hijo de consola (como starccm+.bat): su salida redirigida tiene que llegar al log
+            bat, blog = tmp / "hijo.bat", tmp / "hijo.log"
+            crlf = chr(13) + chr(10)
+            bat.write_bytes(("@echo off" + crlf + "echo bat" + crlf + '"' + sys.executable + '" -I -c "print(1234)"' + crlf + "echo fin" + crlf).encode())
+            _spawn_detached([str(bat)], log=blog, cwd=tmp)
+            t_end = time.time() + 15
+            while time.time() < t_end and "fin" not in (blog.read_text(errors="replace") if blog.is_file() else ""):
+                time.sleep(0.1)
+            bg["bat"] = blog.read_text(errors="replace") if blog.is_file() else ""
+        except Exception as e:  # noqa: BLE001
+            bg["detached"] = e
+            _kill_tree(par.pid)
+
+    def bg_regresion() -> None:
+        """La macro REAL de pipelines/bomba.py con el MISMO camino de imports que pump_case, compilada con el javac de STAR-CCM+."""
+        cad = Path.home() / "OneDrive" / "Documentos" / "cfturbo-agent" / "versions" / "BombaRapida_v1"
+        ccms = sorted(cad.glob("*.cfturbo-ccm")) if cad.is_dir() else []
+        if not ccms or not jc_real:
+            bg["regresion"] = "SKIP: " + ("no hay .cfturbo-ccm de BombaRapida_v1" if not ccms else "no hay javac de STAR-CCM+")
+            return
+        res = []
+        try:
+            mod = _load_pipeline(HERE / "pipelines" / "bomba.py")
+            ccm_d = mod.parse_ccm(str(ccms[0]))
+            d = tmp / "regresion"
+            d.mkdir()
+            for nombre, params in (("rapida", {}), ("iterar+post", {"iterar": True, "post": True})):
+                body = mod.macro_body(_jpath(d), _jpath(cad), ccm_d, "rapida", dict(params))
+                src = d / f"Agent_{_safe(nombre)}.java"
+                text = _wrap(body, _pump_imports(mod), _safe(nombre))
+                src.write_text(text, encoding="utf-8")
+                bad = [ln for ln in text.splitlines() if ln.startswith("import ") and re.search(r"['\[\]]", ln)]
+                (d / "out").mkdir(exist_ok=True)
+                r = subprocess.run([jc_real[0], "-nowarn", "-proc:none", "-cp", jc_real[1], "-d", str(d / "out"), str(src)],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+                res.append((nombre, bad, r.returncode, (r.stderr or r.stdout)[-400:]))
+            bg["regresion"] = res
+        except Exception as e:  # noqa: BLE001
+            bg["regresion"] = e
+
+    def bg_docs() -> None:
+        """Calienta el índice del javadoc (~3,5 s la primera vez); las comprobaciones de docs_search lo esperan."""
+        try:
+            _docs()
+            _members()
+        except Exception:  # noqa: BLE001
+            pass
+
+    docs_thread = threading.Thread(target=bg_docs, daemon=True)
+    docs_thread.start()
+    threads = [threading.Thread(target=bg_regresion, daemon=True)]
+    if os.name == "nt":
+        threads.append(threading.Thread(target=bg_detached, daemon=True))
+    for t in threads:
+        t.start()
+
     print(f"selftest: starccm+ falso = {fake} · escribe solo en {tmp}")
     try:
         r = subprocess.run(_starccm_cmd() + ["-version"], capture_output=True, text=True)
         check("FAKE" in r.stdout, "-version del falso")
+        os.environ["FAKE_RESIDENT_DELAY"] = "0.6"  # el residente tarda 0,6 s en dar su primer latido: server_start no debe esperarlo
+        t_ss = time.time()
         st = server_start()
+        t_ss = time.time() - t_ss
+        os.environ.pop("FAKE_RESIDENT_DELAY")
         check(st.get("pid") and _port_open(PORT), f"server_start -> pid {st.get('pid')} puerto {PORT} en {st.get('startup_seconds')}s")
+        ri0 = _res_info()
+        check(ri0.get("pid") and _pid_alive(ri0["pid"]) and not (RES_DIR / "heartbeat").exists() and _res_waits == 0
+              and _state().get("init") == "pendiente" and st.get("init") == "pendiente",
+              f"server_start lanza el residente y vuelve SIN esperar su latido ({t_ss:.1f} s; init pendiente)")
+        check(Path(_state()["log"]).parent == SIMS and ri0.get("breakaway") in (True, False, None) and "vigilante" in st,
+              "el servidor y el residente salen del lanzador desacoplado (doble lanzamiento)")
         check(KEY not in json.dumps(st) and KEY not in STATE_FILE.read_text(encoding="utf-8"), "la clave PoD no sale de server_start ni de .server.json")
         st2 = server_start()
         check(st2.get("reused"), "server_start reutiliza el servidor vivo")
         r = run_java('sim.println("OK");')
         check(r["ok"] and r["stdout"].strip() == "OK", f"run_java OK ({r['seconds']}s)")
+        check(r["via"] == "residente" and _res_waits == 1 and (RES_DIR / "heartbeat").is_file()
+              and "INIT autosave off" in (_state().get("init") or ""),
+              f"la primera inyección espera el latido del residente y corre antes la macro de init ({_state().get('init')!r})")
         check(not LOCK_FILE.exists(), "el turno se libera al terminar la tool")
         r = run_java('sim.println("AGENT_FAKE_FAIL");\nsim.println("no llega");')
         check(not r["ok"] and r["exception"] and "fallo simulado" in r["exception"], "run_java captura excepción")
@@ -2106,6 +2597,7 @@ def _selftest() -> int:
         hits = recipe_search("selftest hola")["resultado"]
         check(any(h["name"] == "probar-selftest.java" for h in hits), "recipe_search encuentra la receta")
         check(RECIPES.parent == tmp and (HERE / "conocimiento" / "recetas").is_dir(), "las recetas reales viven en conocimiento/recetas")
+        docs_thread.join(timeout=30)
         d = docs_search("Simulation saveState")
         check(("classes" in d and d["classes"]) or "error" in d, "docs_search responde (con o sin javadoc)")
         if DOC_DIR and DOC_DIR.is_dir():
@@ -2139,6 +2631,23 @@ def _selftest() -> int:
         check(all(tmp in q.parents for q in (SIMS, MACROS, RES_DIR, TIEMPOS)) and Path(_state()["log"]).parent == SIMS
               and CASES.parent == tmp and (HERE / "casos").is_dir(),
               "sims, macros, residente, tiempos.csv y log del solver cuelgan de la carpeta de trabajo; casos/ se queda en el repo")
+        check(estado_dir() == WORK and STATE_FILE.parent == WORK and LOCK_FILE.parent == WORK and STATE_FILE.is_file(),
+              "estado_dir(): .server.json e .inject.lock cuelgan de la carpeta de trabajo")
+        check(real_state.parent == real_work and real_lock.parent == real_work
+              and (bool(os.environ.get("COPILOTO_WORK")) or "onedrive" not in str(real_state).lower()),
+              f"los .server.json/.inject.lock REALES quedan fuera del repo y de OneDrive ({real_state.parent})")
+        pe = json.loads(PANEL_ESTADO.read_text(encoding="utf-8")) if PANEL_ESTADO.is_file() else {}
+        check(pe.get("estado_dir") == str(WORK) and pe.get("state_file") == str(STATE_FILE) and pe.get("lock_file") == str(LOCK_FILE),
+              "panel_estado.json dice dónde están .server.json e .inject.lock (lo escribe server_start)")
+        old_d, new_d = tmp / "viejo", tmp / "nuevo"
+        old_d.mkdir()
+        (old_d / ".server.json").write_text('{"pid": 1}', encoding="utf-8")
+        (old_d / ".inject.lock").write_text("{}", encoding="utf-8")
+        moved = _migrate_legacy(old_d, new_d / ".server.json", new_d / ".inject.lock")
+        (old_d / ".server.json").write_text('{"pid": 2}', encoding="utf-8")
+        moved2 = _migrate_legacy(old_d, new_d / ".server.json", new_d / ".inject.lock")
+        check(sorted(moved) == [".inject.lock", ".server.json"] and (new_d / ".server.json").read_text(encoding="utf-8") == '{"pid": 1}'
+              and not moved2, "migración: el estado viejo del repo se mueve a la carpeta de estado y nunca pisa uno existente")
 
         # --- cliente residente (vía por defecto)
         ri = _res_info()
@@ -2291,6 +2800,9 @@ def _selftest() -> int:
         scen.write_text("drift")
         r = iterate(n=100, block=100)
         check(r["ok"] and r["stopped"] == "max" and r["iterations_run"] == 100, "iterate llega a n sin estabilizarse: stopped=max")
+        r = iterate(block=250, window=1000)
+        check(r["ok"] and r["stopped"] == "max" and r["iterations_run"] == 1000,
+              f"iterate until=stable sin n usa 1000 por defecto ({r.get('iterations_run')} it)")
         scen.write_text("stable")
         r = iterate(n=30, until="n")
         check(r["ok"] and r["blocks"] == 1 and r["stopped"] == "max" and r["iteration"] == 30 and r["residuals"], "iterate until='n' es un solo bloque")
@@ -2317,8 +2829,8 @@ def _selftest() -> int:
         fake_m.with_suffix(".out").write_text("AGENT_BEGIN x\nAGENT_END x\n", encoding="utf-8")
         check(not macro_running(), "macro con AGENT_END ya no cuenta")
         time.sleep(0.2)
-        _idle_stop()
-        check(not _port_open(PORT) and not STATE_FILE.exists(), "watchdog apaga el solver inactivo (y guarda) cuando no hay GUI")
+        res_idle = _idle_stop()
+        check(not _port_open(PORT) and not STATE_FILE.exists(), f"watchdog apaga el solver inactivo (y guarda) cuando no hay GUI ({res_idle})")
         IDLE_MIN = 30
         # puerto ocupado por otro proceso: se niega sin copiar el .sim
         srcsim = tmp / "otra.sim"
@@ -2351,6 +2863,53 @@ def _selftest() -> int:
         check(st.get("pid") and st["pid"] != 999999 and _port_open(PORT), "server_start con .server.json viejo relanza")
         check(Path(st["sim"]).parent == SIMS and Path(st["sim"]).name == "mi_caso_x.sim", f"nombre raro saneado -> {Path(st['sim']).name}")
 
+        # --- vigilante independiente del MCP: UN proceso aparte por puerto, con su propio entorno
+        procs_f = tmp / "procs.json"
+        procs_f.write_text(json.dumps([{"pid": 77, "name": "starccm+.exe", "cmd": f'"C:\\x\\starccm+.exe" -host localhost:{PORT}'}]),
+                           encoding="utf-8")
+        venv_env = {"COPILOTO_WORK": str(WORK), "COPILOTO_AGENT_LOG": str(AGENT_LOG), "COPILOTO_VIGILANTE_S": "0.25",
+                    "COPILOTO_VIG_GONE_S": "1", "STARCCM_TEST_PROCS": str(procs_f), "STARCCM_IDLE_MIN": "0.012"}
+        saved_env = {k: os.environ.get(k) for k in venv_env}
+        os.environ.update(venv_env)
+        VIGILANTE_ON, VIGILANTE_S = True, 0.25
+        try:
+            v = _vigilante_ensure(PORT)
+            end = time.time() + 15
+            while time.time() < end and not _state().get("idle_warning"):
+                time.sleep(0.2)
+            st, vpid = _state(), _vigilante_pid(PORT)
+            check(v.get("nuevo") and vpid and _pid_alive(vpid) and v["vigilante"] != os.getpid(),
+                  f"_vigilante_ensure lanza el vigilante como proceso aparte (pid {vpid})")
+            iw = st.get("idle_warning")
+            check(st.get("gui") is True and isinstance(iw, str) and "sin actividad" in iw and "GUI conectada: no se apaga" in iw
+                  and isinstance(st.get("idle_min"), (int, float)) and st.get("idle_checked") and alive(),
+                  f"vigilante con GUI: escribe gui, idle_min e idle_warning como TEXTO y no apaga ({iw!r})")
+            check(time.time() - STATE_FILE.stat().st_mtime > 0.5, "lo que escribe el vigilante (cada 0,25 s) no cuenta como actividad: el mtime no se mueve")
+            v2 = _vigilante_ensure(PORT)
+            p2 = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--vigilante", str(PORT)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs_f.write_text("[]", encoding="utf-8")  # el usuario cierra la GUI: sin GUI y pasado el límite, guarda y apaga
+            end = time.time() + 15
+            while time.time() < end and (_port_open(PORT) or STATE_FILE.exists()):
+                time.sleep(0.2)
+            check(not _port_open(PORT) and not STATE_FILE.exists() and "vigilante: solver apagado por" in AGENT_LOG.read_text(encoding="utf-8"),
+                  "vigilante sin GUI: guarda y apaga el solver inactivo (el MCP no hace nada)")
+            end = time.time() + 12
+            while time.time() < end and _pid_alive(vpid):
+                time.sleep(0.2)
+            check(not _pid_alive(vpid) and not _vig_file(PORT).exists(), "el vigilante termina cuando el servidor muere")
+            check(v2.get("vigilante") == vpid and not v2.get("nuevo") and p2.wait(timeout=30) == 0,
+                  "un solo vigilante por puerto (un segundo, lanzado a mano o por server_start, sale sin sustituir al primero)")
+        finally:
+            for k, val in saved_env.items():
+                os.environ.pop(k, None) if val is None else os.environ.__setitem__(k, val)
+            VIGILANTE_ON, VIGILANTE_S = False, 30.0
+            vp = _vig_info(PORT).get("pid")
+            if vp:
+                _kill_tree(vp)
+        st = server_start(name="mi_caso_x")  # el resto del selftest sigue con un servidor vivo
+        check(st.get("pid") and alive(st), "tras el apagado del vigilante, server_start arranca otro servidor")
+
         # --- GUI conectada
         rows = [{"pid": 1, "name": "starccm+.exe", "cmd": f'"C:\\x\\starccm+.exe" -host localhost:{PORT}'},
                 {"pid": 2, "name": "starccm+.exe", "cmd": f'"C:\\x\\starccm+.exe" -host localhost:{PORT} -batch M.java -noexit'},
@@ -2360,6 +2919,14 @@ def _selftest() -> int:
         check(_gui_clients(rows, PORT) == [1], "_gui_clients: solo la GUI (sin -batch, sin -server, mismo puerto)")
         g = gui_status()
         check(g["connected"] is False and g["server_alive"], "gui_status sin GUI: no conectada")
+        sl2 = subprocess.Popen([sys.executable, "-I", "-c", "import time;time.sleep(60)", "-host", "localhost:1"])
+        sleepers.append(sl2)
+        time.sleep(0.4)
+        t_n = time.time()
+        rows_n = _procs_native("-host") if os.name == "nt" else []
+        t_n = time.time() - t_n
+        check(os.name != "nt" or (any(x["pid"] == sl2.pid and "-host localhost:1" in x["cmd"] for x in rows_n) and t_n < 1.0),
+              f"detección de GUI sin PowerShell: líneas de comandos leídas del PEB en {t_n * 1000:.0f} ms ({len(rows_n)} procesos con -host)")
 
         def spy():
             res = real_list()
@@ -2384,8 +2951,9 @@ def _selftest() -> int:
         _gui_cache = None
         _idle_stop()
         st = _state()
-        check(alive() and (st.get("idle_warning") or {}).get("gui") is True and "¿apagar?" in st["idle_warning"]["msg"],
-              f"vigilante con GUI: no apaga y deja idle_warning ({st.get('idle_warning')})")
+        check(alive() and st.get("gui") is True and isinstance(st.get("idle_warning"), str)
+              and "GUI conectada: no se apaga" in st["idle_warning"] and "sin actividad" in st["idle_warning"],
+              f"vigilante con GUI: no apaga y deja idle_warning como texto ({st.get('idle_warning')!r})")
         check(idle_seconds() > IDLE_MIN * 60, "escribir idle_warning no cuenta como actividad")
         IDLE_MIN = 30
         run_java('sim.println("vuelvo");')
@@ -2419,6 +2987,22 @@ def _selftest() -> int:
         check(r["ok"] and [s["ok"] for s in r["steps"]] == [True, True] and "importado 1450 rapida" in r["steps"][0]["stdout"]
               and (CASES / "BombaFalsa").is_dir() and Path(_state()["sim"]).stem == "BombaFalsa",
               f"pump_case arranca el servidor del caso e inyecta UNA macro ({r.get('seconds')}s; {r.get('error') or r.get('exception') or r.get('steps')})")
+        pp = r.get("parsed", {})
+        sal = CASES / "BombaFalsa" / "salida_pump.txt"
+        check(pp.get("RESULT") == {"H": 16.5, "M": 8.4} and pp.get("PIPE") == {"total": 12.5} and pp.get("BALANCE_MASA", {}).get("pct") == 0.0002
+              and pp.get("AVISO") == ["algo raro"] and pp.get("EULER", {}).get("EULER_OK", "").startswith("H_Euler 18") and pp.get("CELLS") == 1234,
+              f"pump_case devuelve RESULT, PIPE, BALANCE_MASA, AVISO, EULER y CELLS ya leídos ({pp})")
+        check(sal.is_file() and "RESULT\tH\t16.5" in sal.read_text(encoding="utf-8") and r.get("salida_completa") == str(sal)
+              and "RESULT" in r["stdout"], "pump_case deja la salida completa en casos/<caso>/salida_pump.txt y sigue dando la cola de stdout")
+        check(_pump_imports(type("M", (), {"IMPORTS": ["a.*", "b.*"]})) == "a.*,b.*" and _pump_imports(type("M", (), {})) == ""
+              and "import 'a.*'" not in _wrap("", str(["a.*", "b.*"]), "x"),
+              "imports del pipeline: la lista se une con comas (y _wrap sanea el str(lista) del fallo real)")
+        e2e = HERE / "casos" / "BombaRapida_e2e_174159" / "e2e_stdout.txt"
+        if e2e.is_file():
+            q = _parse_pump(e2e.read_text(encoding="utf-8", errors="replace"))
+            check(len(q.get("RESULT", {})) >= 9 and abs(q["RESULT"]["H"] - 16.738) < 0.01 and "iterar" in q.get("PIPE", {})
+                  and q.get("BALANCE_MASA", {}).get("pct", 1) < 1e-3 and len(q.get("PNG", [])) == 3,
+                  f"_parse_pump lee la salida REAL de la corrida e2e ({len(q.get('RESULT', {}))} resultados, {len(q.get('PIPE', {}))} fases)")
         r = pump_case("BombaFalsa", str(cad), mode="normal", params={"fallar": True})
         check(r["ok"] is False and r["failed_at"] == 1 and r["steps"][0]["ok"] is True, "pump_case: un paso que falla se reporta con su índice")
         scen.write_text("stable")
@@ -2453,10 +3037,27 @@ def _selftest() -> int:
         new = [Path(p) for p, _ in _real_files() - real_before]
         check(not any(p.suffix in (".log", ".out", ".json") and "FAKE" in p.read_text(encoding="utf-8", errors="replace")[:400] for p in new if p.is_file()),
               "sims/, macros/ y .server.json reales sin rastro del starccm+ falso")
+        check((real_panel.stat().st_mtime_ns if real_panel.is_file() else None) == real_panel_before, "panel_estado.json real intacto")
         mine_real = real_lock.is_file() and f'"pid": {os.getpid()}' in real_lock.read_text(encoding="utf-8", errors="replace")
         check(not mine_real, ".inject.lock real intacto")
+        for t in threads:
+            t.join(timeout=60)
+        dt = bg.get("detached")
+        if os.name == "nt":
+            ok_det = isinstance(dt, tuple) and dt[0] == (True, True, True) and dt[1] is False and dt[2] is False and dt[3] is True
+            check(ok_det, f"taskkill /T /F real sobre el padre: muere el hijo normal y sobrevive el lanzado con _spawn_detached "
+                          f"(vivos antes/después padre,hijo,desacoplado = {dt if not isinstance(dt, tuple) else (dt[0], dt[1:4])}; breakaway {dt[4] if isinstance(dt, tuple) else '?'})")
+        if os.name == "nt":
+            check("1234" in str(bg.get("bat")), f"un .bat lanzado con _spawn_detached conserva la salida de sus hijos de consola ({str(bg.get('bat'))!r})")
+        rg = bg.get("regresion")
+        if isinstance(rg, str):
+            print(f"  {time.time() - t_all:5.1f}s SKIP {rg}: macro real de pipelines/bomba.py con javac")
+        else:
+            check(isinstance(rg, list) and all(not bad and rc == 0 for _, bad, rc, _ in rg) and len(rg) == 2,
+                  "macro REAL de pipelines/bomba.py (rapida e iterar+post) envuelta con _wrap y los imports de pump_case: compila con el javac de STAR-CCM+"
+                  + ("" if isinstance(rg, list) else f" ({rg!r})") + (f" {[(n, b, e) for n, b, rc, e in rg if b or rc]}" if isinstance(rg, list) else ""))
         secs = time.time() - t_all
-        check(secs < 30, f"el selftest tarda {secs:.1f} s (< 30 s)")
+        check(secs < 45, f"el selftest tarda {secs:.1f} s (< 45 s)")
     finally:
         for pid in [gui_pid] + [s.pid for s in sleepers]:
             if pid:
@@ -2465,6 +3066,11 @@ def _selftest() -> int:
         if st.get("pid") and _pid_alive(st["pid"]):
             _kill_tree(st["pid"])
         _res_kill("selftest")
+        for vf in WORK.glob("vigilante-*.json"):
+            try:
+                _kill_tree(int(json.loads(vf.read_text(encoding="utf-8")).get("pid") or 0))
+            except (OSError, ValueError):
+                pass
         os.environ.pop("FAKE_RESIDENT_MODE", None)
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"selftest: {len(fails)} fallos" if fails else "selftest: todo en verde")
@@ -2474,5 +3080,9 @@ def _selftest() -> int:
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
+    if "--vigilante" in sys.argv:  # proceso independiente del MCP: python mcp_server.py --vigilante <puerto>
+        sys.exit(_vigilante_main(int(sys.argv[sys.argv.index("--vigilante") + 1])))
+    _migrate_legacy(HERE, STATE_FILE, LOCK_FILE)  # .server.json/.inject.lock de cuando vivían en el repo (OneDrive)
+    _write_panel_estado()
     start_watchdog()
     mcp.run()
