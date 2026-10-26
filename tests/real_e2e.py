@@ -18,10 +18,17 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import mcp_server as m  # noqa: E402
 
+if any(a in ("-h", "--help") for a in sys.argv[1:]):
+    print(__doc__); sys.exit(0)
 CANCEL = "--cancel" in sys.argv
 sys.argv = [a for a in sys.argv if a != "--cancel"]
 cad = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\sebas\OneDrive\Documentos\cfturbo-agent\versions\BombaRapida_v1"
 caso = sys.argv[2] if len(sys.argv) > 2 else "BombaRapida_e2e_" + time.strftime("%H%M%S")  # caso nuevo: server_start reabre un .sim del mismo nombre
+# Validar ANTES de arrancar el solver (cada arranque reserva la licencia PoD): visto el 2026-10-26, «--help» se tomó
+# como carpeta de CAD, arrancó el solver 53 s y luego falló.
+_cad = Path(cad)
+if not _cad.is_dir() or not list(_cad.glob("*.cfturbo-ccm")) or not list(_cad.glob("*.stp")):
+    sys.exit(f"carpeta de CAD inválida (faltan .cfturbo-ccm o .stp): {cad} — no arranco el solver")
 out = REPO / "casos" / caso
 out.mkdir(parents=True, exist_ok=True)
 t = {}
