@@ -11,8 +11,9 @@ cada turno). Lecciones completas: [conocimiento/lecciones.md](conocimiento/lecci
 1. `.venv`: `python -m venv .venv` y `.venv\Scripts\pip install mcp`.
 2. `.env`: copiar `.env.example` y poner la clave Power-on-Demand en `STARCCM_PODKEY` (ignorado por git; nunca en código ni logs).
 3. `.mcp.json`: copiar `.mcp.json.example` y ajustar las dos rutas absolutas (python del `.venv` y `mcp_server.py`); reiniciar
-   Claude Code (el servidor `starccm` aparece con sus 15 tools). El panel también lo usa (`--mcp-config`): sin este archivo el
-   panel no puede hablar con el solver.
+   Claude Code (el servidor `starccm` aparece con sus 15 tools). El panel también lo usa (`--mcp-config`) y, si el archivo no
+   existe, lo crea solo con las rutas de este equipo (y avisa en el chat). Un `.mcp.json` copiado con rutas de otra máquina NO se
+   repara: borrarlo o corregir las rutas.
 4. Carpeta de trabajo: no hace falta crearla; `COPILOTO_WORK` (por defecto `%LOCALAPPDATA%\starccm-copiloto`) se crea sola.
 
 ## Usar
@@ -33,7 +34,7 @@ El solver solo arranca fuera del sandbox de Claude Code. Un solo solver vivo a l
 | pieza | qué hace |
 |---|---|
 | `mcp_server.py` | 15 tools. Un servidor `starccm+ -server`; las macros entran por un **cliente residente** (un cliente batch `-noexit` que vigila una carpeta; 0,7-1 s por macro frente a 8,6 s) y, si falla, por el cliente batch de siempre. Turnos con `.inject.lock` |
-| vigilante de inactividad | independiente del turno del panel (cada turno es un `claude -p` nuevo): mira `.server.json` y, sin GUI, guarda y apaga a los `STARCCM_IDLE_MIN` (30); con GUI solo deja `idle_warning` |
+| vigilante de inactividad | proceso propio por puerto (`mcp_server.py --vigilante <puerto>`), lanzado desacoplado (fuera del árbol de la CLI: Detener no lo toca); mira macros en disco y GUI, escribe `gui`/`idle_min`/`idle_warning` en `.server.json` (en `COPILOTO_WORK`; `panel_estado.json` dice dónde) y, sin GUI, guarda y apaga a los `STARCCM_IDLE_MIN` (30) |
 | `panel/chat_panel.py` | chat flotante (tkinter); lanza `claude -p … --resume` con las tools `mcp__starccm__*` |
 | `pipelines/bomba.py` | genera la macro de bomba (y iterar/post) desde el `.cfturbo-ccm` + STEP |
 
@@ -42,7 +43,7 @@ El solver solo arranca fuera del sandbox de Claude Code. Un solo solver vivo a l
 | comando | qué comprueba | coste |
 |---|---|---|
 | `.venv\Scripts\python mcp_server.py --selftest` | las tools contra `tests/fake_starccm.py` (solo temporales) | sin licencia, ~30 s |
-| `.venv\Scripts\python panel\chat_panel.py --selftest` | el panel contra `tests/fake_claude.py`, sin pantalla | sin licencia, ~3 s |
+| `.venv\Scripts\python panel\chat_panel.py --selftest` | el panel contra `tests/fake_claude.py`, sin pantalla | sin licencia, ~9 s |
 | `.venv\Scripts\python pipelines\bomba.py --selftest` | lee un `.cfturbo-ccm` real, compila con el `javac` de STAR-CCM+ el Java generado, prueba el juez de estabilidad | sin licencia, ~70 s |
 | `.venv\Scripts\python tests\real_e2e.py [carpeta_cad] [caso]` | **prueba real**: server_start, `pump_case` (iterar + post), server_stop; escribe `casos/<caso>/e2e.json` con tiempos por fase y resultados | **gasta licencia PoD**, ~3-5 min; lanzar desde una terminal normal (fuera del sandbox) y sin otro solver vivo |
 

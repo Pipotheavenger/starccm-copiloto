@@ -230,6 +230,28 @@ Fechas 2026-10-23 salvo indicación. Las del remoto y la UI web: `conocimiento/C
   Area sobre una frontera de interfaz interna devuelve 0 y el de la parte devuelve la cara entera. Ahora solo avisa si la
   interfaz hermana devuelve área (>0) y la pared sin emparejar pasa de 2 %; si no es medible lo dice y se confía en
   `BALANCE_MASA` (> 0,5 % = revisar interfaces). No pedir re-exportar CAD por ese aviso si el balance de masa es bueno.
+- 2026-10-26 · `taskkill /PID <cli> /T /F` alcanza a los procesos DESACOPLADOS (breakaway, nuevo grupo) mientras el padre
+  siga vivo: el desacople por sí solo no basta. Lanzar con un intermediario que muere (`_spawn_detached`: `python -I -c
+  _LAUNCHER` lanza el destino y termina), así el destino queda huérfano y fuera del árbol de la CLI. Con `DETACHED_PROCESS` un
+  `.bat` (`starccm+.bat`) pierde la salida redirigida de sus hijos de consola: por eso `CREATE_NO_WINDOW`
+  (`COPILOTO_DETACHED=1` cambia a lo contrario, peor). Probado con `claude.exe` real: el desacoplado sobrevive a Detener.
+- 2026-10-26 · Imports de `pump_case` pasados como lista de Python (`str(lista)`) rompían la macro: debe ser `import 'x';`
+  por línea. Fallo real; `_pump_imports` los comparte con el selftest, que compila la macro real con javac, y `_wrap` sanea
+  comillas y corchetes sobrantes.
+- 2026-10-26 · División por cero en reportes: aborta el step (`Non-finite value detected`). Todo denominador:
+  `(abs(den) > 1e-9 ? num/den : 0)` (ver la entrada de arriba; vale para `eta`, `eta_Euler`, `factor_deslizamiento`).
+- 2026-10-26 · `server_start` con un `.sim` del mismo nombre que otro ya guardado en `sims/` lo REABRE (con su solución vieja):
+  usar un caso nuevo por prueba (`BombaRapida_e2e_<hora>`), nunca repetir el nombre.
+- 2026-10-26 · El cliente residente tarda 0,7–1 s por macro con StarScript (frente a 8,6 s del batch): agrupar macros no es
+  por velocidad de inyección sino por los turnos de IA entre ellas; aun así, no lanzar una por reporte.
+- 2026-10-26 · Aviso Euler espurio en CADA corrida con `iterar` (`AVISO Euler: radio medio de la entrada (0.0)…` y
+  `EULER_VALIDAR sin solución`): la validación corría con la malla sin solución. Peor: `euler_check_body` salía VACÍO (cortaba
+  hasta el primer `for (Report r : reps)`, que está antes de la validación), así que tampoco había `EULER_OK`/`EULER_MAL`
+  tras iterar. Ahora la validación solo va tras el bucle estable (o en `post`) y los AVISO de radio exigen radio > 0.
+  Si en una corrida con `iterar` falta `EULER_OK`/`EULER_MAL`, es un error del pipeline, no de la física.
+- Ronda 3-4 (referencia): `panel_estado.json` (raíz del repo, ignorado) apunta a `estado_dir`; `vigilante-<puerto>.json` (pid +
+  latido) garantiza uno por puerto; variables `COPILOTO_VIGILANTE_S`, `STARCCM_VIGILANTE`, `COPILOTO_VIG_GONE_S`,
+  `COPILOTO_DETACHED`, `COPILOTO_AGENT_LOG` (ver `.env.example`).
 - Un servidor viejo con un vigilante que no detecta macros largas guardó y mató el solver de otra sesión a los 7 min de
   una malla (2,7 M celdas). Regla: una sola instancia de cada vigilante; antes de probar, mirar procesos
   `Get-CimInstance Win32_Process | ? CommandLine -match 'mcp_server|chat_panel'` y parar las viejas.
@@ -249,4 +271,4 @@ recomendada primera y la cifra de coste entre paréntesis. Ejemplo: «1) malla f
 
 ## 9. Pendiente de verificar con solver real
 
-Verificado el 2026-10-26 con solver en BombaRapida_e2e (pump_case con iterar y post: H 16,74 m, eta 88,6 %, H_Euler 18,75 m, eta_Euler 0,892, balance 0,0002 %, estable en 250 it, 3 PNG): `pipelines/bomba.py` completo, `iterar`, `post`, receta de Euler (`reportes-euler-triangulos`) y `bomba-reportes` (con divisiones protegidas). Sigue sin verificar: medida de `PARED_CONEXION` corregida (la anterior daba falso positivo), receta NACA con STL, `gui_attach` desde el MCP en uso largo, la curva de 5 caudales.
+Verificado el 2026-10-26 con solver en BombaRapida_e2e (pump_case con iterar y post: H 16,74 m, eta 88,6 %, H_Euler 18,75 m, eta_Euler 0,892, balance 0,0002 %, estable en 250 it, 3 PNG): `pipelines/bomba.py` completo, `iterar`, `post`, receta de Euler (`reportes-euler-triangulos`) y `bomba-reportes` (con divisiones protegidas). Verificado además: medida de `PARED_CONEXION` corregida (en la corrida 181510 dijo «no medible», 0 AVISO; el balance 1,8e-4 % es lo que protege). Sigue sin verificar: la validación de Euler tras iterar sin aviso espurio (N1, corregida en el generador, sin solver), receta NACA con STL, `gui_attach` desde el MCP en uso largo, la curva de 5 caudales.

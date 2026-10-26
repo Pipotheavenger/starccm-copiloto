@@ -6,8 +6,12 @@ y lee lo que la macro imprimió con sim.println entre los marcadores AGENT_BEGIN
 El usuario puede mirar con la GUI real (`gui_attach`: starccm+ -host localhost:P, sin licencia propia).
 No se recarga el .sim entre pasos. Claude nunca resuelve física a mano: STAR-CCM+ es el solver.
 
-Tools (15): server_start, server_stop, server_status, gui_attach, gui_status, inspect, run_java, run_steps,
+Tools (16): server_start, server_stop, server_status, gui_attach, gui_status, cancel, inspect, run_java, run_steps,
 iterate, pump_case, export_scene, save, recipe_search, recipe_save, docs_search.
+
+Progreso en vivo: mientras iterate o pump_case corren, un hilo escribe estado_dir()/progreso.json (cada ~1 s: fase, iteración, H, M,
+eta, continuidad, transcurrido y lo que falta) leyendo el .out de la macro; al terminar deja fase "terminado" con el resultado.
+cancel(): crea el archivo ABORT (criterio «Stop File» de STAR-CCM+, en sims/) y cancel.json; iterate/pump_case lo ven y paran limpio.
 
 Turnos: toda inyección toma el candado de archivo `.inject.lock` (pid, herramienta, inicio). Si otro proceso
 vivo lo tiene, se espera `wait_s` y si no se devuelve {"ok": false, "busy": "..."}. Huérfano (pid muerto o sin
@@ -16,6 +20,8 @@ latido en 2 h) se limpia solo.
 Uso:   python mcp_server.py            (stdio, lo lanza Claude Code desde .mcp.json)
        python mcp_server.py --selftest (starccm+ falso de tests/, sin licencia ni solver, < 45 s)
        python mcp_server.py --vigilante <puerto>  (lo lanza server_start; no se llama a mano)
+       python mcp_server.py --cli <herramienta> [json-args]  (acción directa SIN modelo: gui_attach, gui_status, server_stop,
+                        server_status, cancel; escribe el resultado JSON por stdout; respeta el candado de turnos)
 
 Env (se leen también de .env en la raíz del repo y de ~/.starccm-agent.env, formato KEY=VALUE):
   STARCCM_HOME     carpeta STAR-CCM+<ver> (default: la más nueva en C:\\Program Files\\Siemens)
@@ -36,7 +42,8 @@ Env (se leen también de .env en la raíz del repo y de ~/.starccm-agent.env, fo
                    inbox y ejecuta cada macro con StarScript: ~0,7-1 s por macro en vez de ~8,6 s). 0 = siempre
                    el cliente batch de siempre.
   COPILOTO_WORK    carpeta de trabajo pesada FUERA de OneDrive (default %LOCALAPPDATA%\\starccm-copiloto): sims/,
-                   macros/, residente/ (inbox, out, latido, log del residente) y tiempos.csv.
+                   macros/, residente/ (inbox, out, latido, log del residente), tiempos.csv y agent.log.
+  COPILOTO_CANCEL_GRACE_S  s que iterate/pump_case esperan, tras un cancel, a que la macro termine sola antes de abandonarla (8).
 
 Carpetas: en COPILOTO_WORK sims/ (.sim de trabajo, nunca el original del usuario), macros/ (cada macro inyectada,
 con su salida .out), residente/, logs del solver (sims/*.server.log), tiempos.csv. En la raíz del repo: casos/<caso>/
@@ -99,7 +106,7 @@ def estado_dir() -> Path:
 
 STATE_FILE = estado_dir() / ".server.json"
 LOCK_FILE = estado_dir() / ".inject.lock"
-AGENT_LOG = Path(os.environ.get("COPILOTO_AGENT_LOG") or HERE / "agent.log")
+AGENT_LOG = Path(os.environ.get("COPILOTO_AGENT_LOG") or WORK / "agent.log")  # en la carpeta de trabajo (no en OneDrive)
 PANEL_ESTADO = HERE / "panel_estado.json"  # único archivo de estado que queda en el repo: dice dónde está lo demás
 KEEP_MACROS = 200
 
@@ -547,6 +554,16 @@ def _publish_idle(st: dict, gui: bool, idle_min: float, warning: str | None) -> 
     if not cur.get("pid") or cur.get("pid") != st.get("pid"):
         return
     cur.update(gui=bool(gui), idle_min=idle_min, idle_checked=datetime.now().isoformat(timespec="seconds"))
+    if _vig_self:  # solo el proceso vigilante deja su pid (real) y los de los procesos reales del servidor y del residente
+        cur["vigilante"] = _vig_self
+        ri = _res_info()
+        rp = ri.get("pid") if ri.get("server_pid") == cur.get("pid") and ri.get("pid") and _pid_alive(ri["pid"]) else None
+        cur["residente"] = rp
+        try:
+            cur["pid_real"] = _real_pid(cur["pid"], "-server") if os.name == "nt" else cur["pid"]
+            cur["residente_real"] = _real_pid(rp, "Residente.java") if rp else None
+        except Exception:  # noqa: BLE001
+            pass
     if warning:
         cur["idle_warning"] = warning
     else:
@@ -594,6 +611,7 @@ def _idle_stop() -> str:
 # el servidor muere. Uno por puerto: vigilante-<puerto>.json en la carpeta de estado (pid + latido).
 VIGILANTE_S = float(os.environ.get("COPILOTO_VIGILANTE_S", "30"))
 VIGILANTE_ON = os.environ.get("STARCCM_VIGILANTE", "1") != "0"
+_vig_self: int | None = None  # pid de ESTE proceso si es el vigilante (lo publica en .server.json)
 VIG_GONE_S = float(os.environ.get("COPILOTO_VIG_GONE_S", "3"))  # s seguidos sin servidor antes de terminar (un server_start que reinicia no lo mata)
 
 
@@ -633,12 +651,20 @@ def _vigilante_ensure(port: int) -> dict:
     except Exception as e:  # noqa: BLE001
         _log(f"vigilante: no pude lanzarlo: {e}")
         return {"vigilante": None, "error": str(e)[:200]}
-    _log(f"vigilante lanzado pid {sp['pid']} (puerto {port}, breakaway {sp.get('breakaway')})")
-    return {"vigilante": sp["pid"], "nuevo": True}
+    real, t_end = None, time.time() + 3.0  # el pid del lanzador puede ser el redirector del venv: el vigilante da el suyo en su archivo
+    while time.time() < t_end:
+        real = _vigilante_pid(port)
+        if real:
+            break
+        time.sleep(0.05)
+    _log(f"vigilante lanzado pid {real or sp['pid']} (puerto {port}, breakaway {sp.get('breakaway')}"
+         + (f", lanzador {sp['pid']}" if real and real != sp["pid"] else "") + ")")
+    return {"vigilante": real or sp["pid"], "nuevo": True}
 
 
 def _vigilante_main(port: int) -> int:
-    me = os.getpid()
+    global _vig_self
+    me = _vig_self = os.getpid()
     if _vigilante_pid(port):
         return 0  # ya hay uno
     f = _vig_file(port)
@@ -688,6 +714,10 @@ def start_watchdog() -> None:
 
 
 def _log(msg: str) -> None:
+    try:
+        AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     with open(AGENT_LOG, "a", encoding="utf-8") as f:
         f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {_redact(msg)}\n")
 
@@ -739,7 +769,7 @@ def _procs_native(needle: str) -> list[dict]:
         pe.dwSize = ctypes.sizeof(PE)
         ok = k32.Process32FirstW(snap, ctypes.byref(pe))
         while ok:
-            pid, name = pe.th32ProcessID, pe.szExeFile
+            pid, name, ppid = pe.th32ProcessID, pe.szExeFile, pe.th32ParentProcessID
             ok = k32.Process32NextW(snap, ctypes.byref(pe))
             if pid in (0, 4):
                 continue
@@ -759,7 +789,7 @@ def _procs_native(needle: str) -> list[dict]:
                     continue
                 cmd = rpm(h, buf, length).decode("utf-16-le", "replace")
                 if needle in cmd:
-                    rows.append({"pid": pid, "name": name, "cmd": cmd})
+                    rows.append({"pid": pid, "name": name, "cmd": cmd, "ppid": ppid})
             except OSError:
                 continue
             finally:
@@ -825,6 +855,31 @@ def _gui(fresh: bool = False) -> dict:
     return res
 
 
+def _real_pid(root: int | None, needle: str) -> int | None:
+    """Pid del proceso REAL lanzado desde `root`: el descendiente más profundo cuya línea de comandos contiene `needle`. Un python
+    de un venv de Windows es un redirector que lanza al intérprete de verdad como hijo, y un .bat lanza a cmd y luego al solver:
+    el pid que devuelve el lanzador es el del intermediario. Sin descendiente que coincida (o fuera de Windows) vuelve `root`."""
+    if not root or os.name != "nt":
+        return root
+    try:
+        rows = _procs_native(needle)
+    except Exception:  # noqa: BLE001
+        return root
+    kids: dict[int, list] = {}
+    for r in rows:
+        kids.setdefault(r.get("ppid"), []).append(r)
+    best, depth, stack = root, 0, [(root, 0)]
+    while stack:
+        pid, d = stack.pop()
+        for k in kids.get(pid, []):
+            if str(k.get("name", "")).lower().startswith("conhost"):
+                continue
+            if d + 1 > depth:
+                best, depth = k["pid"], d + 1
+            stack.append((k["pid"], d + 1))
+    return best
+
+
 # ----------------------------------------------------------------------------- macro java
 IMPORTS = [
     "star.common.*", "star.base.neo.*", "star.base.report.*", "star.meshing.*", "star.flow.*",
@@ -867,6 +922,59 @@ def _prune_macros() -> None:
     files = sorted(MACROS.glob("Agent_*"), key=lambda p: p.stat().st_mtime)
     for p in files[:-KEEP_MACROS]:
         p.unlink(missing_ok=True)
+
+
+KEEP_RES_LOGS = 3   # residente-*.log que se conservan (los más recientes)
+PRUNE_DAYS = 7      # macros/.classes y macros/.cache más viejos que esto se borran
+
+
+def _prune_work() -> dict:
+    """Mantenimiento de la carpeta de trabajo: deja los KEEP_RES_LOGS últimos residente-*.log y borra de macros/.classes y
+    macros/.cache lo de más de PRUNE_DAYS días. Devuelve lo borrado."""
+    out = {"residente_logs": 0, "classes": 0}
+    try:
+        logs = sorted(RES_DIR.glob("residente-*.log"), key=lambda q: q.stat().st_mtime, reverse=True)
+        for q in logs[KEEP_RES_LOGS:]:
+            try:
+                q.unlink()
+                out["residente_logs"] += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    cutoff = time.time() - PRUNE_DAYS * 86400
+    for d in (MACROS / ".classes", MACROS / ".cache"):
+        if not d.is_dir():
+            continue
+        try:
+            for f in d.rglob("*"):
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        out["classes"] += 1
+                except OSError:
+                    pass
+            for sub in sorted((x for x in d.rglob("*") if x.is_dir()), key=lambda x: len(x.parts), reverse=True):
+                try:
+                    sub.rmdir()  # solo las vacías
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return out
+
+
+def _migrate_agent_log() -> bool:
+    """agent.log vivía en el repo (OneDrive); ahora en la carpeta de trabajo. Si el viejo existe y el nuevo no, se mueve."""
+    old = HERE / "agent.log"
+    try:
+        if not os.environ.get("COPILOTO_AGENT_LOG") and old.is_file() and old.resolve() != AGENT_LOG.resolve() and not AGENT_LOG.exists():
+            AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old), str(AGENT_LOG))
+            return True
+    except OSError:
+        pass
+    return False
 
 
 def _run_javac(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -941,6 +1049,9 @@ def _inject_locked(body: str, imports: str, timeout: float, expect_death: bool) 
     src = MACROS / f"Agent_{tag}.java"
     src.write_text(_wrap(body, imports, tag), encoding="utf-8")
     t0 = time.time()
+    if not _cancel_requested():
+        _clear_abort()  # un ABORT que quedó de otra corrida pararía esta al instante
+    _prog.watch(src.with_suffix(".out"))
     why = None
     if RES_ON:
         r, why = _inject_resident(st, src, tag, t0, timeout, expect_death)
@@ -1202,6 +1313,7 @@ def _inject_resident(st: dict, src: Path, tag: str, t0: float, timeout: float,
     tmpf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     os.replace(tmpf, RES_DIR / "inbox" / name)  # el residente solo ve *.java: nunca una macro a medias
     acc, res, killed, died, last_chk, last_pid = "", None, False, False, 0.0, 0.0
+    t_cancel, cancelled = None, False
     deadline = time.time() + timeout  # tras comprobar el residente: lanzarlo no gasta el tiempo de la macro
     try:
         while True:
@@ -1227,16 +1339,28 @@ def _inject_resident(st: dict, src: Path, tag: str, t0: float, timeout: float,
                 _touch_lock()
                 if expect_death and not alive(st):  # (cada 0,4 s)
                     break  # sim.kill(): el servidor se fue, no habrá resultado
+                if _cancel_requested():  # cancel(): ABORT ya puesto; si la macro no acaba sola en CANCEL_GRACE_S se abandona
+                    _prog.mark_cancel()
+                    if t_cancel is None:
+                        t_cancel = now
+                    elif now - t_cancel > CANCEL_GRACE_S and getattr(_ctx, "cancel_kill", True):
+                        killed = cancelled = True
+                        break
             time.sleep(RES_POLL)
         if killed or died:
-            reason = (f"timeout {timeout}s" if killed else "el residente murió o dejó de dar latido") + \
+            reason = ("cancelado por el usuario: iteración detenida (ABORT) y macro abandonada" if cancelled else
+                      f"timeout {timeout}s" if killed else "el residente murió o dejó de dar latido") + \
                      "; residente matado (el servidor sigue vivo) y relanzado"
             _res_kill(reason)
             (RES_DIR / "inbox" / name).unlink(missing_ok=True)
             relaunch = ""
             if alive(st):
                 try:
-                    ok2, relaunch = _res_launch(st)
+                    if cancelled:  # sin esperar su latido: la siguiente inyección lo espera
+                        _res_spawn(st)
+                        ok2, relaunch = True, ""
+                    else:
+                        ok2, relaunch = _res_launch(st)
                     relaunch = "" if ok2 else f" (no pude relanzarlo: {relaunch})"
                 except Exception as e:  # noqa: BLE001
                     relaunch = f" (no pude relanzarlo: {e})"
@@ -1263,6 +1387,8 @@ def _inject_resident(st: dict, src: Path, tag: str, t0: float, timeout: float,
     r = _inject_result(st, src, tag, t0, rc, err, killed, out_file, expect_death)
     if died:
         r["resident_died"] = True
+    if cancelled:
+        r["cancelled"] = True
     if err and not killed and not died and _between(acc, tag) is None and not r.get("exception"):
         # error de compilación (o de ejecución antes de AGENT_BEGIN): lo devuelve el propio residente
         r["exception"] = "el cliente residente no pudo compilar/ejecutar la macro: " + err.strip().splitlines()[0][:300]
@@ -1354,8 +1480,463 @@ def _tail_log(st: dict, n: int = 200_000) -> str:
         return f.read().decode("utf-8", "replace")
 
 
+# ----------------------------------------------------------------------------- progreso en vivo y cancelación
+# Mientras iterate o pump_case corren, un hilo del proceso dueño del turno escribe estado_dir()/progreso.json cada ~1 s leyendo el
+# .out de la macro en curso (que el cliente residente va llenando en vivo): marcadores PIPE (fases), ITER, ITERATION/REPORT y la
+# tabla de monitores del solver (Iteration, Continuity, …, M, H). El panel solo lee ese archivo.
+PROG_TOOLS = ("iterate", "pump_case")
+PROG_EVERY_S = 1.0
+CANCEL_GRACE_S = float(os.environ.get("COPILOTO_CANCEL_GRACE_S", "8"))  # tras cancel: s que la macro tiene para acabar sola
+FASES = ["importar", "regiones", "fisica", "mrf", "fronteras", "reportes", "malla", "euler", "iterar", "post"]  # orden de los PIPE
+_FASE_NOMBRE = {"malla": "mallar"}
+_NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+_ROW = re.compile(rf"^\s*(\d+)((?:\s+(?:{_NUM}|NaN|-?Infinity))+)\s*$")
+_VAL_KEYS = {"h": "H", "m": "M", "eta": "eta", "continuity": "continuidad"}
+
+
+def progreso_file() -> Path:
+    return estado_dir() / "progreso.json"
+
+
+def cancel_file() -> Path:
+    return estado_dir() / "cancel.json"
+
+
+def abort_file() -> Path:
+    """Archivo ABORT que vigila el criterio «Stop File» de STAR-CCM+ (por defecto «ABORT» en el directorio de trabajo del servidor,
+    que server_start fija en sims/). Doc: Stopping Criteria > Setting a Stop File."""
+    return SIMS / "ABORT"
+
+
+def _write_json_atomic(path: Path, d: dict) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    for _ in range(4):  # (Windows: replace falla un instante si el panel lo tiene abierto)
+        try:
+            tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            time.sleep(0.05)
+    try:
+        path.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def _clean(o):
+    """Sin NaN/Infinity (no son JSON válido para el panel)."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_clean(v) for v in o]
+    return o
+
+
+def _iso(t: float) -> str:
+    return datetime.fromtimestamp(t).isoformat(timespec="seconds")
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+class _Progreso:
+    """Estado de la corrida en curso + hilo que lo vuelca a progreso.json. Una sola corrida a la vez (el turno del solver)."""
+
+    def __init__(self):
+        self.lk = threading.RLock()
+        self.active = False
+        self.owner = None
+        self.gen = 0
+        self._reset("", None)
+
+    def _reset(self, tool, caso):
+        self.tool, self.caso = tool, caso
+        self.t0 = self.t_fase = time.time()
+        self.fkey = "arrancar"
+        self.hechas: dict = {}
+        self.it = self.it0 = self.t_it = self.r0 = None  # r0 = (iteración, t) de la primera lectura: base del ritmo
+        self.vals: dict = {}
+        self.hist: list = []  # (it, H, M)
+        self.cols = None
+        self.iter_max, self.window, self.tol, self.criterio = None, 100, 0.005, "stable"
+        self.cancel = False
+        self.out, self.pos, self.buf = None, 0, ""
+        self.ref: dict = {}
+
+    # --- ciclo de vida
+    def begin(self, tool: str, caso=None, fase: str = "arrancar", **conf) -> bool:
+        """True si esta llamada toma la corrida (pump_case llama luego a iterate: la anidada no la reinicia, solo la configura)."""
+        with self.lk:
+            if self.active:
+                self.configure(**conf)
+                return False
+            self._reset(tool, caso)
+            self.ref = _read_json(estado_dir() / "fases_ref.json")
+            self.fkey = fase
+            self.configure(**conf)
+            self.active = True
+            self.owner = threading.get_ident()
+            self.gen += 1
+            gen = self.gen
+            self._write()
+        threading.Thread(target=self._loop, args=(gen,), daemon=True).start()
+        return True
+
+    def configure(self, iter_max=None, window=None, tol=None, criterio=None, caso=None) -> None:
+        with self.lk:
+            if iter_max is not None:
+                self.iter_max = int(iter_max)
+            if window is not None:
+                self.window = max(1, int(window))
+            if tol is not None:
+                self.tol = float(tol)
+            if criterio is not None:
+                self.criterio = criterio
+            if caso:
+                self.caso = caso
+
+    def set_fase(self, key: str) -> None:
+        with self.lk:
+            if self.active:
+                self._fase(key)
+                self._write()
+
+    def watch(self, out_path) -> None:
+        """Pasa a leer el .out de la macro que empieza (antes termina de leer el de la anterior)."""
+        with self.lk:
+            if not self.active:
+                return
+            self.feed(final=True)
+            self.out, self.pos, self.buf = Path(out_path), 0, ""
+
+    def mark_cancel(self) -> None:
+        with self.lk:
+            if self.active and not self.cancel:
+                self.cancel = True
+                self._write()
+
+    def update(self, it: int, done: int, reports: dict) -> None:
+        """Lo que sabe iterate al final de un bloque (respaldo de la lectura del .out)."""
+        with self.lk:
+            if not self.active:
+                return
+            self.it0 = it - done + 1
+            self._iter(it)
+            for k, v in (reports or {}).items():
+                if isinstance(v, (int, float)):
+                    self._val(k, float(v))
+            self._hist(it)
+            self._write()
+
+    def end(self, res=None, err=None) -> None:
+        with self.lk:
+            if not self.active or self.owner != threading.get_ident():  # solo termina quien la empezó
+                return
+            self.feed(final=True)
+            self.active = False
+            self.gen += 1
+            resultado = self._resumen(res, err)
+            self._write(terminado=True, resultado=resultado)
+            if isinstance(res, dict) and isinstance((res.get("parsed") or {}).get("PIPE"), dict):
+                ref = {k: v for k, v in res["parsed"]["PIPE"].items() if k in FASES and isinstance(v, (int, float))}
+                if ref:
+                    _write_json_atomic(estado_dir() / "fases_ref.json", {**self.ref, **ref})
+
+    @staticmethod
+    def _resumen(res, err) -> dict:
+        if err:
+            return {"ok": False, "error": str(err)[:500]}
+        r = res if isinstance(res, dict) else {}
+        out = {k: r[k] for k in ("ok", "stopped", "iterations_run", "iteration", "seconds", "cancelled", "error", "exception", "busy",
+                                 "failed_at") if k in r}
+        it = r.get("iterate")
+        if isinstance(it, dict):
+            out["iterate"] = {k: it[k] for k in ("ok", "stopped", "iterations_run", "iteration", "reports", "variation_pct") if k in it}
+        rr = (r.get("parsed") or {}).get("RESULT")
+        if rr:
+            out["RESULT"] = rr
+        elif isinstance(r.get("reports"), dict):
+            out["reports"] = r["reports"]
+        return out
+
+    # --- lectura del .out
+    def feed(self, final: bool = False) -> None:
+        p = self.out
+        if p:
+            try:
+                sz = p.stat().st_size
+                if sz < self.pos:
+                    self.pos, self.buf = 0, ""
+                if sz > self.pos:
+                    with open(p, "rb") as f:
+                        f.seek(self.pos)
+                        data = f.read(4_000_000)
+                    self.pos += len(data)
+                    self.buf += data.decode("utf-8", "replace")
+            except OSError:
+                pass
+        lines = self.buf.split("\n")
+        self.buf = "" if final else lines.pop()
+        for ln in lines:
+            self._line(ln)
+
+    def _fase(self, key: str) -> None:
+        if key != self.fkey:
+            self.fkey, self.t_fase = key, time.time()
+
+    def _val(self, name: str, v: float) -> None:
+        k = _VAL_KEYS.get(re.sub(r"\s*\(.*\)\s*$", "", str(name)).strip().lower())
+        if k:
+            self.vals[k] = v
+
+    def _iter(self, it: int) -> None:
+        now = time.time()
+        if self.fkey != "post":
+            self._fase("iterar")
+        if self.it0 is None:
+            self.it0 = it
+        if self.r0 is None:
+            self.r0 = (it, now)
+        self.it, self.t_it = it, now
+
+    def _hist(self, it: int) -> None:
+        if not self.hist or it > self.hist[-1][0]:
+            self.hist.append((it, self.vals.get("H"), self.vals.get("M")))
+            if len(self.hist) > 20000:
+                del self.hist[:5000]
+
+    def _line(self, ln: str) -> None:
+        s = ln.strip()
+        if not s:
+            return
+        if s.startswith("PIPE "):
+            m = re.match(rf"PIPE (\S+) ({_NUM})$", s)
+            if m:
+                nm = m.group(1)
+                self.hechas[nm] = float(m.group(2))
+                if nm in FASES and nm != "post":
+                    self._fase(FASES[FASES.index(nm) + 1])
+            return
+        if s.startswith("ITER_STOP"):
+            if self.fkey == "iterar":
+                self._fase("post")
+            return
+        if s.startswith("ITER\t"):
+            parts = s.split("\t")
+            try:
+                it = int(parts[1])
+            except (ValueError, IndexError):
+                return
+            self._iter(it)
+            for p in parts[2:]:
+                m = re.match(rf"(\w+) ({_NUM}|NaN)$", p.strip())
+                if m:
+                    self._val(m.group(1), float(m.group(2)))
+            self._hist(it)
+            return
+        m = re.match(r"ITERATION (\d+)$", s)
+        if m:
+            self._iter(int(m.group(1)))
+            return
+        if s.startswith("REPORT\t"):
+            parts = s.split("\t")
+            if len(parts) == 3:
+                try:
+                    self._val(parts[1], float(parts[2]))
+                except ValueError:
+                    pass
+            return
+        if s.startswith("Iteration"):  # cabecera de la tabla de monitores
+            cols = re.split(r"\s{2,}", s)
+            if len(cols) >= 3:
+                self.cols = cols
+            return
+        if self.cols:
+            m = _ROW.match(ln)
+            if m:
+                vals = [m.group(1)] + m.group(2).split()
+                if len(vals) == len(self.cols):
+                    it = int(vals[0])
+                    self._iter(it)
+                    for c, v in zip(self.cols[1:], vals[1:]):
+                        try:
+                            self._val(c, float(v))
+                        except ValueError:
+                            pass
+                    self._hist(it)
+
+    # --- estimación
+    def _var(self, end: float, w: int):
+        """(máx − mín)/|media| de H y M en las `w` iteraciones que acaban en `end`; None si aún no hay tanta historia."""
+        if not self.hist or self.hist[0][0] > end - w:
+            return None
+        worst = None
+        for idx in (1, 2):
+            xs = [h[idx] for h in self.hist if end - w <= h[0] <= end and h[idx] is not None and math.isfinite(h[idx])]
+            if len(xs) >= 2:
+                v = (max(xs) - min(xs)) / max(abs(sum(xs) / len(xs)), 1e-30)
+                worst = v if worst is None else max(worst, v)
+        return worst
+
+    def _rate(self):
+        if self.r0 and self.it is not None and self.t_it and self.it > self.r0[0] and self.t_it > self.r0[1]:
+            return (self.it - self.r0[0]) / (self.t_it - self.r0[1])
+        return None
+
+    def _falta(self, now: float) -> dict:
+        none = {"falta_s": None, "falta_max_s": None, "falta_its": None, "falta_fuente": None}
+        if self.fkey == "iterar" and self.it is not None and self.iter_max:
+            rate = self._rate()
+            if not rate:
+                return none
+            n_done = self.it - (self.it0 if self.it0 is not None else self.it) + 1
+            left_max = max(0, self.iter_max - n_done)
+            if self.criterio == "n":
+                rem = left_max
+            else:
+                w = self.window
+                span = (self.hist[-1][0] - self.hist[0][0]) if self.hist else 0
+                if span < w:
+                    rem = (w - span) + w * 0.5  # llenar la ventana y luego asentarse
+                else:
+                    v, vp = self._var(self.it, w), self._var(self.it - w, w)
+                    if v is None:
+                        rem = w
+                    elif v <= self.tol:
+                        rem = w * 0.25
+                    else:
+                        r = v / vp if vp and vp > v else 0.5  # la variación decae ~ geométricamente por ventana
+                        r = min(max(r, 0.05), 0.95)
+                        rem = w * math.log(self.tol / v) / math.log(r)
+            rem = min(max(rem, 0), left_max)
+            return {"falta_s": round(rem / rate, 1), "falta_max_s": round(left_max / rate, 1), "falta_its": round(rem),
+                    "falta_fuente": "ritmo"}
+        if self.fkey in FASES and self.ref.get(self.fkey) is not None:  # fases anteriores a iterar: lo que tardó la última corrida
+            idx = FASES.index(self.fkey)
+            total = sum(float(self.ref.get(k, 0) or 0) for k in FASES[idx + 1:]) + max(0.0, float(self.ref[self.fkey]) - (now - self.t_fase))
+            return {"falta_s": round(total, 1), "falta_max_s": None, "falta_its": None, "falta_fuente": "referencia"}
+        return none
+
+    def snapshot(self, terminado: bool = False, resultado=None) -> dict:
+        now = time.time()
+        v = self.vals
+        var = self._var(self.it, self.window) if self.it is not None else None
+        d = {"schema": 1, "tool": self.tool, "caso": self.caso,
+             "fase": "terminado" if terminado else _FASE_NOMBRE.get(self.fkey, self.fkey),
+             "fases_s": {k: round(x, 2) for k, x in self.hechas.items()},
+             "iteracion": self.it, "iter_max": self.iter_max, "criterio": self.criterio,
+             "H": v.get("H"), "M": v.get("M"), "eta": v.get("eta"), "continuidad": v.get("continuidad"),
+             "variacion_pct": None if var is None else round(var * 100, 3), "ritmo_it_s": None,
+             "inicio": _iso(self.t0), "transcurrido_s": round(now - self.t0, 1),
+             "falta_s": None, "falta_max_s": None, "falta_its": None, "falta_fuente": None,
+             "cancelando": self.cancel, "terminado": terminado, "resultado": resultado,
+             "actualizado": _iso(now), "t": round(now, 2), "pid": os.getpid()}
+        rate = self._rate()
+        if rate:
+            d["ritmo_it_s"] = round(rate, 3)
+        if terminado:
+            d["falta_s"] = 0.0
+        else:
+            d.update(self._falta(now))
+        return _clean(d)
+
+    def _write(self, terminado: bool = False, resultado=None) -> None:
+        _write_json_atomic(progreso_file(), self.snapshot(terminado, resultado))
+
+    def _loop(self, gen: int) -> None:
+        while True:
+            time.sleep(PROG_EVERY_S)
+            with self.lk:
+                if not self.active or self.gen != gen:
+                    return
+                try:
+                    self.feed()
+                    self._write()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+_prog = _Progreso()
+
+
+def read_progreso() -> dict:
+    """progreso.json tal cual (lo lee el panel y cancel). {} si no hay."""
+    return _read_json(progreso_file())
+
+
+def _progreso_vivo(p: dict | None = None, max_age: float = 10.0) -> bool:
+    """¿Hay una corrida escribiendo progreso ahora (no terminada, latido reciente, proceso dueño vivo)?"""
+    p = read_progreso() if p is None else p
+    return bool(p) and not p.get("terminado") and time.time() - float(p.get("t") or 0) < max_age and _pid_alive(int(p.get("pid") or 0))
+
+
+def _cancel_requested() -> bool:
+    """¿Alguien llamó a cancel() DESPUÉS de empezar la tool de primer nivel de este hilo? (cancel.json trae la hora)"""
+    t0 = getattr(_ctx, "t_start", None)
+    if t0 is None:
+        return False
+    d = _read_json(cancel_file())
+    if d and float(d.get("t") or 0) >= t0 - 1.0:
+        _ctx.cancel_seen = True
+        _ctx.cancel_kill = bool(d.get("kill", True))
+        return True
+    return False
+
+
+def _clear_abort() -> None:
+    try:
+        abort_file().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _cancel_cleanup() -> None:
+    """Fin de la tool que vio el cancel: se borra ABORT (si no, la próxima corrida pararía al instante) y cancel.json."""
+    _clear_abort()
+    try:
+        cancel_file().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _abort_enable_java() -> str:
+    """Java que deja activo el criterio «Stop File» con la ruta absoluta de abort_file() (el nodo existe solo con un modelo de
+    tiempo/estacionario). Mudo y a prueba de fallos: si no existe, vale el ABORT por defecto del directorio de trabajo."""
+    p = _jstr(_jpath(abort_file()))
+    return ("try { for (SolverStoppingCriterion sc : sim.getSolverStoppingCriterionManager().getObjects()) {\n"
+            "  if (sc instanceof AbortFileStoppingCriterion) { AbortFileStoppingCriterion af = (AbortFileStoppingCriterion) sc;\n"
+            f'    af.setAbortFilePath("{p}"); af.setIsUsed(true); }}\n'
+            "} } catch (Throwable e) { }\n")
+
+
+_STOP_BODY = 'sim.getSimulationIterator().stop();\nsim.println("STOP enviado");\n'
+
+
+def _stop_by_client(st: dict) -> None:
+    """Respaldo si el ABORT no basta: un cliente batch APARTE (el residente está ocupado con la macro) llama a stop()."""
+    try:
+        MACROS.mkdir(parents=True, exist_ok=True)
+        tag = "stop_" + datetime.now().strftime("%H%M%S_%f")[:-3]
+        src = MACROS / f"Agent_{tag}.java"
+        src.write_text(_wrap(_STOP_BODY, "", tag), encoding="utf-8")
+        cmd = _starccm_cmd() + ["-host", f"localhost:{st['port']}", "-batch", str(src), "-noexit"] + _lic_flags()
+        subprocess.run(cmd, capture_output=True, text=True, cwd=str(MACROS), timeout=90)
+        _log("cancel: stop() enviado por un cliente aparte")
+    except Exception as e:  # noqa: BLE001
+        _log(f"cancel: el cliente de stop() falló: {type(e).__name__}: {e}")
+
+
 # ----------------------------------------------------------------------------- MCP
-if "--vigilante" in sys.argv:  # el vigilante no sirve MCP: no paga el import (~1,7 s)
+if "--vigilante" in sys.argv or "--cli" in sys.argv:  # el vigilante y --cli no sirven MCP: no pagan el import (~1,7 s)
     class FastMCP:  # type: ignore
         def __init__(self, *a, **k):
             pass
@@ -1404,18 +1985,25 @@ def _tool(fn):
         depth = getattr(_ctx, "depth", 0)
         if depth == 0:
             _ctx.seen, _ctx.reasons = [], []
+            _ctx.t_start, _ctx.cancel_seen, _ctx.cancel_kill = time.time(), False, True
         _ctx.depth = depth + 1
         t0 = time.perf_counter()
         try:
             res = _scrub(fn(*a, **k))
-        except Exception:
+        except Exception as e:
             if depth == 0:
                 _record_time(fn.__name__, round((time.perf_counter() - t0) * 1000), _via_label(), False, len(_ctx.seen))
+                _prog.end(None, f"{type(e).__name__}: {e}")
+                if _ctx.cancel_seen:
+                    _cancel_cleanup()
             raise
         finally:
             _ctx.depth = depth
         if depth:
             return res
+        _prog.end(res)  # (no-op si esta tool no tomó la corrida)
+        if _ctx.cancel_seen:
+            _cancel_cleanup()
         ms = round((time.perf_counter() - t0) * 1000)
         if not isinstance(res, dict):
             res = {"resultado": res}
@@ -1446,7 +2034,7 @@ def _run_init(st: dict) -> None:
     @NNNNN.sim, gigas en una bomba). Su resultado queda en st["init"]; no tumba el arranque."""
     _write_state({**st, "init": "en curso"})  # (la inyección de abajo vuelve a pasar por _inject_locked: no repetir)
     try:
-        res = _inject(_INIT_AUTOSAVE, timeout=600, tool="server_start")["stdout"][-200:]
+        res = _inject(_abort_enable_java() + _INIT_AUTOSAVE, timeout=600, tool="server_start")["stdout"][-200:]
     except Exception as e:  # noqa: BLE001
         res = f"init falló: {e}"
     cur = _state()
@@ -1563,6 +2151,12 @@ def server_start(sim_path: str = "", name: str = "") -> dict:
             except Exception as e:  # noqa: BLE001
                 _log(f"residente: no pude lanzarlo en server_start: {e}")
         st["vigilante"] = _vigilante_ensure(PORT).get("vigilante")
+        try:
+            st["pid_real"] = _real_pid(spid, "-server")  # `pid` es el del lanzador (.bat o redirector del venv); este, el proceso real
+        except Exception:  # noqa: BLE001
+            st["pid_real"] = spid
+        _write_state({**_state(), "pid_real": st["pid_real"], "vigilante": st["vigilante"]})
+        _prune_work()
         if not alive(st):
             raise RuntimeError(f"El servidor murió justo al arrancar. Cola del log:\n{_redact(_tail_log(st, 3000))}")
         _log(f"servidor pid={st['pid']} puerto={PORT} sim={sim} en {st['startup_seconds']}s; residente lanzado sin esperar")
@@ -1582,6 +2176,10 @@ def server_stop(save: bool = True) -> dict:
             _res_stop(3.0)
             return {"stopped": False, "reason": "no había servidor"}
         result = {"stopped": True, "saved": None}
+        tm = {}  # segundos por fase (guardar, apagar, residente): para ver dónde se va el tiempo
+        ri0 = _res_info()
+        res_vivo = bool(ri0.get("pid")) and _pid_alive(ri0["pid"])  # (el STOP anticipado de abajo puede hacerlo salir antes de _res_stop)
+        t_s = time.time()
         if _pid_alive(st["pid"]) and _port_open(st["port"]):
             g = _gui()
             if g["connected"]:
@@ -1595,17 +2193,26 @@ def server_stop(save: bool = True) -> dict:
                 result["saved"] = sim
                 if (cp := mirror_sim(sim)):
                     result["copia"] = cp
+                tm["guardar"] = round(time.time() - t_s, 2)
+            t_k = time.time()
             try:
                 r = _inject("sim.kill();\n", timeout=1800, expect_death=True, tool="server_stop")
                 result["stdout"] = r["stdout"]
             except Exception as e:  # noqa: BLE001
                 result["kill_error"] = str(e)
-            for _ in range(60):
-                if not _pid_alive(st["pid"]):
-                    break
-                time.sleep(POLL_S)
-        if _res_stop(3.0):  # el residente (archivo STOP) no sobrevive al servidor
+            try:  # el residente recibe STOP ya, mientras el servidor termina de morir (antes se esperaba a uno y luego al otro)
+                (RES_DIR / "inbox").mkdir(parents=True, exist_ok=True)
+                (RES_DIR / "inbox" / "STOP").write_text("", encoding="utf-8")
+            except OSError:
+                pass
+            end = time.time() + 60
+            while time.time() < end and _pid_alive(st["pid"]):  # sondeo de 0,1 s: sin esperas fijas de POLL_S
+                time.sleep(0.1)
+            tm["apagar"] = round(time.time() - t_k, 2)
+        t_r = time.time()
+        if _res_stop(3.0) or res_vivo:  # el residente (archivo STOP) no sobrevive al servidor
             result["residente"] = "detenido"
+        tm["residente"] = round(time.time() - t_r, 2)
         if _pid_alive(st["pid"]):
             if _pid_is_ours(st["pid"]):
                 _kill_tree(st["pid"])
@@ -1613,6 +2220,8 @@ def server_stop(save: bool = True) -> dict:
             else:  # PID reasignado a otro proceso: no se toca, solo se limpia el estado
                 result["pid_reused"] = True
         STATE_FILE.unlink(missing_ok=True)
+        tm["total"] = round(time.time() - t_s, 2)
+        result["timings_s"] = tm
         _log(f"servidor {st['pid']} apagado {result}")
         return result
 
@@ -1662,6 +2271,55 @@ def gui_attach(wait_s: int = 0) -> dict:
             break
     return {"ok": True, "launched": gpid, "connected": g["connected"], "pids": g["pids"],
             "note": "" if g["connected"] else "la GUI tarda ~30 s en conectar; confirma con gui_status()"}
+
+
+@_tool
+def cancel(wait_s: int = 15) -> dict:
+    """Detiene LIMPIO las iteraciones en curso (iterate o la fase iterar de pump_case): crea el archivo ABORT que vigila el
+    criterio «Stop File» de STAR-CCM+ (sims/ABORT) y cancel.json; la tool que itera lo ve, deja de pedir bloques, borra ABORT
+    y devuelve stopped="cancelled" con la solución hasta la última iteración. Si tras ~5 s la iteración sigue avanzando, además
+    manda stop() desde un cliente aparte. NO toma el turno (el turno es de quien itera). Sin iteración en curso no crea ABORT
+    (pararía la próxima corrida) y no toca nada: {"iteracion_en_curso": false}. Devuelve cancelled (¿paró?), iteracion_en_curso,
+    iteracion, metodo y turno. wait_s: máximo que espera a que pare."""
+    t0 = time.time()
+    st = _state()
+    if not alive(st):
+        return {"ok": True, "cancelled": False, "iteracion_en_curso": False, "reason": "no hay servidor vivo"}
+    p = read_progreso()
+    vivo = _progreso_vivo(p)
+    holder = lock_holder()
+    if not vivo or p.get("fase") != "iterar":
+        fase = p.get("fase") if vivo else None
+        return {"ok": True, "cancelled": False, "iteracion_en_curso": False, "fase": fase, "turno": holder,
+                "reason": "no hay iteración en curso" + (f" (la macro está en la fase «{fase}»: no se interrumpe; usa server_stop)" if fase else "")}
+    owner, it_at = p.get("pid"), p.get("iteracion")
+    _write_json_atomic(cancel_file(), {"t": time.time(), "by": os.getpid(), "kill": True, "iteracion": it_at, "tool": p.get("tool")})
+    try:
+        abort_file().parent.mkdir(parents=True, exist_ok=True)
+        abort_file().write_text("cancelado " + datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    except OSError as e:
+        _cancel_cleanup()
+        return {"ok": False, "cancelled": False, "iteracion_en_curso": True, "error": f"no pude crear {abort_file()}: {e}"}
+    _log(f"cancel: ABORT creado ({abort_file()}); iteración {it_at}, dueño pid {owner}")
+    stopped, method, fb = False, "ABORT", None
+    end = time.time() + max(1.0, float(wait_s))
+    fb_at = time.time() + 5.0
+    while time.time() < end:
+        time.sleep(0.2)
+        pp = read_progreso()
+        if lock_holder() is None or pp.get("terminado") or pp.get("pid") != owner:
+            stopped = True
+            break
+        if fb is None and time.time() >= fb_at and isinstance(pp.get("iteracion"), int) and isinstance(it_at, int) \
+                and pp["iteracion"] > it_at + 1:  # el ABORT no paró nada: la iteración sigue avanzando
+            method = "ABORT+stop()"
+            fb = threading.Thread(target=_stop_by_client, args=(st,), daemon=True)
+            fb.start()
+    if lock_holder() is None:  # nadie es dueño: ABORT y cancel.json se limpian aquí (si no, el dueño lo hace al terminar)
+        _cancel_cleanup()
+    return {"ok": True, "cancelled": stopped, "iteracion_en_curso": True, "iteracion": it_at, "metodo": method, "turno": lock_holder(),
+            "segundos": round(time.time() - t0, 1), "abort_pendiente": abort_file().exists(),
+            **({} if stopped else {"reason": "ABORT enviado; la iteración aún no terminó (quien itera lo borra al acabar)"})}
 
 
 def _jpath(p: str | os.PathLike) -> str:
@@ -1920,7 +2578,7 @@ def _iter_block(k: int, timeout_s: float) -> dict:
     # "StarUpdate unexpectedly missing"). Reportes: valor directo de cada Report.
     csv = MACROS / "residuals.csv"
     csv.unlink(missing_ok=True)
-    body = f"""
+    body = _abort_enable_java() + f"""
 sim.getSimulationIterator().step({int(k)});
 sim.println("ITERATION " + sim.getSimulationIterator().getCurrentIteration());
 try {{
@@ -2022,20 +2680,37 @@ def iterate(n: int = 0, until: str = "stable", reports: list[str] = ["H", "M"], 
         pid = _state().get("pid")
         if pid != _iter_pid:
             _iter_hist, _iter_pid = [], pid
-        done, t0, blocks, last = 0, time.time(), 0, {}
+        _prog.begin("iterate", caso=Path(_state().get("sim") or "").stem or None, fase="iterar")
+        _prog.configure(iter_max=n, window=window, tol=tol, criterio="stable" if until == "stable" else "n")
+        _prog.set_fase("iterar")
+        done, t0, blocks, last, prev_it = 0, time.time(), 0, {}, None
         stopped, var, names = "max", {}, list(reports or [])
         while done < n:
+            if _cancel_requested():
+                stopped = "cancelled"
+                break
             k = min(block, n - done) if until == "stable" else n
             last = _iter_block(k, timeout_s)
             blocks += 1
             if not last["ok"] or "iteration" not in last:
+                if _cancel_requested():  # la macro se abandonó por el cancel (no es un fallo)
+                    return {"ok": True, "stopped": "cancelled", "cancelled": True, "iterations_run": done, "iteration": _prog.it,
+                            "blocks": blocks, "seconds": round(time.time() - t0, 1), "reports": {}}
                 return {"ok": False, "stopped": "error", "iterations_run": done, "blocks": blocks,
                         "stdout": last["stdout"][-1500:], **_err(last)}
-            done += k
             it = last["iteration"]
+            blk = k
+            if _cancel_requested():  # el bloque pudo parar antes por el ABORT: las iteraciones hechas son las que dice el solver
+                blk = (it - prev_it) if prev_it is not None else ((it - _prog.it0 + 1) if _prog.cols and _prog.it0 is not None else k)
+                blk = max(0, min(k, blk))
+            done += blk
+            prev_it = it
+            _prog.update(it, done, last["reports"])
             if _iter_hist and it <= _iter_hist[-1]["it"]:
                 _iter_hist = []  # el .sim volvió atrás (otra simulación): historia nueva
             if until != "stable":
+                if _cancel_requested():
+                    stopped = "cancelled"
                 break
             low = {r.lower(): (r, v) for r, v in last["reports"].items()}
             miss = [x for x in names if x.lower() not in low]
@@ -2052,7 +2727,10 @@ def iterate(n: int = 0, until: str = "stable", reports: list[str] = ["H", "M"], 
             if reason:
                 stopped = reason
                 break
-        out = {"ok": True, "stopped": stopped, "iterations_run": done, "iteration": last.get("iteration"), "blocks": blocks,
+            if _cancel_requested():
+                stopped = "cancelled"
+                break
+        out = {"ok": True, "stopped": stopped, **({"cancelled": True} if stopped == "cancelled" else {}), "iterations_run": done, "iteration": last.get("iteration"), "blocks": blocks,
                "seconds": round(time.time() - t0, 1), "reports": last.get("reports", {}),
                "variation_pct": {k: round(v * 100, 3) for k, v in var.items()}, "history": _short(_iter_hist)}
         if last.get("residuals"):
@@ -2167,10 +2845,17 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
     with _turn("pump_case") as busy:
         if busy:
             return _busy_only(busy)
+        pr = dict(params or {})
+        itp = pr.get("iterar")
+        mx = (pr.get("max_iter") or (itp if isinstance(itp, int) and not isinstance(itp, bool) and itp > 1 else 1000)) if itp \
+            else (n if until in ("stable", "n") else None)
+        _prog.begin("pump_case", caso=case, fase="arrancar", iter_max=mx, window=pr.get("ventana", 100), tol=pr.get("tol", 0.005),
+                    criterio="n" if until == "n" else "stable")
         try:
             server_start(name=case)  # reutiliza el vivo; se niega si hay otro .sim cargado
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e)[:1500], **info}
+        _prog.set_fase("importar")
         r = _inject(body, imports, timeout=timeout_s, tool="pump_case")
         steps = _parse_steps(r["stdout"])
         failed = next((s["i"] for s in steps if s.get("ok") is False), None)
@@ -2184,7 +2869,9 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
         out = {**info, "ok": bool(r["ok"]) and failed is None, "steps": steps, "failed_at": failed, "seconds": r["seconds"],
                "macro": r["macro"], "parsed": _parse_pump(r["stdout"]), "salida_completa": str(salida) if salida else None,
                "stdout": r["stdout"][-3000:], **_err(r)}
-        if until in ("stable", "n") and out["ok"]:
+        if r.get("cancelled"):
+            out["cancelled"] = True
+        if until in ("stable", "n") and out["ok"] and not _cancel_requested():
             it = iterate(n=n, until=until, reports=list(reports), block=block)  # mismo turno (re-entrante)
             out["iterate"] = {k: it.get(k) for k in ("ok", "stopped", "iterations_run", "iteration", "blocks", "seconds",
                                                     "reports", "variation_pct", "error", "exception", "busy") if k in it}
@@ -2433,9 +3120,11 @@ def _selftest() -> int:
     global EXE, PORT, SIMS, MACROS, CASES, RECIPES, STATE_FILE, LOCK_FILE, AGENT_LOG, IDLE_MIN, LOCK_WAIT
     global PIPELINE_BOMBA, GUI_TTL, POLL_S, _inject_local, _gui_cache, _list_procs, _iter_hist, _iter_pid
     global WORK, RES_DIR, TIEMPOS, RES_ON, RES_HB_STALE, RES_START_WAIT, _res_off_until, _javac, _run_javac, _precompile
-    global PANEL_ESTADO, VIGILANTE_ON, VIGILANTE_S
+    global PANEL_ESTADO, VIGILANTE_ON, VIGILANTE_S, PROG_EVERY_S, CANCEL_GRACE_S
     import tempfile
     t_all = time.time()
+    agent_log_real = AGENT_LOG
+    PROG_EVERY_S, CANCEL_GRACE_S = 0.2, 1.5
     VIGILANTE_ON = False  # el vigilante real solo se prueba en su sección (es un proceso aparte con su propio entorno)
     fake = HERE / "tests" / "fake_starccm.py"
     os.environ["STARCCM_EXE"] = str(fake)
@@ -2464,6 +3153,8 @@ def _selftest() -> int:
     (RECIPES / "paso-falla.java").write_text('sim.println("AGENT_FAKE_FAIL");\nsim.println("no llega");\n', encoding="utf-8")
     scen = tmp / "scen.txt"
     os.environ["FAKE_SCEN_FILE"] = str(scen)
+    ctl = tmp / "ctl.json"  # control en caliente del falso (iteración lenta, ignorar ABORT)
+    os.environ["FAKE_CTL_FILE"] = str(ctl)
     LOCK_WAIT, POLL_S, GUI_TTL = 0.5, 0.05, 1e9
     real_list = _list_procs
     seen_rows: list = []
@@ -2544,6 +3235,27 @@ def _selftest() -> int:
         except Exception as e:  # noqa: BLE001
             bg["regresion"] = e
 
+    def bg_java() -> None:
+        """El Java nuevo (Stop File activo, init, stop() de respaldo) compilado con el javac real de STAR-CCM+."""
+        if not jc_real:
+            bg["java"] = "SKIP: no hay javac de STAR-CCM+"
+            return
+        res = []
+        try:
+            d = tmp / "javanuevo"
+            d.mkdir()
+            (d / "out").mkdir()
+            for nombre, body in (("init", _abort_enable_java() + _INIT_AUTOSAVE), ("stop", _STOP_BODY),
+                                 ("iter", _abort_enable_java() + "sim.getSimulationIterator().step(5);")):
+                src = d / f"Agent_{nombre}.java"
+                src.write_text(_wrap(body, "", nombre), encoding="utf-8")
+                r = subprocess.run([jc_real[0], "-nowarn", "-proc:none", "-cp", jc_real[1], "-d", str(d / "out"), str(src)],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+                res.append((nombre, r.returncode, (r.stderr or r.stdout)[-300:]))
+            bg["java"] = res
+        except Exception as e:  # noqa: BLE001
+            bg["java"] = e
+
     def bg_docs() -> None:
         """Calienta el índice del javadoc (~3,5 s la primera vez); las comprobaciones de docs_search lo esperan."""
         try:
@@ -2554,7 +3266,7 @@ def _selftest() -> int:
 
     docs_thread = threading.Thread(target=bg_docs, daemon=True)
     docs_thread.start()
-    threads = [threading.Thread(target=bg_regresion, daemon=True)]
+    threads = [threading.Thread(target=bg_regresion, daemon=True), threading.Thread(target=bg_java, daemon=True)]
     if os.name == "nt":
         threads.append(threading.Thread(target=bg_detached, daemon=True))
     for t in threads:
@@ -2577,6 +3289,9 @@ def _selftest() -> int:
         check(Path(_state()["log"]).parent == SIMS and ri0.get("breakaway") in (True, False, None) and "vigilante" in st,
               "el servidor y el residente salen del lanzador desacoplado (doble lanzamiento)")
         check(KEY not in json.dumps(st) and KEY not in STATE_FILE.read_text(encoding="utf-8"), "la clave PoD no sale de server_start ni de .server.json")
+        pr = st.get("pid_real")
+        check(pr and _pid_alive(pr) and (os.name != "nt" or (_real_pid(st["pid"], "-server") == pr and any(x["pid"] == pr for x in _procs_native("-server"))))
+              and _state().get("pid_real") == pr, f".server.json guarda el pid REAL del servidor ({pr}; lanzador {st['pid']})")
         st2 = server_start()
         check(st2.get("reused"), "server_start reutiliza el servidor vivo")
         r = run_java('sim.println("OK");')
@@ -2806,6 +3521,11 @@ def _selftest() -> int:
         scen.write_text("stable")
         r = iterate(n=30, until="n")
         check(r["ok"] and r["blocks"] == 1 and r["stopped"] == "max" and r["iteration"] == 30 and r["residuals"], "iterate until='n' es un solo bloque")
+        pg = read_progreso()
+        check(pg.get("terminado") is True and pg.get("fase") == "terminado" and pg.get("tool") == "iterate" and pg.get("iteracion") == 30
+              and pg.get("H") is not None and pg.get("M") is not None and (pg.get("resultado") or {}).get("ok") is True
+              and (pg.get("resultado") or {}).get("stopped") == "max" and pg.get("pid") == os.getpid() and pg.get("falta_s") == 0.0,
+              f"progreso.json al terminar iterate: fase terminado con el resultado ({ {k: pg.get(k) for k in ('fase', 'iteracion', 'H', 'resultado')} })")
         r = iterate(n=50, reports=["Q_no_existe"])
         check(r["ok"] is False and "Q_no_existe" in r.get("error", ""), "iterate con un reporte inexistente falla con mensaje claro")
 
@@ -2885,6 +3605,12 @@ def _selftest() -> int:
                   and isinstance(st.get("idle_min"), (int, float)) and st.get("idle_checked") and alive(),
                   f"vigilante con GUI: escribe gui, idle_min e idle_warning como TEXTO y no apaga ({iw!r})")
             check(time.time() - STATE_FILE.stat().st_mtime > 0.5, "lo que escribe el vigilante (cada 0,25 s) no cuenta como actividad: el mtime no se mueve")
+            ic1 = _state().get("idle_checked")
+            time.sleep(1.1)
+            st = _state()
+            check(st.get("vigilante") == vpid == v["vigilante"] and st.get("idle_checked") and st.get("idle_checked") != ic1
+                  and st.get("pid_real") and _pid_alive(st["pid_real"]) and st.get("residente") and _pid_alive(st["residente"]),
+                  f"el vigilante deja su pid REAL (no el del lanzador) e idle_checked en cada chequeo en .server.json ({st.get('vigilante')}, {ic1} -> {st.get('idle_checked')})")
             v2 = _vigilante_ensure(PORT)
             p2 = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--vigilante", str(PORT)],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2966,6 +3692,8 @@ def _selftest() -> int:
         check(rpid and not _pid_alive(rpid) and not _res_info() and r.get("residente") == "detenido", "server_stop detiene el residente")
         check(r["stopped"] and r.get("gui_warning") and r.get("saved") and Path(r["saved"]).parent == SIMS and not STATE_FILE.exists(),
               "server_stop con GUI avisa (gui_warning), guarda en sims/nuevo_*.sim y apaga")
+        check(r.get("timings_s", {}).get("total", 99) < 4 and {"guardar", "apagar", "residente"} <= set(r.get("timings_s", {})),
+              f"server_stop sin esperas fijas: sondeo de 0,1 s y STOP al residente a la vez ({r.get('timings_s')})")
         _kill_tree(gui_pid)
         gui_pid = None
         _list_procs, GUI_TTL = (lambda: []), 10.0
@@ -3010,8 +3738,160 @@ def _selftest() -> int:
         r = pump_case("BombaFalsa", str(cad), until="stable", n=600, block=100)
         check(r["ok"] and r["via"] == "residente" and r["iterate"]["stopped"] == "stable" and r["iterate"]["blocks"] >= 2
               and _res_launches == n_launch, f"pump_case until=stable: una macro y luego bloques por el MISMO residente ({r.get('iterate')})")
+        pg = read_progreso()
+        check(pg.get("terminado") and pg.get("tool") == "pump_case" and pg.get("caso") == "BombaFalsa"
+              and (pg.get("resultado") or {}).get("iterate", {}).get("stopped") == "stable" and (pg.get("resultado") or {}).get("RESULT", {}).get("H") == 16.5,
+              f"progreso.json de pump_case con iterate: terminado, caso y resultado ({ (pg.get('resultado') or {}).get('iterate') })")
         r = pump_case("OtroCaso", str(cad))
         check(r["ok"] is False and "otro .sim" in r.get("error", ""), "pump_case se niega si hay otro .sim cargado")
+
+        # --- progreso en vivo (parser), cancel y --cli
+        pgx = _Progreso()
+        pgx._reset("pump_case", "X")
+        pgx.iter_max = 1000
+        for ln in ("PIPE importar 8.0", "PIPE regiones 0.2", "PIPE fisica 1.3", "PIPE mrf 0.2", "PIPE fronteras 0.2", "PIPE reportes 1.0"):
+            pgx._line(ln)
+        f1 = pgx.snapshot()["fase"]
+        pgx._line("PIPE malla 50.1")
+        f2 = pgx.snapshot()["fase"]
+        for ln in ("     Iteration     Continuity     X-momentum     pt_in (Pa)        M (N-m)              H",
+                   "            30   1.000857e-01   5.427665e-02   1.4e+05   8.453830e+00   1.529018e+01",
+                   "            31   9.588507e-02   5.239161e-02   1.5e+05   8.497105e+00   1.553220e+01"):
+            pgx._line(ln)
+        sn = pgx.snapshot()
+        pgx._line("ITER\t50\tH 15.886\tM 8.4846")
+        pgx._line("ITER_STOP\tstable\titeraciones 50")
+        check((f1, f2) == ("mallar", "euler") and sn["fase"] == "iterar" and sn["iteracion"] == 31 and abs(sn["H"] - 15.5322) < 1e-9
+              and abs(sn["M"] - 8.497105) < 1e-9 and abs(sn["continuidad"] - 0.09588507) < 1e-12 and pgx.snapshot()["iteracion"] == 50
+              and pgx.snapshot()["fase"] == "post" and pgx.snapshot()["fases_s"]["malla"] == 50.1,
+              f"progreso: fases por los PIPE (importar..mallar..iterar..post), tabla de monitores e ITER ({f1}, {f2}, {sn['fase']})")
+        e2e_out = HERE / "casos" / "BombaRapida_e2e_181510" / "salida_pump.txt"
+        if e2e_out.is_file():
+            pgr = _Progreso()
+            pgr._reset("pump_case", "real")
+            for ln in e2e_out.read_text(encoding="utf-8", errors="replace").splitlines():
+                pgr._line(ln)
+            sr = pgr.snapshot()
+            check(sr["iteracion"] == 250 and abs(sr["H"] - 16.7382) < 1e-3 and abs(sr["M"] - 8.4544) < 1e-3 and sr["fase"] == "post"
+                  and sr["continuidad"] is not None and "importar" in sr["fases_s"] and abs(sr["fases_s"]["malla"] - 50.17) < 0.01,
+                  f"progreso: la salida REAL de la corrida e2e da iteración 250, H, M, continuidad y las fases ({sr['iteracion']}, {sr['H']}, {sr['fase']})")
+        nan_s = _Progreso()
+        nan_s._reset("iterate", "n")
+        nan_s._line("ITER\t10\tH NaN\tM 1.5")
+        check(json.loads(json.dumps(nan_s.snapshot(), allow_nan=False))["H"] is None, "progreso: NaN sale como null (JSON válido)")
+
+        # cancel sin iteración en curso: no crea ABORT (pararía la próxima corrida) ni toca nada
+        t_c = time.time()
+        r = cancel()
+        check(r["ok"] and r["iteracion_en_curso"] is False and r["cancelled"] is False and not abort_file().exists()
+              and not cancel_file().exists() and time.time() - t_c < 2, "cancel sin iteración en curso: no crea ABORT y responde al instante")
+
+        # cancel de una iteración en marcha: ABORT, la tool ve el cancel, para limpia y borra ABORT y cancel.json
+        def lanzar(**kw):
+            box = {}
+
+            def run():
+                try:
+                    box["r"] = iterate(**kw)
+                except Exception as e:  # noqa: BLE001
+                    box["r"] = {"error": repr(e)}
+            th_ = threading.Thread(target=run, daemon=True)
+            th_.start()
+            return th_, box
+
+        def esperar_iteracion(minimo, hasta=20.0):
+            t_end = time.time() + hasta
+            while time.time() < t_end:
+                q = read_progreso()
+                if q.get("fase") == "iterar" and (q.get("iteracion") or 0) >= minimo and not q.get("terminado") and q.get("H") is not None:
+                    return q
+                time.sleep(0.1)
+            return read_progreso()
+
+        scen.write_text("stable")
+        ctl.write_text(json.dumps({"delay": 0.02}))
+        base_it = read_progreso().get("iteracion") or 0
+        th_c, box = lanzar(n=2000, until="n")
+        live = esperar_iteracion(base_it + 15)
+        check(live.get("fase") == "iterar" and not live.get("terminado") and live.get("H") is not None and live.get("M") is not None
+              and live.get("continuidad") is not None and (live.get("ritmo_it_s") or 0) > 0 and live.get("falta_s") is not None
+              and live.get("transcurrido_s") is not None and live.get("iter_max") == 2000 and live.get("pid") == os.getpid(),
+              f"progreso en vivo mientras itera: fase, iteración, H, M, continuidad, ritmo y lo que falta ({ {k: live.get(k) for k in ('fase', 'iteracion', 'H', 'continuidad', 'ritmo_it_s', 'falta_s')} })")
+        rc_ = cancel()
+        th_c.join(timeout=20)
+        ri_ = box.get("r", {})
+        check(rc_["ok"] and rc_["cancelled"] is True and rc_["iteracion_en_curso"] and rc_["metodo"] == "ABORT"
+              and ri_.get("stopped") == "cancelled" and ri_.get("cancelled") is True and ri_.get("ok") is True
+              and 0 < (ri_.get("iterations_run") or 0) < 2000 and ri_.get("iteration") < 2000,
+              f"cancel detiene las iteraciones en curso por el archivo ABORT ({rc_.get('segundos')} s; parada en {ri_.get('iteration')} de 2000; {rc_.get('metodo')})")
+        check(not abort_file().exists() and not cancel_file().exists() and not LOCK_FILE.exists() and alive(),
+              "tras el cancel se borran ABORT y cancel.json y se libera el turno (el servidor sigue vivo)")
+        pgc = read_progreso()
+        check(pgc.get("terminado") and (pgc.get("resultado") or {}).get("cancelled") is True and (pgc.get("resultado") or {}).get("stopped") == "cancelled",
+              "progreso.json deja el resultado cancelado")
+        ctl.write_text(json.dumps({"delay": 0}))
+        r = iterate(n=20, until="n")
+        check(r["ok"] and r["stopped"] == "max" and r["iterations_run"] == 20, "tras un cancel la siguiente corrida itera con normalidad (sin ABORT viejo)")
+        abort_file().write_text("viejo", encoding="utf-8")  # un ABORT que quedó de otra corrida no la para
+        r = iterate(n=20, until="n")
+        check(r["ok"] and r["stopped"] == "max" and r["iterations_run"] == 20 and not abort_file().exists(), "un ABORT viejo se borra al empezar una corrida")
+
+        # una macro que NO obedece el ABORT: pasado CANCEL_GRACE_S se abandona (residente relanzado, servidor vivo)
+        ctl.write_text(json.dumps({"delay": 0.03, "ignore_abort": True}))
+        n_launch = _res_launches
+        CANCEL_GRACE_S = 0.8
+        base_it = read_progreso().get("iteracion") or 0
+        th_g, box_g = lanzar(n=80, until="n")
+        esperar_iteracion(base_it + 5)
+        t_g = time.time()
+        rg_ = cancel(wait_s=10)
+        th_g.join(timeout=20)
+        ri_g = box_g.get("r", {})
+        check(rg_["cancelled"] is True and ri_g.get("stopped") == "cancelled" and ri_g.get("ok") is True and alive() and _res_launches == n_launch + 1
+              and not abort_file().exists() and not cancel_file().exists(),
+              f"cancel de una macro que ignora el ABORT: se abandona tras la gracia ({time.time() - t_g:.1f} s), residente relanzado, servidor vivo ({rg_}; {ri_g}; lanzamientos {_res_launches - n_launch})")
+        ctl.write_text(json.dumps({"delay": 0}))
+        r = run_java('sim.println("tras el cancel duro");')
+        check(r["ok"] and r["stdout"] == "tras el cancel duro", "tras el cancel duro el solver sigue sirviendo por el residente nuevo")
+
+        # --cli: acciones directas sin modelo (otro proceso, sin importar mcp)
+        cli_env = {**os.environ, "COPILOTO_WORK": str(WORK), "COPILOTO_AGENT_LOG": str(AGENT_LOG), "STARCCM_EXE": str(fake),
+                   "STARCCM_PORT": str(PORT), "COPILOTO_CLI_LOCK_WAIT_S": "0.5", "STARCCM_VIGILANTE": "0", "FAKE_SCEN_FILE": str(scen)}
+
+        def cli(*args, timeout=30):
+            t_ = time.time()
+            q = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--cli", *args], capture_output=True, text=True,
+                               encoding="utf-8", env=cli_env, timeout=timeout)
+            try:
+                js = json.loads(q.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                js = {"_raw": q.stdout[-300:], "_err": q.stderr[-300:]}
+            return q.returncode, js, time.time() - t_
+
+        rc1, j1, t1 = cli("server_status")
+        rc2, j2, t2 = cli("gui_status")
+        rc3, j3, t3 = cli("cancel")
+        rc4, j4, t4 = cli("nada")
+        rc5, j5, _ = cli("gui_status", "{no es json")
+        check(rc1 == rc2 == rc3 == 0 and j1.get("alive") is True and j1.get("pid") == _state().get("pid") and j2.get("connected") is False
+              and j2.get("server_alive") is True and j3.get("iteracion_en_curso") is False and max(t1, t2, t3) < 2.0,
+              f"--cli server_status / gui_status / cancel: JSON por stdout en {max(t1, t2, t3):.2f} s sin modelo ({t1:.2f}, {t2:.2f}, {t3:.2f}; {j1.get('_err') or ''})")
+        check(rc4 == 2 and j4.get("ok") is False and "uso" in j4.get("error", "") and rc5 == 2, "--cli: herramienta desconocida o JSON roto -> error en JSON y código 2")
+        hold = subprocess.Popen([sys.executable, "-I", "-c", _HOLD, str(LOCK_FILE), "2"], stdout=subprocess.PIPE, text=True)
+        hold.stdout.readline()
+        rc6, j6, t6 = cli("server_stop", '{"save": false}')
+        check(rc6 == 0 and j6.get("stopped") is False and "panel_demo" in (j6.get("busy") or "") and alive() and t6 < 3,
+              f"--cli server_stop respeta el candado de turnos: busy en {t6:.1f} s y el solver sigue ({j6.get('busy')})")
+        hold.wait(timeout=10)
+        try:
+            LOCK_FILE.unlink()
+        except OSError:
+            pass
+        rc7, j7, t7 = cli("server_stop", '{"save": false}', timeout=60)
+        check(rc7 == 0 and j7.get("stopped") is True and not alive() and not STATE_FILE.exists() and "timings_s" in j7,
+              f"--cli server_stop apaga el solver ({t7:.1f} s; fases {j7.get('timings_s')})")
+        st = server_start(name="BombaFalsa")  # el resto del selftest necesita un servidor vivo
+        check(st.get("pid") and alive(st) and run_java('sim.println("init");')["ok"], "server_start tras el --cli server_stop")
 
         # --- el servidor muere a mitad de una macro: error claro, no un «ok» vacío
         real_inject = _inject_local
@@ -3056,6 +3936,34 @@ def _selftest() -> int:
             check(isinstance(rg, list) and all(not bad and rc == 0 for _, bad, rc, _ in rg) and len(rg) == 2,
                   "macro REAL de pipelines/bomba.py (rapida e iterar+post) envuelta con _wrap y los imports de pump_case: compila con el javac de STAR-CCM+"
                   + ("" if isinstance(rg, list) else f" ({rg!r})") + (f" {[(n, b, e) for n, b, rc, e in rg if b or rc]}" if isinstance(rg, list) else ""))
+        # --- mantenimiento: residente-*.log (3 últimos) y macros/.classes de más de 7 días
+        for q in list(RES_DIR.glob("residente-*.log")):
+            q.unlink()
+        now_ = time.time()
+        for i in range(1, 7):
+            lf = RES_DIR / f"residente-9-{i}.log"
+            lf.write_text("x", encoding="utf-8")
+            os.utime(lf, (now_ + i, now_ + i))
+        cls = MACROS / ".classes" / "viejo"
+        cls.mkdir(parents=True, exist_ok=True)
+        (cls / "A.class").write_text("x", encoding="utf-8")
+        (MACROS / ".classes" / "nuevo.class").write_text("x", encoding="utf-8")
+        os.utime(cls / "A.class", (now_ - 8 * 86400, now_ - 8 * 86400))
+        borrado = _prune_work()
+        left = sorted(q.name for q in RES_DIR.glob("residente-*.log"))
+        check(left == ["residente-9-4.log", "residente-9-5.log", "residente-9-6.log"] and borrado["residente_logs"] == 3,
+              f"mantenimiento: residente-*.log deja los 3 últimos ({left})")
+        check(not (cls / "A.class").exists() and not cls.exists() and (MACROS / ".classes" / "nuevo.class").exists() and borrado["classes"] == 1,
+              "mantenimiento: macros/.classes borra lo de más de 7 días (y las carpetas vacías) y deja lo reciente")
+        check(agent_log_real == (Path(os.environ["COPILOTO_AGENT_LOG"]) if os.environ.get("COPILOTO_AGENT_LOG") else real_work / "agent.log"),
+              f"agent.log va a la carpeta de trabajo ({agent_log_real})")
+        jv = bg.get("java")
+        if isinstance(jv, str):
+            print(f"  {time.time() - t_all:5.1f}s SKIP {jv}")
+        else:
+            check(isinstance(jv, list) and len(jv) == 3 and all(rc == 0 for _, rc, _ in jv),
+                  "Java nuevo (Stop File activo con ruta absoluta, stop() de respaldo, init) compila con el javac de STAR-CCM+"
+                  + ("" if isinstance(jv, list) else f" ({jv!r})") + (f" {[(n, e) for n, rc, e in jv if rc]}" if isinstance(jv, list) else ""))
         secs = time.time() - t_all
         check(secs < 45, f"el selftest tarda {secs:.1f} s (< 45 s)")
     finally:
@@ -3077,12 +3985,48 @@ def _selftest() -> int:
     return 1 if fails else 0
 
 
+CLI_TOOLS = ("gui_attach", "gui_status", "server_stop", "server_status", "cancel")
+
+
+def _cli(argv: list[str]) -> int:
+    """`python mcp_server.py --cli <herramienta> [json-args]`: ejecuta UNA herramienta sin modelo y escribe su resultado JSON por stdout
+    (UTF-8, una línea). Respeta el candado de turnos: espera como mucho COPILOTO_CLI_LOCK_WAIT_S (3) y devuelve {"busy": ...}.
+    Código de salida: 0 si la herramienta respondió (aunque diga ok:false), 1 si lanzó, 2 si el uso es incorrecto."""
+    global LOCK_WAIT
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    name = argv[0] if argv else ""
+    rc, res = 0, None
+    try:
+        args = json.loads(argv[1]) if len(argv) > 1 and argv[1].strip() else {}
+        if name not in CLI_TOOLS or not isinstance(args, dict):
+            raise ValueError(f"uso: --cli <{'|'.join(CLI_TOOLS)}> [json-args]")
+    except ValueError as e:
+        res, rc = {"ok": False, "error": str(e)}, 2
+    if res is None:
+        LOCK_WAIT = float(os.environ.get("COPILOTO_CLI_LOCK_WAIT_S", "3"))
+        try:
+            res = globals()[name](**args)
+        except TypeError as e:
+            res, rc = {"ok": False, "error": f"argumentos de {name}: {e}"}, 2
+        except Exception as e:  # noqa: BLE001
+            res, rc = {"ok": False, "error": f"{type(e).__name__}: {_redact(str(e))[:500]}"}, 1
+    print(json.dumps(_clean(_scrub(res)), ensure_ascii=False), flush=True)
+    return rc
+
+
 if __name__ == "__main__":
+    if "--cli" in sys.argv:  # acción directa sin modelo (panel): ver _cli
+        sys.exit(_cli(sys.argv[sys.argv.index("--cli") + 1:]))
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     if "--vigilante" in sys.argv:  # proceso independiente del MCP: python mcp_server.py --vigilante <puerto>
         sys.exit(_vigilante_main(int(sys.argv[sys.argv.index("--vigilante") + 1])))
     _migrate_legacy(HERE, STATE_FILE, LOCK_FILE)  # .server.json/.inject.lock de cuando vivían en el repo (OneDrive)
+    _migrate_agent_log()
+    _prune_work()
     _write_panel_estado()
     start_watchdog()
     mcp.run()

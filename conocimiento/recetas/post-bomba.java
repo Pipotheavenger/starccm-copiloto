@@ -156,5 +156,22 @@
 // --- validación de Euler con la solución (AVISO / EULER_MAL / EULER_OK)
 {
 boolean turbina = false; String hrep = "H"; ReportManager rm = sim.getReportManager();
+// ---- VALIDACION (necesita solución; bomba.py la reutiliza sola con euler_check_body)
+int itEu = 0; try { itEu = sim.getSimulationIterator().getCurrentIteration(); } catch (Exception e) { }
+if (itEu < 1) sim.println("EULER_VALIDAR\tsin solución (iteración 0): repetir tras iterar");
+else {
+  double vUVu1 = Double.NaN, vUVu2 = Double.NaN, vHe = Double.NaN, vH = Double.NaN, vU1 = Double.NaN, vU2 = Double.NaN;
+  try { vUVu1 = rm.getReport("UVu1").getReportMonitorValue(); vUVu2 = rm.getReport("UVu2").getReportMonitorValue();
+        vHe = rm.getReport("H_Euler").getReportMonitorValue(); vU1 = rm.getReport("U1").getReportMonitorValue(); vU2 = rm.getReport("U2").getReportMonitorValue(); } catch (Exception e) { sim.println("AVISO\tEuler: no pude leer los reportes: " + e); }
+  try { vH = rm.getReport(hrep).getReportMonitorValue(); } catch (Exception e) { }
+  boolean malo = false;
+  if (Double.isNaN(vUVu1) || Double.isNaN(vUVu2) || Math.abs(vUVu2 - vUVu1) <= 1e-6 * Math.max(Math.abs(vUVu1), Math.abs(vUVu2)) + 1e-12) {
+    sim.println("AVISO\tEuler: UVu2 (" + vUVu2 + ") = UVu1 (" + vUVu1 + "): el reporte de salida lee la entrada o no hay trabajo"); malo = true; }
+  if (!Double.isNaN(vU1) && !Double.isNaN(vU2) && (turbina ? vU2 >= vU1 : vU2 <= vU1)) {
+    sim.println("AVISO\tEuler: U2 (" + vU2 + ") frente a U1 (" + vU1 + ") no cuadra con entrada→salida del rotor"); malo = true; }
+  if (!Double.isNaN(vH) && !Double.isNaN(vHe) && (turbina ? vHe >= vH : vHe <= vH)) {
+    sim.println("AVISO\tEuler: H_Euler (" + vHe + ") " + (turbina ? "no es menor" : "no es mayor") + " que H (" + vH + ")"); malo = true; }
+  sim.println(malo ? "EULER_MAL\trevisar fronteras del rotor" : "EULER_OK\tH_Euler " + vHe + " m, H " + vH + " m");
+}
 }
 

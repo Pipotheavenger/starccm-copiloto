@@ -87,12 +87,30 @@ retirado y de la UI web antigua quedan solo en `conocimiento/CLAUDE_agente_anter
   (`Residente.java`) vigila `residente/inbox` y ejecuta cada macro con `StarScript`: 0,7-1 s por macro frente a 8,6 s del
   cliente batch (~10x). No precompila: el error de compilación vuelve en ~0,6 s con el texto de javac. Se relanza si muere; tras
   2 intentos fallidos cae al cliente batch (con `javac` previo, `STARCCM_PRECOMPILE`). Cada respuesta trae `via` y `ms`.
-- **Vigilante de inactividad independiente**: cada turno del panel es un `claude -p` nuevo que arranca y mata su MCP, así que
-  el vigilante no puede vivir solo dentro de él: trabaja sobre `.server.json` (mtime = última actividad) y los candados.
-  Sin GUI guarda y apaga a los `STARCCM_IDLE_MIN` (30; PoD cobra por hora); con GUI solo escribe `idle_warning` y el panel
-  pregunta. Una macro en marcha cuenta como actividad.
+- **Lanzamiento desacoplado** (`_spawn_detached`): servidor, residente, vigilante y GUI se lanzan con un proceso intermedio
+  (`python -I -c _LAUNCHER`) que arranca el destino con `CREATE_NEW_PROCESS_GROUP|CREATE_BREAKAWAY_FROM_JOB` y `CREATE_NO_WINDOW`
+  y muere: el destino queda sin padre, fuera del árbol de la CLI. Motivo: `taskkill /T` (Detener del panel) alcanza a los hijos
+  desacoplados mientras el padre viva (probado con `claude.exe` real: el desacoplado sobrevive). `CREATE_NO_WINDOW` y no
+  `DETACHED_PROCESS` porque con éste un `.bat` pierde la salida redirigida de sus hijos de consola. Si el job no permite
+  breakaway reintenta sin él («doble lanzamiento»). `COPILOTO_DETACHED=1` invierte el modo (peor; solo diagnóstico).
+- **`panel_estado.json`** (raíz del repo, ignorado por git; lo escribe el MCP al arrancar y en `server_start`, solo si cambia):
+  `estado_dir`, `state_file`, `lock_file`, `work`. El panel lo lee para saber dónde están `.server.json` e `.inject.lock`
+  (si falta: `COPILOTO_WORK`, luego `%LOCALAPPDATA%\starccm-copiloto`). `_migrate_legacy` mueve el estado viejo del repo.
+- **Vigilante de inactividad independiente, por puerto**: `python mcp_server.py --vigilante <puerto>` (no importa `mcp`, arranca en
+  ~0,2 s), lanzado por `server_start`, por el arranque del MCP y al reutilizar un servidor vivo. Cada `COPILOTO_VIGILANTE_S` (30)
+  mide la inactividad en disco (macros en marcha o recientes, mtime de `.server.json`) y la GUI, y escribe en `.server.json`
+  `gui`, `idle_min`, `idle_checked` e `idle_warning` (TEXTO). Uno solo por puerto (`vigilante-<puerto>.json`: pid + latido);
+  termina cuando el servidor lleva `COPILOTO_VIG_GONE_S` (3 s) muerto. Sin GUI guarda y apaga a los `STARCCM_IDLE_MIN` (30; PoD
+  cobra por hora); con GUI solo avisa. `STARCCM_VIGILANTE=0` lo desactiva. Residuales: si el vigilante muere, nadie avisa (el
+  panel debe mirar `idle_checked`); el estado de la GUI llega con hasta 30 s de retraso.
+- **Ronda 4 (en curso, A4/B4; no documentado como hecho hasta verlo en el código)**: `mcp_server.py --cli` (tools sin LLM, p. ej.
+  apagar el solver directo), `progreso.json` con iteración/H/M en vivo durante `iterar`, cancelación con un archivo `ABORT`
+  que el bucle de iterar revisa cada bloque de 50, y en el panel una tarjeta de progreso y acciones directas (apagar, abrir
+  GUI) que no gastan un turno del modelo.
 - **Panel**: modo Rápido (sonnet, esfuerzo bajo) / Preciso (opus), cola de mensajes mientras el agente trabaja, cronómetro por
-  herramienta, línea de tiempos por turno, Abrir GUI, Detener (solo la CLI), Apagar con confirmación.
+  herramienta, línea de tiempos por turno, Abrir GUI, Detener (la CLI y su árbol, nunca el solver, el residente, el vigilante ni
+  la GUI: `protected_pids`), Apagar con confirmación. Al cerrar con el solver vivo pregunta «¿Apagar el solver antes de salir?».
+  Prohíbe a la CLI leer `.env` (`--disallowedTools` Read/Grep/Glob) y crea `.mcp.json` si falta (`ensure_mcp_config`).
 
 ## Medido
 
@@ -113,6 +131,32 @@ Todo por la vía residente (`via=residente`). Resultados: H 16,74 m, M 8,454 N·
 balance de masa 0,0002 %, Q_in −13,864 / Q_out 13,864, estable en 250 iteraciones, 3 PNG. Referencia anterior: 3 min 45 s con 300 it
 y 45 min con una corrida improvisada. Las divisiones entre reportes van protegidas `(abs(den) > 1e-9 ? num/den : 0)`: sin eso
 `eta_Euler` aborta en la iteración 1 (`H_Euler = 0`).
+
+### Segunda corrida real (`casos/BombaRapida_e2e_181510`, 2026-10-26)
+
+Mismo caso y parámetros, `salida_pump.txt` (209 KB) con el desglose `PIPE <fase> <s>` del propio pipeline:
+
+| fase PIPE | segundos |
+|---|---|
+| importar | 7,97 |
+| regiones | 0,25 |
+| fisica | 1,29 |
+| mrf | 0,19 |
+| fronteras | 0,17 |
+| reportes | 0,98 |
+| malla | 50,17 |
+| euler | 0,96 |
+| iterar (250 it, parada por estabilidad) | 105,38 |
+| post | 3,09 |
+| **total pipeline** | **170,45** |
+
+Mallado: CELLS 175 316. Parada `stable` en 250 iteraciones (variación máx. 0,062 %). y+ en álabes: mín 3,91, **medio 24,5**, máx 49,3
+(parte del rango cae en 5–30: mirar con cuidado η y par). Balance de masa 1,8e-4 %; 6 líneas `PARED_CONEXION` «no medible»,
+0 `AVISO` de interfaz. H_Euler 18,75 m, η_Euler 0,892. **Los tiempos están contaminados**: corrieron tres selftests en paralelo
+(CPU de 4 procesos), así que el total de `pump_case` (192 s) y de la corrida (239 s) no son comparables con los 143 s / 194 s de la
+primera; repetir `tests/real_e2e.py` sin nada más corriendo. Esa corrida mostró además el aviso Euler espurio («radio medio…
+0.0», `EULER_VALIDAR sin solución`) y la ausencia de `EULER_OK`: corregido después en `pipelines/bomba.py` (la validación va tras
+iterar y `euler_check_body` ya no sale vacío); pendiente de verlo con solver.
 
 ## Reglas de diseño
 

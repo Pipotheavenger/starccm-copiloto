@@ -46,7 +46,7 @@ STAR-CCM+ **2410** (19.06.009-R8, doble precisión) en este PC (i5-1245U, `STARC
 Licencia PoD (`ccmppower`, `1999@flex.cd-adapco.com`), por periodo, UNA copia, cobra por hora: `.env` (ver `.env.example`).
 Trabajo pesado en `COPILOTO_WORK` (por defecto `%LOCALAPPDATA%\starccm-copiloto`, fuera de OneDrive): `sims/`, `macros/`,
 `residente/`, `tiempos.csv`, `.server.json`, `.inject.lock`. En el repo: `casos/<caso>/`, recetas, conocimiento.
-Inyección: **cliente residente** (0,7-1 s por macro; cada respuesta trae `via`) con respaldo batch (8-10 s). `gui_attach()` abre la GUI (sin licencia extra).
+Inyección: **cliente residente** (0,7-1 s por macro; `via`) con respaldo batch (8-10 s). Procesos desacoplados (`CREATE_NO_WINDOW`); `panel_estado.json` apunta al estado; vigilante por puerto. `gui_attach()` abre la GUI (sin licencia extra).
 
 ## Flujo estándar: bomba centrífuga, estacionario
 
@@ -69,22 +69,23 @@ Sin `.cfturbo-ccm` no hay `pump_case`. `inspect`; superficie sucia → surface w
 ## Lecciones críticas (una línea; detalle en `conocimiento/lecciones.md`)
 
 - Sandbox del tool Bash bloquea las DLL de STAR-CCM+: el solver arranca desde el MCP o fuera del sandbox. Sin `-podkey` aborta (rc 8).
-- Consola cp1252: solo ASCII en `print` de guiones; un «Δ» revienta después de hacer el trabajo.
+- Consola cp1252: solo ASCII en `print` de guiones (un «Δ» revienta).
 - Cliente batch sin `-noexit` apaga el servidor. `MonitorManager.export` falla en batch: usar plot `Residuals` y `getReportMonitorValue()`.
 - Expresiones entre reportes: `${nombreReport}`. División en reportes: `(abs(den) > 1e-9 ? num/den : 0)` (cero en iteración 1 aborta `StepSimulation`).
 - `newRegionsFromParts` crea un solo continuo: reusarlo. Autoguardado batch deja `@meshed.sim`: `server_start` lo apaga.
 - Una operación de malla POR PARTE con `AutomaticSurfaceRepairAutoMesher`; las 3 partes juntas fallan.
 - Interfaces dejan la parte no emparejada como **Wall** (Q_out ≈ 0, diverge). Causa: CFturbo exportado «virtual»; re-exportar en «Flow domain». `PARED_CONEXION` solo es fiable si dice área medida; si «no medible», manda `BALANCE_MASA`.
 - Fronteras de interfaz (`DirectBoundaryInterfaceBoundary`, `[int_…]`) fuera de escenas de malla y exportaciones.
-- Antes de mallar, `ImportManager.export` falla: la geometría sale con `MeshPart.exportStlPart`.
+- Antes de mallar `ImportManager.export` falla: usar `MeshPart.exportStlPart`.
 - MRF: `ReferenceFrameManager.createReferenceFrame(RotatingReferenceFrame.class, n)`; rpm de CFturbo en rev/s con signo (−48,333 = −2900 rpm), tal cual al marco.
 - Presión total en la entrada + caudal en la salida converge mejor y fija NPSH. H incluye la extensión de salida: difiere del 1D de CFturbo (BombaRapida −19 %).
 - Euler: fronteras del rotor POR NOMBRE (Inflow/Outflow, incluidas `[int_…]`), ponderadas por caudal; vale con solución. Validar H_Euler > H.
 - Escenas en batch: `PartDisplayer` con las FRONTERAS, `initialize()`, representación Fv por defecto, `resetCamera(true)`; el fluido se ve en PLANOS a media salida del rotor, no en paredes.
-- `scene.open()` en macro abre en el cliente batch, no en la GUI. Edge `--print-to-pdf` puede salir antes de escribir: esperar al archivo.
+- `scene.open()` en macro abre en el cliente batch, no en la GUI.
 - Una sola instancia de cada vigilante/panel; si el cliente que lanzó una macro muere, la macro sigue en el solver (vivo y cobrando).
 - Apagar sin guardar pierde la solución: `save` antes de `server_stop(save=false)`. Los selftests solo usan temporales.
 - Fallo transitorio de MPI tras apagar otro servidor no es de licencia: reintentar tras un rato.
+- `taskkill /T` alcanza procesos desacoplados mientras el padre viva: lanzar con intermediario que muere (`_spawn_detached`). `server_start` reabre un .sim del mismo nombre: caso nuevo por prueba. Imports de `pump_case` como lista → `import 'x';`.
 
 ## Casos de referencia (cifras en `conocimiento/INDICE.md`)
 
@@ -93,4 +94,4 @@ Sin `.cfturbo-ccm` no hay `pump_case`. `inspect`; superficie sucia → surface w
 
 ## Pendiente de verificar con solver
 
-Medida corregida de `PARED_CONEXION`; receta NACA con STL; `gui_attach` en uso largo; curva de 5 caudales; `run_steps` con recetas de caso.
+Euler tras iterar sin aviso espurio (N1); receta NACA con STL; `gui_attach` en uso largo; curva de 5 caudales; `run_steps` con recetas de caso.

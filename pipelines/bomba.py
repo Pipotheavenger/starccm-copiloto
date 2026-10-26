@@ -199,6 +199,12 @@ def _euler_text(ccm: dict, params: dict) -> str:
     if a not in txt or b not in txt:
         raise RuntimeError("la receta de Euler cambió de cabecera: actualiza pipelines/bomba.py")
     beta2 = "" if params.get("beta2") in (None, "") else str(params["beta2"])
+    # Sin solución (iteración 0) los radios medios salen 0.0 y la validación no tiene datos: nada de AVISO espurio. La validación
+    # se emite tras iterar (post o fin del bucle estable, ver macro_body); aquí se recorta y los AVISO de radio exigen radio > 0.
+    i0, j0 = txt.index("int itEu = 0;"), txt.index("for (Report r : reps) { String v;")
+    txt = txt[:i0] + txt[j0:]
+    txt = txt.replace("if (!turbina && rIn >= rOut)", "if (!turbina && rOut > 0 && rIn >= rOut)")
+    txt = txt.replace("if (turbina && rIn <= rOut)", "if (turbina && rIn > 0 && rIn <= rOut)")
     txt = txt.replace(a, 'boolean turbina = false;')
     txt = txt.replace(b, f'double rho = {ccm["density"]!r}; String hrep = "H", beta2 = {json.dumps(beta2)}, '
                          f'eIn = "ENTRADA_ROTOR", eOut = "SALIDA_ROTOR";')
@@ -209,7 +215,7 @@ def euler_check_body(params: dict | None = None) -> str:
     """Solo la validación de Euler (UVu2 ≠ UVu1, H_Euler > H): correr tras iterar con los reportes ya creados."""
     txt = RECETA_EULER.read_text(encoding="utf-8")
     i = txt.index("// ---- VALIDACION")
-    j = txt.index("for (Report r : reps)")
+    j = txt.index("for (Report r : reps) { String v;")  # la última: la primera (monitores) queda antes de VALIDACION
     return ('{\nboolean turbina = false; String hrep = "H"; ReportManager rm = sim.getReportManager();\n'
             + txt[i:j] + "}\n")
 
@@ -793,7 +799,10 @@ def macro_body(case_dir: str, cad_dir: str, ccm: dict, mode: str = "rapida", par
     out = out.replace("@@EULER@@", euler)
     post_on, iter_on = bool(params.get("post")), bool(params.get("iterar"))
     out = out.replace("@@ESCENA@@", ESCENA if params.get("escena", True) and not post_on else "")  # con post, la escena sale con datos
-    out = out.replace("@@ITERAR@@", (iterate_body(case_dir, params) + "@@PIPE:iterar@@") if iter_on else "")
+    it_txt = ""
+    if iter_on:  # la validación de Euler va tras el bucle estable (si no hay post, que la trae post_body)
+        it_txt = iterate_body(case_dir, params) + ("\n" + euler_check_body(params) if params.get("euler", True) and not post_on else "") + "@@PIPE:iterar@@"
+    out = out.replace("@@ITERAR@@", it_txt)
     if post_on:
         pp = dict(params)
         pp.setdefault("post_euler", bool(params.get("euler", True)))
@@ -937,6 +946,15 @@ def selftest() -> int:
     # iterar + post dentro de la MISMA macro (criterio por defecto: máx. 1000) y por separado
     full = macro_body(str(tmp / "caso"), cad, ccm, "rapida", {"iterar": True, "post": True})
     check("pxMax = 1000," in full and "ITER_STOP" in full and "PIPE iterar" in full and "PIPE post" in full, "macro con iterar+post: máx. 1000 y marcadores")
+    # N1: nada de validación ni AVISO de Euler antes de iterar (iteración 0)
+    k = full.index("ITER_STOP")
+    check("EULER_VALIDAR" not in full[:k] and "EULER_OK" not in full[:k] and "EULER_OK" in full[k:], "Euler: la validación va después de iterar, no antes")
+    check("rOut > 0 && rIn >= rOut" in full, "Euler: AVISO de radios solo con radio > 0 (sin malla/solución salen 0.0)")
+    solo = macro_body(str(tmp / "caso"), cad, ccm, "rapida", {"iterar": True})
+    k2 = solo.index("ITER_STOP")
+    check("EULER_VALIDAR" not in solo[:k2] and "EULER_OK" in solo[k2:], "iterar sin post: la validación de Euler va tras el bucle")
+    err = compile_java(solo, "iterar_solo", tmp)
+    check(err in (None, "SKIP"), "javac iterar sin post" + ("" if err in (None, "SKIP") else "\n" + str(err)))
     check("/images\"" in full and "/presion_alabes.png\"" in full and "velocidad_relativa.png" in full and "yplus.png" in full and "EULER_OK" in full,
           "post: 3 PNG en casos/<caso>/images y validación de Euler dentro de la macro")
     check(full.count('createScene("presion_alabes")') == 1, "con post no se duplica la escena previa de presión")

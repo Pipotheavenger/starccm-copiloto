@@ -22,6 +22,10 @@ Entiende además los marcadores de run_steps (STEP_BEGIN/OK/ERROR/END/SKIPPED, `
 `.step(N)` avanza una iteración falsa, el plot Residuals se exporta a CSV y cada Report imprime su valor. La
 curva sale de la escena que dice el archivo $FAKE_SCEN_FILE: stable | plateau | drift (cambiar de escena
 reinicia las iteraciones).
+Iteración lenta y cancelable: FAKE_STEP_DELAY=<s> hace que cada iteración de `.step(N)` tarde esos segundos, imprima en vivo la
+tabla de monitores (Iteration, Continuity, X-momentum, M (N-m), H) y se detenga si existe el archivo FAKE_ABORT_FILE (por defecto
+«ABORT» en el directorio de trabajo del servidor: el criterio «Stop File» de STAR-CCM+). FAKE_IGNORE_ABORT=1 lo ignora (para probar
+la macro que no obedece). Con el servidor ya lanzado se controlan por el JSON de $FAKE_CTL_FILE: {"delay": s, "ignore_abort": bool}. El servidor emite esa salida por el socket a medida que sale y el residente la reimprime en vivo.
 Se ejecuta con `python -I tests/fake_starccm.py ...` (ver STARCCM_EXE en mcp_server.py).
 """
 import math
@@ -65,13 +69,23 @@ def main(argv):
             except socket.timeout:
                 pass
             macro = data.decode("utf-8", "replace").replace(END.decode(), "")
+            def emit(txt, conn=conn):
+                print(txt, flush=True)
+                try:
+                    conn.sendall((txt + chr(10)).encode("utf-8"))
+                except OSError:
+                    pass
+            _EMIT[0] = emit
             try:
                 out = run_macro(macro)
             except Exception as e:  # noqa: BLE001
                 out = f"FAKE_INTERNAL_ERROR: {e!r}"
+            _EMIT[0] = None
             print(out, flush=True)
             try:
                 conn.sendall(out.encode("utf-8"))
+            except OSError:
+                pass
             finally:
                 conn.close()
             if ".kill()" in macro:
@@ -104,9 +118,11 @@ def main(argv):
     return 2
 
 
-def send_macro(host, port, text):
-    """Manda una macro al servidor falso y devuelve su salida (lo que hace el cliente batch de un solo uso)."""
+def send_macro(host, port, text, live=False):
+    """Manda una macro al servidor falso y devuelve su salida (lo que hace el cliente batch de un solo uso). live: la va
+    imprimiendo a medida que llega (el log del residente la ve en vivo, como el real)."""
     c = socket.create_connection(("127.0.0.1" if host == "localhost" else host, port), timeout=10)
+    c.settimeout(600)
     c.sendall(text.encode("utf-8") + END)
     c.shutdown(socket.SHUT_WR)
     out = b""
@@ -115,6 +131,8 @@ def send_macro(host, port, text):
         if not chunk:
             break
         out += chunk
+        if live:
+            print(chunk.decode("utf-8", "replace"), end="", flush=True)
     c.close()
     return out.decode("utf-8", "replace")
 
@@ -154,7 +172,8 @@ def resident(host, port, text):
                 err = "java.lang.RuntimeException: compilation failed\n\tAgent.java:7: error: cannot find symbol (fake)"
             else:
                 try:
-                    print(send_macro(host, port, macro), flush=True)
+                    send_macro(host, port, macro, live=True)
+                    print("", flush=True)
                 except Exception as e:  # noqa: BLE001
                     err = f"conexión con el servidor: {e!r}"
             print("RESIDENTE_FIN " + name, flush=True)
@@ -173,6 +192,7 @@ _LITERAL = re.compile(r'^"((?:[^"\\]|\\.)*)"$')
 _HEAD = re.compile(r'^"((?:[^"\\]|\\.)*)"')
 _IT = [0]
 _SCEN = [None]
+_EMIT = [None]
 
 
 def _scen():
@@ -184,6 +204,19 @@ def _scen():
     if name != _SCEN[0]:
         _SCEN[0], _IT[0] = name, 0
     return name
+
+
+def _ctl():
+    """Control en caliente (el servidor ya está lanzado): JSON {"delay": s, "ignore_abort": bool} en $FAKE_CTL_FILE."""
+    p = os.environ.get("FAKE_CTL_FILE")
+    if p and os.path.isfile(p):
+        try:
+            import json
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass
+    return {}
 
 
 def _series(name, it):
@@ -209,7 +242,27 @@ def run_macro(text):
     stop_flag = "_stop = true;" in text
     scen = _scen()
     m = re.search(r"\.step\((\d+)\)", text)
-    if m:
+    skip_begin = False
+    ctl = _ctl()
+    delay = float(ctl.get("delay", os.environ.get("FAKE_STEP_DELAY", "0")) or 0)
+    if m and delay > 0 and _EMIT[0]:
+        b = re.search(r'sim\.println\("(AGENT_BEGIN [^"]+)"\)', text)
+        if b:
+            _EMIT[0](b.group(1))
+            skip_begin = True
+        abort = os.environ.get("FAKE_ABORT_FILE", "ABORT")
+        ignore = bool(ctl.get("ignore_abort")) or os.environ.get("FAKE_IGNORE_ABORT") == "1"
+        it0 = _IT[0]
+        for i in range(int(m.group(1))):
+            if not ignore and os.path.exists(abort):
+                break
+            time.sleep(delay)
+            _IT[0] = it0 + i + 1
+            if i % 10 == 0:
+                _EMIT[0]("     Iteration     Continuity     X-momentum     M (N-m)              H")
+            rep_, res_ = _series(scen, _IT[0])
+            _EMIT[0](f"{_IT[0]:13d}   {res_:.6e}   {3 * res_:.6e}   {rep_['M']:.6e}   {rep_['H']:.6e}")
+    elif m:
         _IT[0] += int(m.group(1))
     m = re.search(r'rp\.export\("([^"]+)"', text)
     if m:
@@ -221,6 +274,8 @@ def run_macro(text):
             f.write("\n".join(rows) + "\n")
     for m in re.finditer(r"sim\.println\((.*?)\);", text, re.S):
         arg = m.group(1).strip()
+        if skip_begin and arg.startswith('"AGENT_BEGIN'):
+            continue
         if "STEP_SKIPPED" in arg:
             if stopped:
                 lines.append(_LITERAL.match(arg).group(1))

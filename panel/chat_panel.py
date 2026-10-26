@@ -1,6 +1,6 @@
 """Panel flotante de chat para starccm-copiloto (tkinter, solo biblioteca estándar). Ver ARQUITECTURA.md §2.
 
-Uso:  python panel/chat_panel.py        |   python panel/chat_panel.py --selftest
+Uso:  python panel/chat_panel.py  |  --selftest  |  --demo (datos de ejemplo, sin CLI ni solver)
 Lanza `claude -p … --output-format stream-json` en un hilo; los eventos pasan por una cola que la UI vacía con after().
 """
 import json
@@ -30,7 +30,6 @@ ESTILO = (
 
 MODOS = {"rapido": ("Rápido", "PANEL_MODEL_RAPIDO", "sonnet", "low"),
          "preciso": ("Preciso", "PANEL_MODEL_PRECISO", "opus", "medium")}
-MSG_APAGAR = "Guarda y apaga el solver con server_stop"
 PREFIJO_COLA = "MENSAJE DEL USUARIO MIENTRAS TRABAJABAS:\n"
 
 
@@ -210,6 +209,7 @@ class Runner:
 
     def __init__(self, q: queue.Queue, repo: Path = REPO, sdir: Path | None = None):
         self.q, self.proc, self.stopped, self.repo, self.sdir = q, None, False, Path(repo), sdir
+        self.msg, self.resumed = "", None
 
     @property
     def busy(self) -> bool:
@@ -230,6 +230,7 @@ class Runner:
             self.q.put(("done", -1, False))
             return False
         self.stopped = False
+        self.msg, self.resumed = msg, sid
         try:
             self.proc = subprocess.Popen(cmd, cwd=self.repo, env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
@@ -242,14 +243,24 @@ class Runner:
 
     def _read(self, p):
         err: list[str] = []
-        threading.Thread(target=lambda: [err.append(x) for x in p.stderr], daemon=True).start()
-        got_result = False
+        te = threading.Thread(target=lambda: [err.append(x) for x in p.stderr], daemon=True)
+        te.start()
+        got_result = lost = False
         for line in p.stdout:
+            if self.resumed and SESSION_RE.search(line):
+                lost = True  # --resume con una sesión caducada: el panel empieza una nueva y reenvía
             for ev in parse_event(line):
+                if lost and ev[0] in ("result", "raw"):
+                    continue
                 got_result |= ev[0] == "result"
                 self.q.put(ev)
         rc = p.wait()
-        if rc != 0 and not self.stopped and not got_result:
+        te.join(2)
+        if self.resumed and rc != 0 and SESSION_RE.search(" ".join(err)):
+            lost = True
+        if lost and rc != 0 and not self.stopped:
+            self.q.put(("session_lost", self.resumed))
+        elif rc != 0 and not self.stopped and not got_result:
             self.q.put(("error", f"la CLI terminó con código {rc}: " + " ".join(err)[-300:]))
         self.q.put(("done", rc, self.stopped))
 
@@ -379,13 +390,17 @@ def stop_warning(repo: Path | None = None, sdir: Path | None = None) -> str | No
     return None
 
 
+VIGIL_MAX_S = 120
+
+
 def read_status(repo: Path | None = None, sdir: Path | None = None) -> dict:
     """Lee .server.json y .inject.lock (sin importar mcp_server). Devuelve campos + `texto` para la barra."""
     dirs = state_dirs(repo, sdir)
     sf = _first(".server.json", dirs)
     st = _json(sf)
     alive = bool(st.get("pid")) and pid_alive(st["pid"])
-    out = {"solver": alive, "caso": None, "idle_min": None, "idle_warning": None, "gui": False, "busy": None}
+    out = {"solver": alive, "caso": None, "idle_min": None, "idle_warning": None, "gui": False, "busy": None,
+           "vigil_age": None, "vigil_down": False}
     parts = []
     if alive:
         out["caso"] = Path(st["sim"]).stem if st.get("sim") else "(sin .sim)"
@@ -399,6 +414,8 @@ def read_status(repo: Path | None = None, sdir: Path | None = None) -> dict:
                 pass
         parts.append(f"Solver vivo · {out['caso']}" + (f" · {out['idle_min']} min inactivo" if out["idle_min"] is not None else ""))
         out["idle_warning"] = warning_text(st.get("idle_warning"), out["idle_min"])
+        out["vigil_age"] = iso_age(st["idle_checked"]) if st.get("idle_checked") else None
+        out["vigil_down"] = out["vigil_age"] is not None and out["vigil_age"] > VIGIL_MAX_S  # el vigilante no late: cobra sin control
     else:
         parts.append("Solver apagado")
     out["gui"] = bool(st.get("gui")) if alive else False
@@ -416,18 +433,160 @@ def read_status(repo: Path | None = None, sdir: Path | None = None) -> dict:
     return out
 
 
+# ---------- acciones directas (sin turno de modelo) y progreso ----------
+LABEL_CLI = {"gui_attach": "Abrir GUI", "gui_status": "Estado de la GUI", "server_stop": "Apagar solver",
+             "server_status": "Estado del solver", "cancel": "Parar iteraciones"}
+SESSION_RE = re.compile(r"no conversation found|session.{0,40}not found|could not find session", re.I)
+
+
+def repo_python(repo: Path = REPO) -> str:
+    vpy = Path(repo) / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return str(vpy if vpy.is_file() else sys.executable)
+
+
+def cli_cmd(tool: str, args: dict | None = None, repo: Path | None = None) -> list[str]:
+    repo = Path(repo or REPO)
+    cmd = [repo_python(repo), os.environ.get("PANEL_MCP_SERVER") or str(repo / "mcp_server.py"), "--cli", tool]
+    if args:
+        cmd.append(json.dumps(args))
+    return cmd
+
+
+def run_cli(tool: str, args: dict | None = None, repo: Path | None = None, timeout: float = 120) -> dict:
+    """`mcp_server.py --cli <herramienta> [json]` -> dict (JSON por stdout). Nunca lanza: los fallos vuelven como {'error': ...}."""
+    try:
+        p = subprocess.run(cli_cmd(tool, args, repo), cwd=repo or REPO, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, stdin=subprocess.DEVNULL,
+                           creationflags=0x08000000 if os.name == "nt" else 0)
+    except subprocess.TimeoutExpired:
+        return {"error": f"sin respuesta en {int(timeout)} s"}
+    except OSError as e:
+        return {"error": f"no pude lanzar mcp_server.py: {e}"}
+    res = None
+    for ln in reversed((p.stdout or "").strip().splitlines()):
+        try:
+            res = json.loads(ln)
+            break
+        except ValueError:
+            continue
+    if not isinstance(res, dict):
+        res = {"error": ((p.stderr or "").strip()[-200:] or "sin salida JSON") if p.returncode else "sin salida JSON"}
+    elif p.returncode and "error" not in res:
+        res["error"] = (p.stderr or "").strip()[-200:] or f"código {p.returncode}"
+    return res
+
+
+def fmt_cli(tool: str, res: dict) -> tuple[str, bool]:
+    """(texto para el chat, ok)."""
+    label = LABEL_CLI.get(tool, tool)
+    if res.get("error"):
+        return f"{label}: {res['error']}", False
+    for k in ("msg", "mensaje", "message", "resumen", "summary", "status", "estado"):
+        if isinstance(res.get(k), str) and res[k]:
+            return f"{label}: {res[k]}", res.get("ok", True) is not False
+    items = [f"{k}: {v}" for k, v in res.items() if isinstance(v, (str, int, float, bool)) and v is not None][:6]
+    return f"{label}: " + (" · ".join(items) or "hecho"), res.get("ok", True) is not False
+
+
+def iso_age(s) -> float | None:
+    """Segundos desde una marca ISO (hora local si no trae zona)."""
+    from datetime import datetime
+    try:
+        dt = datetime.fromisoformat(str(s))
+    except ValueError:
+        return None
+    return (datetime.now(dt.tzinfo) - dt).total_seconds()
+
+
+def _num(d: dict, *keys):
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return v
+    return None
+
+
+PROG_STALE_S = 45
+
+
+def read_progress(repo: Path | None = None, sdir: Path | None = None) -> dict | None:
+    """progreso.json (lo escribe el MCP ≤ cada 2 s durante iterate/pump_case). `active` = hay cálculo en curso:
+    fase distinta de «terminado» y archivo vivo (< 45 s)."""
+    f = _first("progreso.json", state_dirs(repo, sdir))
+    d = _json(f)
+    if not d:
+        return None
+    try:
+        age = time.time() - f.stat().st_mtime
+    except OSError:
+        return None
+    fase = str(d.get("fase") or "").strip()
+    it, tot = _num(d, "iteracion", "iteración", "iter", "it"), _num(d, "iteraciones", "iter_max", "n", "total", "max_iter")
+    frac = _num(d, "fraccion", "frac")
+    if frac is None and (pct := _num(d, "pct", "porcentaje")) is not None:
+        frac = pct / 100
+    if frac is None and it is not None and tot:
+        frac = it / tot
+    eta = _num(d, "eta", "eficiencia")
+    return {"caso": d.get("caso") or "", "fase": fase, "it": it, "tot": tot, "frac": None if frac is None else max(0.0, min(1.0, frac)),
+            "H": _num(d, "H", "h", "altura"), "M": _num(d, "M", "m", "torque"), "eta": eta,
+            "cont": _num(d, "continuidad", "cont", "continuity"), "seg": _num(d, "segundos", "s", "transcurrido_s"),
+            "resta": _num(d, "restante_s", "faltan_s", "restante", "eta_s"), "age": age,
+            "active": bool(fase) and fase.lower() not in ("terminado", "listo", "fin") and age <= PROG_STALE_S}
+
+
+def fnum(x, dec=1, unit="") -> str:
+    if x is None:
+        return "—"
+    return f"{x:.{dec}f}".replace(".", ",") + unit
+
+
+def fsci(x) -> str:
+    return "—" if x is None else f"{x:.1e}".replace(".", ",")
+
+
+def fresta(s) -> str:
+    if s is None:
+        return ""
+    return f"faltan ~{max(int(round(s / 60)), 1)} min" if s >= 60 else f"faltan ~{int(round(s))} s"
+
+
+def dpi_aware() -> bool:
+    """Windows: proceso consciente del DPI ANTES de crear Tk (si no, a 150 % todo sale borroso)."""
+    if os.name != "nt":
+        return False
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # por monitor
+        return True
+    except Exception:
+        try:
+            return bool(ctypes.windll.user32.SetProcessDPIAware())
+        except Exception:
+            return False
+
+
 # ---------- ventana ----------
 FONT, MONO = ("Segoe UI", 10), ("Consolas", 10)
 INLINE = re.compile(r"(\*\*[^*\n]+\*\*|`[^`\n]+`)")
-BTN_BG = "SystemButtonFace" if os.name == "nt" else "#d9d9d9"
+C = {"bg": "#f4f5f7", "card": "#ffffff", "line": "#e2e5ea", "ink": "#1f2937", "mute": "#6b7280", "blue": "#2563eb",
+     "user": "#dbeafe", "amber_bg": "#fef3c7", "amber": "#92400e", "red_bg": "#fee2e2", "red": "#991b1b"}
+CHIPS = {  # (bg, fg) de cada «chip» encendido; apagado = gris
+    "off": ("#e5e7eb", "#4b5563"), "solver": ("#dcfce7", "#166534"), "gui": ("#dbeafe", "#1e40af"), "agent": ("#fef3c7", "#92400e")}
+BTN = {  # clave: (bg, fg, activebg)
+    "enviar": ("#2563eb", "#ffffff", "#1d4ed8"), "detener": ("#ffedd5", "#9a3412", "#fed7aa"),
+    "nueva": ("#eceef2", "#374151", "#dde0e6"), "gui": ("#dbeafe", "#1d4ed8", "#bfdbfe"),
+    "apagar": ("#fee2e2", "#b91c1c", "#fecaca"), "peligro": ("#dc2626", "#ffffff", "#b91c1c")}
+SUGERENCIAS = (("Simular una bomba de CFturbo", "msg", "Quiero simular una bomba de CFturbo"),
+               ("Abrir la GUI", "cli", "gui_attach"), ("Estado del solver", "cli", "server_status"))
 
 
 class Panel:
     def __init__(self, root, runner_q=None, repo: Path | None = None, sdir: Path | None = None):
         import tkinter as tk
-        from tkinter import ttk
         self.tk, self.root = tk, root
         self.repo, self.sdir = repo, sdir  # None = ubicaciones reales (panel_estado.json / COPILOTO_WORK / LOCALAPPDATA)
+        self.sc = max(root.winfo_fpixels("1i") / 96, 1.0)
         self.closed = self.closing = False
         self.aft: dict[str, str] = {}
         self.close_timeout, self.dlg = 60.0, None
@@ -442,67 +601,124 @@ class Panel:
         self.n_tools = 0
         self.npend = 0
         self.confirm: dict[str, float] = {}
+        self.cli_active: set[str] = set()
+        self.lost = False
+        self.prog: dict | None = None
+        self.vis: tuple = (False, False, False)
+        self.empty = None
         root.title("Copiloto STAR-CCM+")
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        root.geometry(f"420x640+{max(sw - 440, 0)}+{max((sh - 640) // 2 - 20, 0)}")
-        root.minsize(320, 360)
-        root.configure(bg="#f5f6f8")
+        w, h = min(self.px(440), sw - 20), min(self.px(700), sh - 80)
+        root.geometry(f"{w}x{h}+{max(sw - w - 20, 0)}+{max((sh - h) // 2 - 20, 0)}")
+        root.minsize(self.px(340), self.px(420))
+        root.configure(bg=C["bg"])
         self.top = tk.BooleanVar(value=True)
         root.attributes("-topmost", True)
+        P = self.px
 
-        bar = tk.Frame(root, bg="#e8ebf0")
-        bar.pack(fill="x")
-        self.status = tk.Label(bar, text="…", anchor="w", justify="left", bg="#e8ebf0", fg="#222", font=FONT, wraplength=300)
-        self.status.pack(side="left", fill="x", expand=True, padx=6, pady=3)
-        tk.Checkbutton(bar, text="Encima", variable=self.top, command=self.toggle_top, bg="#e8ebf0", font=FONT).pack(side="right", padx=4)
-        bar.bind("<Configure>", lambda e: self.status.config(wraplength=max(e.width - 100, 100)))
-        mbar = self.modo_bar = tk.Frame(root, bg="#e8ebf0")
-        mbar.pack(fill="x")
-        tk.Label(mbar, text="Modo:", bg="#e8ebf0", font=FONT).pack(side="left", padx=(6, 2))
+        # cabecera: título, «chips» de estado y Encima
+        head = tk.Frame(root, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
+        head.pack(fill="x")
+        r1 = tk.Frame(head, bg=C["card"])
+        r1.pack(fill="x", padx=P(12), pady=(P(8), P(2)))
+        tk.Label(r1, text="Copiloto STAR-CCM+", bg=C["card"], fg=C["ink"], font=(FONT[0], 12, "bold")).pack(side="left")
+        tk.Checkbutton(r1, text="Encima", variable=self.top, command=self.toggle_top, bg=C["card"], activebackground=C["card"],
+                       fg=C["mute"], font=(FONT[0], 9), bd=0, highlightthickness=0).pack(side="right")
+        r2 = tk.Frame(head, bg=C["card"])
+        r2.pack(fill="x", padx=P(12), pady=(P(2), P(2)))
+        self.chip = {}
+        for key in ("solver", "gui", "agent"):
+            lb = tk.Label(r2, text="", font=(FONT[0], 9, "bold"), padx=P(9), pady=P(2))
+            lb.pack(side="left", padx=(0, P(6)))
+            self.chip[key] = lb
+        self.sub = tk.Label(head, text="", anchor="w", bg=C["card"], fg=C["mute"], font=(FONT[0], 9))
+        self.sub.pack(fill="x", padx=P(12), pady=(0, P(6)))
+        mbar = self.modo_bar = tk.Frame(root, bg=C["bg"])
+        mbar.pack(fill="x", padx=P(8), pady=(P(4), 0))
+        tk.Label(mbar, text="Modo", bg=C["bg"], fg=C["mute"], font=(FONT[0], 9)).pack(side="left", padx=(P(4), P(2)))
         self.modo = tk.StringVar(value=load_modo())
         for k, (nombre, *_r) in MODOS.items():
-            tk.Radiobutton(mbar, text=nombre, value=k, variable=self.modo, command=self.on_modo, bg="#e8ebf0",
-                           activebackground="#e8ebf0", font=FONT).pack(side="left", padx=2)
-        self.modo_info = tk.Label(mbar, text="", bg="#e8ebf0", fg="#666", font=(FONT[0], 9))
-        self.modo_info.pack(side="left", padx=6)
+            tk.Radiobutton(mbar, text=nombre, value=k, variable=self.modo, command=self.on_modo, bg=C["bg"], activebackground=C["bg"],
+                           font=FONT, bd=0, highlightthickness=0).pack(side="left", padx=2)
+        self.modo_info = tk.Label(mbar, text="", bg=C["bg"], fg=C["mute"], font=(FONT[0], 9))
+        self.modo_info.pack(side="left", padx=P(6))
         self.on_modo(save=False)
-        self.warn = tk.Label(root, text="", anchor="w", justify="left", bg="#fde68a", fg="#7a4100", font=(FONT[0], FONT[1], "bold"),
-                             wraplength=380, padx=8, pady=3)  # banda ámbar: idle_warning (solo visible si hay aviso)
-        root.bind("<Configure>", lambda e: self.warn.config(wraplength=max(root.winfo_width() - 24, 100)) if e.widget is root else None)
 
-        foot = tk.Frame(root, bg="#f5f6f8")
+        # bandas y tarjeta de progreso (se muestran solo si hacen falta; ver relayout)
+        self.mid = tk.Frame(root, bg=C["bg"])
+        self.mid.pack(fill="x", padx=P(8))
+        self.vig = tk.Frame(self.mid, bg=C["red_bg"])
+        self.vig_lbl = tk.Label(self.vig, text="⛔ El vigilante no responde: el solver puede quedar cobrando", anchor="w", justify="left",
+                                bg=C["red_bg"], fg=C["red"], font=(FONT[0], 10, "bold"), wraplength=P(300), padx=P(8), pady=P(5))
+        self.vig_lbl.pack(side="left", fill="x", expand=True)
+        self.vig_btn = self.button(self.vig, "Apagar", lambda: self.twice("vig", self.vig_btn, "Apagar", self.on_off_now), "peligro", small=True)
+        self.vig_btn.pack(side="right", padx=P(6), pady=P(4))
+        self.warn = tk.Label(self.mid, text="", anchor="w", justify="left", bg=C["amber_bg"], fg=C["amber"], font=(FONT[0], 10, "bold"),
+                             wraplength=P(380), padx=P(8), pady=P(5))  # banda ámbar: idle_warning
+        self.card = tk.Frame(self.mid, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
+        ch = tk.Frame(self.card, bg=C["card"])
+        ch.pack(fill="x", padx=P(10), pady=(P(8), P(4)))
+        self.p_title = tk.Label(ch, text="", anchor="w", bg=C["card"], fg=C["ink"], font=(FONT[0], 10, "bold"))
+        self.p_title.pack(side="left")
+        self.p_rest = tk.Label(ch, text="", anchor="e", bg=C["card"], fg=C["blue"], font=(FONT[0], 9, "bold"))
+        self.p_rest.pack(side="right")
+        self.bar = tk.Canvas(self.card, height=P(8), bg=C["card"], highlightthickness=0, bd=0)
+        self.bar.pack(fill="x", padx=P(10))
+        self.bar.bind("<Configure>", lambda e: self.draw_bar())
+        self.bar_frac = None
+        tl = tk.Frame(self.card, bg=C["card"])
+        tl.pack(fill="x", padx=P(6), pady=(P(6), P(8)))
+        self.tile = {}
+        for i, (key, cap) in enumerate((("it", "Iteración"), ("H", "H"), ("M", "M"), ("eta", "η"), ("cont", "Continuidad"))):
+            tl.columnconfigure(i, weight=1, uniform="t")
+            f = tk.Frame(tl, bg=C["card"])
+            f.grid(row=0, column=i, sticky="ew")
+            tk.Label(f, text=cap, bg=C["card"], fg=C["mute"], font=(FONT[0], 8)).pack()
+            v = tk.Label(f, text="—", bg=C["card"], fg=C["ink"], font=(FONT[0], 10, "bold"))
+            v.pack()
+            self.tile[key] = v
+        root.bind("<Configure>", self.on_resize)
+
+        # pie: entrada y botones
+        foot = tk.Frame(root, bg=C["bg"])
         foot.pack(side="bottom", fill="x")
-        row = tk.Frame(foot, bg="#f5f6f8")
-        row.pack(fill="x", padx=6, pady=(4, 0))
+        self.live = tk.Label(foot, text="", anchor="w", bg=C["bg"], fg=C["blue"], font=(FONT[0], 9))
+        self.live.pack(fill="x", padx=P(12))
+        box = tk.Frame(foot, bg=C["card"], highlightthickness=1, highlightbackground="#cfd4dc", highlightcolor=C["blue"])
+        box.pack(fill="x", padx=P(10), pady=(P(2), P(6)))
+        self.entry = tk.Text(box, height=3, wrap="word", font=FONT, relief="flat", bd=0, padx=P(8), pady=P(6), bg=C["card"], fg=C["ink"],
+                             insertbackground=C["ink"])
+        self.entry.pack(fill="x")
+        row = tk.Frame(foot, bg=C["bg"])
+        row.pack(fill="x", padx=P(10), pady=(0, P(10)))
         self.btn = {}
-        for key, txt, cmd in (("enviar", "Enviar", self.on_send), ("detener", "Detener", self.on_stop),
-                              ("nueva", "Nueva", self.on_new), ("gui", "Abrir GUI", self.on_gui),
-                              ("apagar", "Apagar solver", self.on_off)):
-            b = tk.Button(row, text=txt, command=cmd, font=FONT, padx=4)
-            b.pack(side="left", padx=2, pady=2)
+        for key, txt, cmd, side in (("enviar", "Enviar", self.on_send, "left"), ("detener", "Detener", self.on_stop, "left"),
+                                    ("apagar", "Apagar solver", self.on_off, "right"), ("gui", "Abrir GUI", self.on_gui, "right"),
+                                    ("nueva", "Nueva", self.on_new, "right")):
+            b = self.button(row, txt, cmd, key)
+            b.pack(side=side, padx=(0, P(5)) if side == "left" else (P(5), 0))
             self.btn[key] = b
-        self.btn["enviar"].config(bg="#2563eb", fg="white")
-        self.entry = tk.Text(foot, height=3, wrap="word", font=FONT, relief="solid", bd=1)
-        self.entry.pack(fill="x", padx=6, pady=6)
-        self.live = tk.Label(root, text="", anchor="w", bg="#f5f6f8", fg="#1d4ed8", font=FONT)
-        self.live.pack(side="bottom", fill="x", padx=8)
 
-        self.hist = tk.Text(root, wrap="word", state="disabled", font=FONT, bg="#ffffff", fg="#1b1b1b", relief="flat",
-                            padx=8, pady=6, spacing3=3)
+        # chat
+        self.hist = tk.Text(root, wrap="word", state="disabled", font=FONT, bg=C["card"], fg=C["ink"], relief="flat", bd=0,
+                            padx=P(12), pady=P(8), spacing3=P(3), highlightthickness=1, highlightbackground=C["line"], cursor="arrow")
+        from tkinter import ttk
         sb = ttk.Scrollbar(root, command=self.hist.yview)
         self.hist.config(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.hist.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y", pady=(P(6), 0))
+        self.hist.pack(side="left", fill="both", expand=True, padx=(P(8), 0), pady=(P(6), 0))
         h = self.hist
-        h.tag_config("user", background="#dde9ff", lmargin1=8, lmargin2=8, rmargin=8, spacing1=6, spacing3=6)
+        h.tag_config("user", background=C["user"], justify="right", lmargin1=P(60), lmargin2=P(60), rmargin=P(10), spacing1=P(6), spacing3=P(6))
+        h.tag_config("unl", justify="right", lmargin1=P(60), lmargin2=P(60), rmargin=P(10), spacing1=P(6), spacing3=P(6))
+        h.tag_config("agent", lmargin1=P(4), lmargin2=P(4), rmargin=P(30))
         h.tag_config("bold", font=(FONT[0], FONT[1], "bold"))
         h.tag_config("code", font=MONO, background="#eef0f3")
         h.tag_config("table", font=MONO, background="#f3f5f8")
-        h.tag_config("tool", foreground="#555555", font=(FONT[0], FONT[1], "italic"))
+        h.tag_config("tool", foreground="#555555", font=(FONT[0], 9, "italic"), lmargin1=P(4), lmargin2=P(4))
         h.tag_config("ok", foreground="#1a7f37")
         h.tag_config("bad", foreground="#c62828")
         h.tag_config("err", foreground="#c62828", font=(FONT[0], FONT[1], "bold"))
-        h.tag_config("sys", foreground="#777777")
+        h.tag_config("sys", foreground="#777777", font=(FONT[0], 9, "italic"))
         h.tag_config("stat", foreground="#888888", font=(FONT[0], 9), spacing1=2, spacing3=8)
         h.tag_config("queued", foreground="#b45309", font=(FONT[0], 9, "italic"))
 
@@ -511,16 +727,59 @@ class Panel:
         self.entry.bind("<Up>", self.on_up)
         root.bind("<Control-t>", lambda e: (self.top.set(not self.top.get()), self.toggle_top()))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.say("Listo. Escribe lo que necesitas." + (" (continúo la conversación anterior)" if self.sid else ""), "sys")
+        if self.sid:
+            self.say("Continúo la conversación anterior.", "sys")
+        else:
+            self.show_empty()
         self.entry.focus_set()
         self.pump()
         self.refresh()
+        self.refresh_progress()
+
+    def px(self, n) -> int:
+        return int(round(n * self.sc))
+
+    def button(self, parent, text, cmd, key, small=False):
+        bg, fg, act = BTN[key]
+        b = self.tk.Button(parent, text=text, command=cmd, font=(FONT[0], 9 if small else 10, "bold" if key == "enviar" else "normal"),
+                           bg=bg, fg=fg, activebackground=act, activeforeground=fg, relief="flat", bd=0, cursor="hand2",
+                           padx=self.px(10 if small else 12), pady=self.px(4 if small else 6), highlightthickness=0)
+        b._key, b._text = key, text
+        return b
+
+    def on_resize(self, e):
+        if e.widget is self.root:
+            w = max(self.root.winfo_width() - self.px(40), 100)
+            self.warn.config(wraplength=w)
+            self.vig_lbl.config(wraplength=max(w - self.px(90), 100))
+
+    # --- estado vacío con sugerencias
+    def show_empty(self):
+        tk, P = self.tk, self.px
+        f = tk.Frame(self.hist, bg=C["card"])
+        tk.Label(f, text="¿Qué quieres hacer?", bg=C["card"], fg=C["ink"], font=(FONT[0], 14, "bold")).pack()
+        tk.Label(f, text="Escribe abajo o elige una opción", bg=C["card"], fg=C["mute"], font=(FONT[0], 10)).pack(pady=(P(2), P(12)))
+        self.sug = []
+        for txt, kind, arg in SUGERENCIAS:
+            b = tk.Button(f, text=txt, font=FONT, bg="#eff4ff", fg="#1e40af", activebackground="#dbeafe", relief="flat", bd=0,
+                          cursor="hand2", padx=P(14), pady=P(8), width=28,
+                          command=(lambda a=arg: self.on_send(a)) if kind == "msg" else (lambda a=arg: self.direct(a)))
+            b.pack(pady=P(4))
+            self.sug.append(b)
+        f.place(relx=0.5, rely=0.42, anchor="center")
+        self.empty = f
+
+    def hide_empty(self):
+        if self.empty is not None:
+            self.empty.destroy()
+            self.empty = None
 
     # --- texto
     def toggle_top(self):
         self.root.attributes("-topmost", bool(self.top.get()))
 
     def put(self, text, *tags):
+        self.hide_empty()
         self.hist.config(state="normal")
         self.hist.insert("end", text, tags)
         self.hist.config(state="disabled")
@@ -531,17 +790,19 @@ class Panel:
 
     def agent_text(self, text):
         for line in text.split("\n"):
+            if re.fullmatch(r"\s*\|[-:| ]+\|\s*", line):  # separador de tabla markdown: no se pinta
+                continue
             if line.lstrip().startswith("|"):
-                self.put(line + "\n", "table")
+                self.put(line + "\n", "agent", "table")
                 continue
             for part in INLINE.split(line):
                 if part.startswith("**") and part.endswith("**") and len(part) > 4:
-                    self.put(part[2:-2], "bold")
+                    self.put(part[2:-2], "agent", "bold")
                 elif part.startswith("`") and part.endswith("`") and len(part) > 2:
-                    self.put(part[1:-1], "code")
+                    self.put(part[1:-1], "agent", "code")
                 else:
-                    self.put(part)
-            self.put("\n")
+                    self.put(part, "agent")
+            self.put("\n", "agent")
 
     # --- acciones
     def on_send(self, msg=None):
@@ -560,7 +821,8 @@ class Panel:
             self.put("\n")
             self.pending.append((mk, msg))
             return
-        self.put(msg + "\n", "user")
+        self.put(msg, "user")
+        self.put("\n", "unl")
         self.start(msg)
 
     def on_modo(self, save=True):
@@ -593,6 +855,32 @@ class Panel:
             self.entry.insert("1.0", self.last_msg)
             return "break"
 
+    # --- acciones directas: mcp_server.py --cli en un hilo, resultado en el chat, sin turno de modelo
+    def direct(self, tool, args=None):
+        if tool in self.cli_active:
+            return
+        self.cli_active.add(tool)
+        self.say(f"▸ {LABEL_CLI.get(tool, tool)}…", "sys")
+        repo = self.repo or REPO
+        tmo = 180 if tool == "server_stop" else 90
+
+        def work():
+            self.q.put(("cli", tool, run_cli(tool, args, repo, tmo)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_gui(self):
+        self.direct("gui_attach")
+
+    def on_off_now(self):
+        self.direct("server_stop")
+
+    def on_cancel(self):
+        self.direct("cancel")
+
+    def on_off(self):
+        self.twice("apagar", self.btn["apagar"], "Apagar solver", self.on_off_now)
+
+    # --- Detener
     def on_stop(self):
         if self.runner.busy:
             n = len(self.pending)
@@ -600,37 +888,55 @@ class Panel:
             self.runner.stop()
             self.say("Detenido." + (f" Descarté {n} mensaje(s) en cola." if n else ""), "sys")
             self.root.after(self.stop_delay_ms, self.check_after_stop)
+        elif self.progress_active():
+            self.check_after_stop()
 
     stop_delay_ms = 1200
 
-    def check_after_stop(self):
-        w = stop_warning(self.repo, self.sdir)
-        if not w or self.closed:
-            return
-        self.say(w, "err")
+    def progress_active(self) -> bool:
+        return bool(self.prog and self.prog["active"])
+
+    def chat_button(self, text, cmd, key):
+        b = self.button(self.hist, text, cmd, key, small=True)
         self.hist.config(state="normal")
-        b = self.tk.Button(self.hist, text="Apagar solver", font=FONT, bg="#ffd6d6", command=self.on_off_now)
-        self.hist.window_create("end", window=b, padx=4, pady=2)
-        self.hist.insert("end", "\n")
+        self.hist.window_create("end", window=b, padx=self.px(4), pady=self.px(2))
         self.hist.config(state="disabled")
-        self.hist.see("end")
-        self.stop_btn = b
+        return b
+
+    def check_after_stop(self):
+        self.refresh_progress(reschedule=False)
+        w, act = stop_warning(self.repo, self.sdir), self.progress_active()
+        if (not w and not act) or self.closed:
+            return
+        if w:
+            self.say(w, "err")
+        if act:
+            self.say("Hay iteraciones en marcha en el solver" + (f" ({self.prog['caso']})" if self.prog["caso"] else "") +
+                     ": «Parar iteraciones» las cancela sin apagar nada.", "sys" if w else "err")
+            self.cancel_btn = self.chat_button("Parar iteraciones", self.on_cancel, "detener")
+        if w:
+            self.stop_btn = self.chat_button("Apagar solver", self.on_off_now, "apagar")
+        self.put("\n")
 
     def twice(self, key, button, normal, action):
         """Confirmación dentro del panel: el primer clic pide confirmar; el segundo (en 4 s) ejecuta."""
         now = time.time()
+        bg, fg, act = BTN[button._key]
+
+        def restore():
+            button.config(text=normal, bg=bg, fg=fg, activebackground=act)
         if now - self.confirm.get(key, 0) < 4:
             self.confirm.pop(key, None)
-            button.config(text=normal, bg=BTN_BG)
+            restore()
             action()
             return
         self.confirm[key] = now
-        button.config(text="¿Seguro? Otro clic", bg="#ffd6d6")
+        button.config(text="¿Seguro? Otro clic", bg="#dc2626", fg="#ffffff", activebackground="#b91c1c")
 
         def reset():
             if key in self.confirm and time.time() - self.confirm[key] >= 3.9:
                 self.confirm.pop(key, None)
-                button.config(text=normal, bg=BTN_BG)
+                restore()
         self.root.after(4000, reset)
 
     def on_new(self):
@@ -642,17 +948,8 @@ class Panel:
             self.hist.config(state="normal")
             self.hist.delete("1.0", "end")
             self.hist.config(state="disabled")
-            self.say("Conversación nueva.", "sys")
+            self.show_empty()
         self.twice("nueva", self.btn["nueva"], "Nueva", go)
-
-    def on_gui(self):
-        self.on_send("Abre la GUI con gui_attach")
-
-    def on_off_now(self):
-        self.on_send(MSG_APAGAR)
-
-    def on_off(self):
-        self.twice("apagar", self.btn["apagar"], "Apagar solver", self.on_off_now)
 
     # --- cerrar: si el solver está vivo, pregunta dentro del panel
     def status_now(self):
@@ -677,15 +974,16 @@ class Panel:
         self.root.destroy()
 
     def show_dlg(self):
-        tk = self.tk
-        f = tk.Frame(self.root, bg="#ffffff", bd=2, relief="solid", padx=14, pady=12)
-        tk.Label(f, text="¿Apagar el solver antes de salir?\n(cobra por hora)", bg="#ffffff", font=(FONT[0], 11, "bold"),
-                 justify="center").pack(pady=(0, 10))
+        tk, P = self.tk, self.px
+        f = tk.Frame(self.root, bg="#ffffff", highlightthickness=1, highlightbackground="#9ca3af", padx=P(18), pady=P(14))
+        tk.Label(f, text="¿Apagar el solver antes de salir?", bg="#ffffff", font=(FONT[0], 11, "bold")).pack()
+        tk.Label(f, text="Cobra por hora mientras esté encendido", bg="#ffffff", fg=C["mute"], font=(FONT[0], 9)).pack(pady=(0, P(10)))
         row = tk.Frame(f, bg="#ffffff")
         row.pack()
         self.dlg_btn = {}
-        for key, txt in (("si", "Sí"), ("no", "No"), ("cancelar", "Cancelar")):
-            b = tk.Button(row, text=txt, font=FONT, width=9, command=lambda k=key: self.dlg_answer(k))
+        for key, txt, st in (("si", "Sí", "enviar"), ("no", "No", "nueva"), ("cancelar", "Cancelar", "nueva")):
+            b = self.button(row, txt, lambda k=key: self.dlg_answer(k), st)
+            b.config(width=8)
             b.pack(side="left", padx=3)
             self.dlg_btn[key] = b
         f.place(relx=0.5, rely=0.45, anchor="center")
@@ -703,13 +1001,13 @@ class Panel:
             return
         self.closing, self.close_t0 = True, time.time()
         self.say("Apagando el solver antes de salir… (máx. %d s)" % self.close_timeout, "sys")
-        self.on_send(MSG_APAGAR)  # si la CLI está ocupada se encola y sale al terminar el turno
+        self.on_off_now()  # directo: sin pasar por el modelo
         self.root.after(300, self.close_poll)
 
     def close_poll(self):
         if self.closed:
             return
-        if not self.runner.busy and not self.pending and not self.status_now()["solver"]:
+        if not self.cli_active and not self.status_now()["solver"]:
             self.finish()
         elif time.time() - self.close_t0 > self.close_timeout:
             self.closing = False
@@ -760,9 +1058,24 @@ class Panel:
             self.say("⚠ " + ev[1], "sys")
         elif k == "raw":
             self.say(ev[1], "sys")
+        elif k == "session_lost":
+            self.lost = True
+        elif k == "cli":
+            self.cli_active.discard(ev[1])
+            txt, ok = fmt_cli(ev[1], ev[2])
+            self.say(("✓ " if ok else "✗ ") + txt, "ok" if ok else "err")
+            if not self.closed:
+                self.refresh()
         elif k == "done":
             self.tools.clear()
             self.live.config(text="")
+            if self.lost and self.runner.msg:
+                self.lost = False
+                self.sid = None
+                save_sid(None)
+                self.say("⚠ La sesión anterior caducó: empiezo una conversación nueva y reenvío tu mensaje.", "sys")
+                self.start(self.runner.msg)
+                return
             if ev[2] or ev[1] != 0:
                 self.pending.clear()
             self.flush_queue()
@@ -779,30 +1092,132 @@ class Panel:
     def tick(self):
         if self.tools:
             label, t0 = max(self.tools.values(), key=lambda v: v[1])
-            self.live.config(text=f"▶ {label} … {fmt_s(time.time() - t0)}", fg="#1d4ed8")
+            self.live.config(text=f"▶ {label} … {fmt_s(time.time() - t0)}", fg=C["blue"])
         elif self.runner.busy:
-            self.live.config(text=f"… la IA piensa {fmt_s(time.time() - self.turn_t0)}" if self.turn_t0 else "", fg="#777777")
+            self.live.config(text=f"… la IA piensa {fmt_s(time.time() - self.turn_t0)}" if self.turn_t0 else "", fg=C["mute"])
         else:
             self.live.config(text="")
+        if self.bar_frac is None and self.card.winfo_manager() == "pack":
+            self.draw_bar()
+
+    def draw_bar(self):
+        c, w, h = self.bar, self.bar.winfo_width(), self.px(8)
+        c.delete("all")
+        c.create_rectangle(0, 0, w, h, fill="#e5e7eb", width=0)
+        if self.bar_frac is not None:
+            c.create_rectangle(0, 0, w * self.bar_frac, h, fill=C["blue"], width=0)
+        elif w > 10:  # fase sin porcentaje: bloque que se desliza
+            x = ((time.time() * 0.6) % 1.0) * (w + w * 0.3) - w * 0.3
+            c.create_rectangle(max(x, 0), 0, min(x + w * 0.3, w), h, fill=C["blue"], width=0)
+
+    def relayout(self, show: tuple):
+        if show == self.vis:
+            return
+        self.vis = show
+        for w in (self.vig, self.warn, self.card):
+            w.pack_forget()
+        for on, w in zip(show, (self.vig, self.warn, self.card)):
+            if on:
+                w.pack(fill="x", pady=(self.px(6), 0))
+
+    def refresh_progress(self, reschedule=True):
+        pr = self.prog = read_progress(self.repo, self.sdir)
+        if pr and pr["active"]:
+            self.p_title.config(text=f"● {pr['caso'] or 'Cálculo'} · {pr['fase'].capitalize()}")
+            self.p_rest.config(text=fresta(pr["resta"]))
+            self.bar_frac = pr["frac"]
+            it = "—" if pr["it"] is None else (f"{int(pr['it'])}/{int(pr['tot'])}" if pr["tot"] else f"{int(pr['it'])}")
+            eta = pr["eta"]
+            self.tile["it"].config(text=it)
+            self.tile["H"].config(text=fnum(pr["H"], 1, " m"))
+            self.tile["M"].config(text=fnum(pr["M"], 2, " N·m"))
+            self.tile["eta"].config(text=fnum(None if eta is None else (eta * 100 if eta <= 1.5 else eta), 1, " %"))
+            self.tile["cont"].config(text=fsci(pr["cont"]))
+        self.relayout((self.vis[0], self.vis[1], bool(pr and pr["active"])))
+        if pr and pr["active"]:
+            self.draw_bar()
+        if reschedule and not self.closed:
+            if "prog" in self.aft:
+                self.root.after_cancel(self.aft["prog"])
+            self.aft["prog"] = self.root.after(2000, self.refresh_progress)
 
     def refresh(self):
         s = self.status_now()
-        self.status.config(text=s["texto"])
+        off_bg, off_fg = CHIPS["off"]
+
+        def chip(key, on, on_text, off_text):
+            bg, fg = CHIPS[key] if on else (off_bg, off_fg)
+            self.chip[key].config(text=("● " if on else "○ ") + (on_text if on else off_text), bg=bg, fg=fg)
+        chip("solver", s["solver"], "Solver encendido", "Solver apagado")
+        chip("gui", s["gui"], "GUI conectada", "GUI no conectada")
+        chip("agent", self.runner.busy or bool(s["busy"]) or bool(self.cli_active), "Agente trabajando", "Agente libre")
+        self.sub.config(text=(f"{s['caso']}" + (f" · {s['idle_min']} min inactivo" if s["idle_min"] is not None else "")) if s["solver"]
+                        else "Sin solver: se arranca cuando haga falta")
         if s["idle_warning"]:
             self.warn.config(text="⚠ " + s["idle_warning"])
-            if self.warn.winfo_manager() != "pack":
-                self.warn.pack(fill="x", after=self.modo_bar)
-        elif self.warn.winfo_manager() == "pack":
-            self.warn.pack_forget()
+        self.relayout((bool(s["vigil_down"]), bool(s["idle_warning"]), self.vis[2]))
         if "refresh" in self.aft:
             self.root.after_cancel(self.aft["refresh"])
         self.aft["refresh"] = self.root.after(3000, self.refresh)
 
 
+def demo_setup(p: "Panel", sd: Path) -> None:
+    """--demo: estado y mensajes de ejemplo, sin CLI ni solver."""
+    from datetime import datetime, timedelta
+    t0 = time.time()
+    vigil, vacio = "--vigil" in sys.argv, "--empty" in sys.argv  # variantes para revisar el aspecto
+
+    def write():
+        if p.closed:
+            return
+        n = 120 + int((time.time() - t0) / 2)
+        if vacio:
+            (sd / "progreso.json").unlink(missing_ok=True)
+        else:
+            (sd / "progreso.json").write_text(json.dumps({"caso": "BombaRapida", "fase": "iterando", "iteracion": n, "iteraciones": 250,
+                                                          "H": 16.74, "M": 3.12, "eta": 0.887, "continuidad": 2.3e-4, "segundos": n * 0.8,
+                                                          "restante_s": (250 - n) * 0.8}), encoding="utf-8")
+        chk = datetime.now() - timedelta(minutes=5 if vigil else 0)
+        (sd / ".server.json").write_text(json.dumps({"pid": os.getpid(), "sim": "C:/x/BombaRapida.sim", "gui": True, "idle_min": 0,
+                                                     "idle_checked": chk.isoformat(timespec="seconds"),
+                                                     "idle_warning": "35 min sin actividad: ¿apagar el solver?" if vigil else None}),
+                                                     encoding="utf-8")
+        p.aft["demo"] = p.root.after(2000, write)
+    write()
+    p.refresh()
+    p.refresh_progress(reschedule=False)
+    if vacio:
+        return
+    p.put("Simula la bomba de CFturbo con 250 iteraciones", "user")
+    p.put("\n", "unl")
+    p.agent_text("Importo la geometría y monto la física de **BombaRapida**.")
+    p.put("▶ Montando la bomba (importar, malla, física) «BombaRapida» … ", "tool")
+    p.put("96 s ", "tool", "✓", "ok")
+    p.put("\n")
+    p.agent_text("Malla lista: 412 000 celdas, y+ medio 38. Itero hasta que se estabilice.")
+    p.put("▶ Iterando 250 iteraciones … ", "tool")
+    p.put("\n")
+    p.put("¿Cuál es la altura ahora?", "user")
+    p.put("\n", "unl")
+    p.agent_text("Vas en la iteración 120 de 250:\n| magnitud | valor |\n|---|---|\n| H | 16,7 m |\n| η | 88,7 % |\n"
+                 "Se estabiliza: faltan unos 2 min. Todavía **no** apago el solver.")
+    p.say("⏱ 1 min 52 s en total · 3 turnos del modelo · 1 min 40 s en herramientas (2) · 12 s pensando", "stat")
+
+
 def main():
+    global ESTADO
+    dpi_aware()
     import tkinter as tk
     root = tk.Tk()
-    Panel(root)
+    if "--demo" in sys.argv:
+        ESTADO = Path(tempfile.mkdtemp(prefix="panel-demo-")) / ".estado.json"
+        sd = Path(tempfile.mkdtemp(prefix="panel-demo-"))
+        os.environ["COPILOTO_WORK"] = str(sd)
+        p = Panel(root, repo=REPO, sdir=sd)
+        p.sid = None
+        demo_setup(p, sd)
+    else:
+        Panel(root)
     root.mainloop()
 
 
@@ -820,9 +1235,166 @@ def selftest():
         ok_all &= bool(c)
         print(("OK   " if c else "FALLA"), msg)
 
+    def run_new_checks(p, root, spin, trepo, tmp, tmp_sd, sj):
+        """Ronda 4: chips, tarjeta de progreso, acciones directas, vigilante caído, sesión caducada, estado vacío."""
+        from datetime import datetime, timedelta
+        base = {"pid": os.getpid(), "sim": "C:/x/Nueva.sim", "gui": True}
+        check(isinstance(dpi_aware(), bool) and p.sc >= 1.0, "DPI-aware: dpi_aware() (SetProcessDpiAwareness) no revienta y hay factor de escala")
+        # chips de estado
+        p.refresh()
+        c = p.chip
+        check(c["solver"].cget("text") == "● Solver encendido" and c["solver"].cget("bg") == CHIPS["solver"][0]
+              and c["gui"].cget("bg") == CHIPS["gui"][0] and c["agent"].cget("text") == "○ Agente libre", "chips: solver verde, GUI azul, agente libre gris")
+        p.cli_active.add("x")
+        p.refresh()
+        check(c["agent"].cget("bg") == CHIPS["agent"][0] and "trabajando" in c["agent"].cget("text"), "chip del agente en ámbar mientras trabaja")
+        p.cli_active.discard("x")
+        sj.write_text(json.dumps({**base, "pid": 999999, "gui": True}))
+        p.refresh()
+        check(c["solver"].cget("text") == "○ Solver apagado" and c["solver"].cget("bg") == CHIPS["off"][0] and c["gui"].cget("text") == "○ GUI no conectada",
+              "chips: solver apagado y GUI en gris")
+        sj.write_text(json.dumps(base))
+        # tarjeta de progreso
+        pj = tmp_sd / "progreso.json"
+        pj.unlink(missing_ok=True)
+        p.refresh_progress(reschedule=False)
+        check(read_progress(trepo, tmp_sd) is None and p.card.winfo_manager() == "", "sin progreso.json la tarjeta está oculta")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "iterando", "iteracion": 100, "iteraciones": 250, "H": 16.74, "M": 3.1,
+                                  "eta": 0.887, "continuidad": 2.3e-4, "segundos": 80, "restante_s": 180}))
+        p.refresh_progress(reschedule=False)
+        check(p.card.winfo_manager() == "pack" and "BombaX" in p.p_title.cget("text") and "Iterando" in p.p_title.cget("text")
+              and p.tile["it"].cget("text") == "100/250" and p.tile["H"].cget("text") == "16,7 m" and p.tile["eta"].cget("text") == "88,7 %"
+              and p.tile["cont"].cget("text") == "2,3e-04" and p.p_rest.cget("text") == "faltan ~3 min" and abs(p.bar_frac - 0.4) < 1e-9,
+              "tarjeta de progreso: caso, fase, iteración, H, η, continuidad, «faltan ~3 min» y barra al 40 %")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "malla"}))
+        p.refresh_progress(reschedule=False)
+        check(p.card.winfo_manager() == "pack" and p.bar_frac is None and p.tile["it"].cget("text") == "—", "fase sin iteraciones: barra indeterminada y «—»")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "terminado", "iteracion": 250, "iteraciones": 250}))
+        p.refresh_progress(reschedule=False)
+        check(p.card.winfo_manager() == "", "fase «terminado»: la tarjeta se oculta")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "iterando", "iteracion": 5, "iteraciones": 250}))
+        old = time.time() - 300
+        os.utime(pj, (old, old))
+        p.refresh_progress(reschedule=False)
+        check(p.card.winfo_manager() == "" and read_progress(trepo, tmp_sd)["active"] is False, "progreso.json abandonado (> 45 s): la tarjeta se oculta")
+        # vigilante caído
+        sj.write_text(json.dumps({**base, "idle_checked": (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds")}))
+        p.refresh()
+        check(p.vig.winfo_manager() == "pack" and "vigilante no responde" in p.vig_lbl.cget("text") and read_status(trepo, tmp_sd)["vigil_down"],
+              "idle_checked > 2 min con solver vivo: banda roja «El vigilante no responde»")
+        sj.write_text(json.dumps({**base, "idle_checked": datetime.now().isoformat(timespec="seconds"), "idle_warning": "x"}))
+        p.refresh()
+        check(p.vig.winfo_manager() == "" and p.warn.winfo_manager() == "pack", "idle_checked reciente: sin banda roja")
+        sj.write_text(json.dumps(base))
+        p.refresh()
+        check(p.vig.winfo_manager() == "" and not read_status(trepo, tmp_sd)["vigil_down"], "sin idle_checked (vigilante apagado a propósito): sin banda roja")
+        sj.write_text(json.dumps({**base, "idle_checked": (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds"), "idle_warning": "aviso"}))
+        pj.write_text(json.dumps({"caso": "B", "fase": "iterando", "iteracion": 1, "iteraciones": 9}))
+        p.refresh()
+        p.refresh_progress(reschedule=False)
+        order = [("vig" if w is p.vig else "warn" if w is p.warn else "card") for w in p.mid.pack_slaves()]
+        check(order == ["vig", "warn", "card"], f"orden de bandas: roja, ámbar, tarjeta ({order})")
+        # acciones directas: sin turno de modelo
+        log = Path(os.environ["FAKE_CLI_LOG"])
+        n0, last = (len(log.read_text().splitlines()) if log.exists() else 0), p.last_msg
+        p.vig_btn.invoke()
+        check(p.vig_btn.cget("text").startswith("¿Seguro?") and not p.cli_active,
+              "Apagar (banda roja) pide confirmación en el panel")
+        p.vig_btn.invoke()
+        check(spin(lambda: "✓ Apagar solver: solver apagado (falso)" in p.hist.get("1.0", "end"), 10), "Apagar (banda roja): server_stop directo y resultado en el chat")
+        sj.write_text(json.dumps(base))
+        p.refresh()
+        p.on_gui()
+        p.on_gui()  # el segundo clic con la primera en vuelo se ignora
+        check(spin(lambda: "✓ Abrir GUI: GUI conectada (falsa)" in p.hist.get("1.0", "end"), 10), "Abrir GUI: gui_attach directo, resultado en el chat")
+        spin(lambda: not p.cli_active, 5)
+        p.on_off()
+        check(p.btn["apagar"].cget("text").startswith("¿Seguro?"), "«Apagar solver»: primer clic pide confirmar")
+        p.on_off()
+        spin(lambda: not p.cli_active and p.btn["apagar"].cget("text") == "Apagar solver", 10)
+        calls = [ln.split()[0] for ln in log.read_text().splitlines()[n0:]]
+        check(calls.count("gui_attach") == 1 and calls.count("server_stop") == 2 and p.last_msg == last and not p.runner.busy, f"acciones directas no gastan turno del modelo (llamadas: {calls})")
+        check(run_cli("herramienta_rara")["error"] == "herramienta desconocida" and "error" in run_cli("x", repo=tmp / "nada"),
+              "run_cli: errores del MCP y del lanzamiento vuelven como {'error': …}")
+        check(cli_cmd("cancel", {"a": 1})[-3:] == ["--cli", "cancel", '{"a": 1}'], "cli_cmd: mcp_server.py --cli herramienta json")
+        txt, ok = fmt_cli("cancel", {"ok": True, "cancelado": True})
+        check(ok and txt.startswith("Parar iteraciones:") and fmt_cli("gui_attach", {"error": "x"}) == ("Abrir GUI: x", False), "fmt_cli: texto del resultado")
+        # Detener con progreso activo: ofrece «Parar iteraciones»
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "iterando", "iteracion": 10, "iteraciones": 250}))
+        p.refresh_progress(reschedule=False)
+        p.on_stop()
+        check(hasattr(p, "cancel_btn") and p.cancel_btn.cget("text") == "Parar iteraciones" and "Parar iteraciones" in p.hist.get("1.0", "end"),
+              "Detener con iteraciones en marcha ofrece «Parar iteraciones»")
+        p.cancel_btn.invoke()
+        check(spin(lambda: "✓ Parar iteraciones:" in p.hist.get("1.0", "end"), 10) and "cancel" in log.read_text(), "«Parar iteraciones» llama a --cli cancel")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "terminado"}))
+        p.refresh_progress(reschedule=False)
+        sj.write_text(json.dumps({**base}))
+        p.refresh()
+        # estado vacío y sugerencias
+        p.on_new()
+        check(p.btn["nueva"].cget("text").startswith("¿Seguro?"), "«Nueva» pide confirmar")
+        p.on_new()
+        check(p.empty is not None and len(p.sug) == 3 and [b.cget("text") for b in p.sug][0] == "Simular una bomba de CFturbo", "estado vacío con 3 sugerencias")
+        p.sug[2].invoke()
+        check(spin(lambda: "✓ Estado del solver:" in p.hist.get("1.0", "end"), 10) and p.empty is None, "sugerencia «Estado del solver»: acción directa y desaparece el estado vacío")
+        # sesión caducada: --resume falla -> conversación nueva y reenvío automático
+        os.environ["FAKE_PAUSE"] = "0.1"
+        os.environ["PANEL_CLAUDE_BIN"] = str(fake_resume)
+        save_sid("viejo")
+        p.sid = "viejo"
+        p.on_send("hola otra vez")
+        check(spin(lambda: "caducó" in p.hist.get("1.0", "end") and "Importo la geometría" in p.hist.get("1.0", "end") and not p.runner.busy, 15),
+              "sesión caducada: empieza conversación nueva y reenvía el mensaje")
+        t = p.hist.get("1.0", "end")
+        check(t.count("hola otra vez") == 1 and "terminó con" not in t and p.sid == "fake-0001" and load_sid() == "fake-0001",
+              "sesión caducada: un solo mensaje del usuario, sin error, nueva sesión guardada")
+        os.environ["FAKE_RESUME_MODE"] = "stdout"
+        q3: queue.Queue = queue.Queue()
+        r3 = Runner(q3, trepo)
+        r3.send("x", "viejo")
+        evs3 = []
+        while True:
+            evs3.append(q3.get(timeout=15))
+            if evs3[-1][0] == "done":
+                break
+        k3 = [e[0] for e in evs3]
+        check("session_lost" in k3 and "result" not in k3 and "error" not in k3, f"sesión caducada avisada por stdout (result de error): {k3}")
+        os.environ.pop("FAKE_RESUME_MODE")
+        os.environ["PANEL_CLAUDE_BIN"] = str(REPO / "tests" / "fake_claude.py")
+        os.environ["FAKE_PAUSE"] = "0.4"
+
     t0 = time.time()
     tmp = Path(tempfile.mkdtemp(prefix="panel-selftest-"))
     ESTADO = tmp / ".estado.json"
+    # mcp_server falso: `--cli <herramienta> [json]` -> JSON por stdout (el real lo añade el constructor A4)
+    fake_mcp = tmp / "fake_mcp_server.py"
+    fake_mcp.write_text(
+        "import json, os, sys, time\n"
+        "a = sys.argv; i = a.index('--cli'); tool = a[i + 1]; args = json.loads(a[i + 2]) if len(a) > i + 2 else {}\n"
+        "open(os.environ['FAKE_CLI_LOG'], 'a').write(tool + ' ' + json.dumps(args) + '\\n')\n"
+        "if tool == 'server_stop':\n"
+        "    time.sleep(0.4); p = os.environ.get('FAKE_STOP_REMOVE')\n"
+        "    if p and os.path.exists(p): os.unlink(p)\n"
+        "    print(json.dumps({'ok': True, 'msg': 'solver apagado (falso)'}))\n"
+        "elif tool == 'gui_attach': print(json.dumps({'ok': True, 'msg': 'GUI conectada (falsa)'}))\n"
+        "elif tool == 'cancel': print(json.dumps({'ok': True, 'cancelado': True}))\n"
+        "elif tool == 'server_status': print(json.dumps({'ok': True, 'solver': False, 'caso': None}))\n"
+        "else: print(json.dumps({'error': 'herramienta desconocida'})); sys.exit(2)\n", encoding="utf-8")
+    os.environ["PANEL_MCP_SERVER"] = str(fake_mcp)
+    os.environ["FAKE_CLI_LOG"] = str(tmp / "cli.log")
+    os.environ.pop("FAKE_STOP_REMOVE", None)
+    fake_resume = tmp / "fake_claude_resume.py"  # como la CLI con --resume de una sesión caducada; sin --resume, la falsa normal
+    fake_resume.write_text(
+        "import os, runpy, sys\n"
+        "if '--resume' in sys.argv:\n"
+        "    if os.environ.get('FAKE_RESUME_MODE') == 'stdout':\n"
+        "        print('{\"type\": \"result\", \"subtype\": \"error_during_execution\", \"is_error\": true, \"session_id\": \"x\", "
+        "\"result\": \"No conversation found with session ID: viejo\"}', flush=True)\n"
+        "    else:\n"
+        "        sys.stderr.write('No conversation found with session ID: viejo\\n')\n"
+        "    sys.exit(1)\n"
+        f"runpy.run_path(r'{REPO / 'tests' / 'fake_claude.py'}', run_name='__main__')\n", encoding="utf-8")
     os.environ["PANEL_CLAUDE_BIN"] = str(REPO / "tests" / "fake_claude.py")
     os.environ["FAKE_PAUSE"] = "0.1"
 
@@ -987,11 +1559,12 @@ def selftest():
         sj = tmp_sd / ".server.json"
         sj.write_text(json.dumps({"pid": os.getpid(), "sim": "C:/x/Nueva.sim", "gui": False, "idle_warning": {"msg": "40 min sin actividad: ¿apagar?"}}))
         p.refresh()
-        check(p.warn.winfo_manager() == "pack" and "40 min sin actividad" in p.warn.cget("text") and "GUI no conectada" in p.status.cget("text"),
+        check(p.warn.winfo_manager() == "pack" and "40 min sin actividad" in p.warn.cget("text") and "GUI no conectada" in p.chip["gui"].cget("text"),
               "ventana: idle_warning en banda ámbar y «GUI no conectada»")
         sj.write_text(json.dumps({"pid": os.getpid(), "sim": "C:/x/Nueva.sim", "gui": True}))
         p.refresh()
-        check(p.warn.winfo_manager() == "" and "GUI conectada" in p.status.cget("text"), "ventana: sin aviso la banda se oculta; GUI conectada")
+        check(p.warn.winfo_manager() == "" and "GUI conectada" in p.chip["gui"].cget("text"), "ventana: sin aviso la banda se oculta; GUI conectada")
+        run_new_checks(p, root, spin, trepo, tmp, tmp_sd, sj)
         # Detener: avisa si el solver sigue vivo con una macro en curso
         check(stop_warning(trepo, tmp_sd) is None, "tras Detener sin macro en curso: sin aviso")
         lock = tmp_sd / ".inject.lock"
@@ -1012,8 +1585,10 @@ def selftest():
         p.dlg_btn["si"].invoke()
         check(spin(lambda: "no se apagó a tiempo" in p.hist.get("1.0", "end"), 10) and not p.closed and not p.closing,
               "Sí con solver que no se apaga: espera el máximo y no cierra a ciegas")
-        spin(lambda: not p.runner.busy and not p.pending, 10)
-        check("Apagando el solver antes de salir" in p.hist.get("1.0", "end") and p.last_msg == MSG_APAGAR, "Sí manda server_stop por el chat")
+        spin(lambda: not p.cli_active, 10)
+        log = Path(os.environ["FAKE_CLI_LOG"]).read_text(encoding="utf-8")
+        check("Apagando el solver antes de salir" in p.hist.get("1.0", "end") and "server_stop" in log and p.last_msg != "Guarda y apaga el solver",
+              "Sí llama a `mcp_server.py --cli server_stop` directo (sin turno de modelo)")
         root2 = tk.Tk()  # No: cierra sin apagar
         root2.withdraw()
         p2 = Panel(root2, repo=trepo, sdir=tmp_sd)
@@ -1021,7 +1596,7 @@ def selftest():
         p2.dlg_btn["no"].invoke()
         check(p2.closed, "No: cierra sin apagar el solver")
         p.close_timeout = 20.0  # Sí con apagado real (el .server.json desaparece al segundo)
-        threading.Timer(1.0, lambda: sj.unlink()).start()
+        os.environ["FAKE_STOP_REMOVE"] = str(sj)  # el falso server_stop borra .server.json
         p.on_close()
         p.dlg_btn["si"].invoke()
         t_si = time.time()
