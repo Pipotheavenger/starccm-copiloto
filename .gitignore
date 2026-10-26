@@ -9,3 +9,4 @@ casos/*/
 .server.json
 .inject.lock
 .mcp.json
+panel/.estado.json

@@ -4,7 +4,8 @@ import json
 import sys
 import time
 
-pause = float(sys.argv[sys.argv.index("--fake-pause") + 1]) if "--fake-pause" in sys.argv else 0.6
+import os
+pause = float(sys.argv[sys.argv.index("--fake-pause") + 1]) if "--fake-pause" in sys.argv else float(os.environ.get("FAKE_PAUSE", "0.6"))
 
 
 def out(o):

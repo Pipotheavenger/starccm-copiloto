@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "starccm": {
+      "command": "C:\\Users\\sebas\\OneDrive\\Documentos\\starccm-copiloto\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\Users\\sebas\\OneDrive\\Documentos\\starccm-copiloto\\mcp_server.py"]
+    }
+  }
+}

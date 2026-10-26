@@ -1,0 +1,1949 @@
+"""MCP para operar Simcenter STAR-CCM+ (2410, Windows) desde Claude Code y desde el panel de chat.
+
+Arquitectura: UN servidor de STAR-CCM+ vivo con el .sim en memoria (starccm+ -server -port P). Cada
+tool inyecta una macro Java con un cliente batch (`starccm+ -host localhost:P -batch M.java -noexit`)
+y lee lo que la macro imprimió con sim.println entre los marcadores AGENT_BEGIN/AGENT_END.
+El usuario puede mirar con la GUI real (`gui_attach`: starccm+ -host localhost:P, sin licencia propia).
+No se recarga el .sim entre pasos. Claude nunca resuelve física a mano: STAR-CCM+ es el solver.
+
+Tools (15): server_start, server_stop, server_status, gui_attach, gui_status, inspect, run_java, run_steps,
+iterate, pump_case, export_scene, save, recipe_search, recipe_save, docs_search.
+
+Turnos: toda inyección toma el candado de archivo `.inject.lock` (pid, herramienta, inicio). Si otro proceso
+vivo lo tiene, se espera `wait_s` y si no se devuelve {"ok": false, "busy": "..."}. Huérfano (pid muerto o sin
+latido en 2 h) se limpia solo.
+
+Uso:   python mcp_server.py            (stdio, lo lanza Claude Code desde .mcp.json)
+       python mcp_server.py --selftest (starccm+ falso de tests/, sin licencia ni solver, < 30 s)
+
+Env (se leen también de .env en la raíz del repo y de ~/.starccm-agent.env, formato KEY=VALUE):
+  STARCCM_HOME     carpeta STAR-CCM+<ver> (default: la más nueva en C:\\Program Files\\Siemens)
+  STARCCM_EXE      lanzador (default: $STARCCM_HOME/star/bin/starccm+.bat; un .py = falso de pruebas)
+  STARCCM_PODKEY   clave Power-on-Demand. NUNCA en código, recetas, logs ni commits (_redact la borra de toda salida).
+  STARCCM_LICPATH  servidor de licencias (default 1999@flex.cd-adapco.com)
+  STARCCM_PORT     puerto del servidor (default 47827)
+  STARCCM_NP       procesos paralelos (default: núcleos - 2)
+  STARCCM_IDLE_MIN minutos sin tools antes de guardar y apagar (default 30; PoD cobra por hora).
+                   Con GUI conectada NO apaga: deja `idle_warning` en .server.json.
+  STARCCM_LOCK_WAIT_S segundos que una tool espera el turno (default 120)
+  STARCCM_PRECOMPILE 1 (default) compila la macro con el javac del JDK de STAR-CCM+ antes de
+                   inyectarla: un error de sintaxis o de nombre de clase vuelve en 2 s sin tocar
+                   el servidor. 0 para saltarlo.
+
+Carpetas (en la raíz del repo): sims/ (.sim de trabajo, nunca el original del usuario), macros/ (cada macro
+inyectada, con su salida .out), casos/<caso>/ (cad, reportes, imágenes, RESUMEN.md), conocimiento/recetas/
+(snippets Java que funcionaron), pipelines/ (guiones fijos). Estado del servidor en .server.json.
+"""
+from __future__ import annotations
+
+import functools
+import glob
+import html
+import importlib.util
+import json
+import math
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SIMS = HERE / "sims"
+MACROS = HERE / "macros"
+CASES = HERE / "casos"
+RECIPES = HERE / "conocimiento" / "recetas"
+PIPELINE_BOMBA = HERE / "pipelines" / "bomba.py"
+STATE_FILE = HERE / ".server.json"
+LOCK_FILE = HERE / ".inject.lock"
+AGENT_LOG = HERE / "agent.log"
+KEEP_MACROS = 200
+
+
+# ----------------------------------------------------------------------------- configuración
+def _load_env_files() -> None:
+    """KEY=VALUE de .env (raíz del repo) y ~/.starccm-agent.env; el entorno real manda."""
+    for p in (HERE / ".env", Path.home() / ".starccm-agent.env"):
+        if not p.is_file():
+            continue
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip().removeprefix("export ").strip()
+            v = v.strip().strip('"').strip("'")
+            os.environ.setdefault(k, v)
+
+
+_load_env_files()
+
+
+def _find_home() -> Path | None:
+    env = os.environ.get("STARCCM_HOME")
+    if env:
+        return Path(env)
+    hits = sorted(glob.glob(r"C:\Program Files\Siemens\*\STAR-CCM+*"))
+    return Path(hits[-1]) if hits else None
+
+
+HOME = _find_home()
+EXE = os.environ.get("STARCCM_EXE") or (str(HOME / "star" / "bin" / "starccm+.bat") if HOME else "starccm+")
+PORT = int(os.environ.get("STARCCM_PORT", "47827"))
+NP = int(os.environ.get("STARCCM_NP", str(max(1, (os.cpu_count() or 2) - 2))))
+IDLE_MIN = float(os.environ.get("STARCCM_IDLE_MIN", "30"))
+LICPATH = os.environ.get("STARCCM_LICPATH", "1999@flex.cd-adapco.com")
+PRECOMPILE = os.environ.get("STARCCM_PRECOMPILE", "1") == "1"
+LOCK_WAIT = float(os.environ.get("STARCCM_LOCK_WAIT_S", "120"))
+DOC_DIR = (HOME / "doc" / "client" / "html") if HOME else None
+
+
+def _starccm_cmd() -> list[str]:
+    """Comando base. Un STARCCM_EXE .py es el falso de pruebas (python -I)."""
+    if EXE.lower().endswith(".py"):
+        return [sys.executable, "-I", EXE]
+    return [EXE]
+
+
+def _lic_flags() -> list[str]:
+    key = os.environ.get("STARCCM_PODKEY", "")
+    return ["-power", "-podkey", key, "-licpath", LICPATH] if key else []
+
+
+def _redact(s: str) -> str:
+    key = os.environ.get("STARCCM_PODKEY", "")
+    return s.replace(key, "***PODKEY***") if key and isinstance(s, str) else s
+
+
+def _scrub(o):
+    """_redact en todas las cadenas de un resultado (dict/list anidados): nada con la clave sale de una tool."""
+    if isinstance(o, str):
+        return _redact(o)
+    if isinstance(o, dict):
+        return {k: _scrub(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_scrub(v) for v in o]
+    return o
+
+
+def _javac() -> tuple[str, str] | None:
+    """(javac, classpath) del JDK que trae STAR-CCM+, o None si no está o el exe es el falso."""
+    if not HOME or not PRECOMPILE or EXE.lower().endswith(".py"):
+        return None
+    jdks = sorted(glob.glob(str(HOME.parent / "jdk" / "*" / "jdk*" / "bin" / "javac.exe")))
+    if not jdks:
+        return None
+    plat = HOME / "star" / "lib" / "java" / "platform"
+    cp = os.pathsep.join(str(plat / d / "*") for d in ("modules/ext", "modules", "core", "lib"))
+    return jdks[-1], cp
+
+
+# ----------------------------------------------------------------------------- estado
+_lock = threading.RLock()
+_last_tool = time.time()
+_proc: subprocess.Popen | None = None
+
+
+def _state() -> dict:
+    """.server.json o {} si no existe. Si existe pero no se puede leer (OneDrive o una escritura a medias lo bloquean
+    un instante), reintenta: un {} falso hace creer que no hay solver (así el selftest de la UI apagó uno real)."""
+    for i in range(20):
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except Exception:  # noqa: BLE001
+            time.sleep(0.05 * (i + 1))
+    return {}
+
+
+def _write_state(d: dict) -> None:
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=1, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    if os.name == "nt":
+        # OpenProcess + WaitForSingleObject: microsegundos (tasklist costaba ~0,19 s por sondeo)
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        h = k32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
+        if not h:
+            return False
+        try:
+            return k32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT: sigue corriendo
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pid_is_ours(pid: int) -> bool:
+    """Evita matar un proceso ajeno si Windows reasignó el PID guardado (el PID es el del .bat/starccm+)."""
+    if os.name != "nt":
+        return True
+    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=30).stdout
+    m = re.match(r'"([^"]+)"', out.strip())
+    return bool(m) and re.search(r"cmd|star|java|python|mpi|ccm|hydra|smpd", m.group(1), re.I) is not None
+
+
+def _port_open(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def _kill_tree(pid: int) -> None:
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)
+    else:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+def alive(st: dict | None = None) -> bool:
+    """¿Servidor vivo (proceso y puerto)? La usan las tools y el panel."""
+    st = _state() if st is None else st
+    return bool(st.get("pid")) and _pid_alive(st["pid"]) and _port_open(st.get("port", 0))
+
+
+def _touch() -> None:
+    """Marca actividad en memoria y en disco (mtime de .server.json): el watchdog de cualquier proceso la ve."""
+    global _last_tool
+    _last_tool = time.time()
+    try:
+        os.utime(STATE_FILE, None)
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------------- turnos entre procesos
+_turn_depth = 0  # re-entrada dentro de este proceso (una tool llama a otras); protegido por _lock
+
+
+def _read_lock() -> tuple[bool, dict | None, float]:
+    """(existe, contenido o None si ilegible, edad en s desde el último latido)."""
+    try:
+        age = time.time() - LOCK_FILE.stat().st_mtime
+    except OSError:
+        return False, None, 0.0
+    try:
+        info = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        return True, (info if isinstance(info, dict) else None), age
+    except Exception:  # noqa: BLE001
+        return True, None, age
+
+
+def _lock_orphan(info: dict | None, age: float) -> bool:
+    """Huérfano: dueño muerto, o sin latido en 2 h (ponytail: una sola macro de >2 h con el dueño vivo se limpiaría)."""
+    if not info:
+        return age > 5  # recién creado y aún sin escribir: no es huérfano; basura vieja sí
+    pid = int(info.get("pid") or 0)
+    if pid == os.getpid():
+        return _turn_depth == 0  # es mío pero no lo estoy usando: resto de un fallo anterior
+    return (not _pid_alive(pid)) or age > 2 * 3600
+
+
+def lock_holder() -> dict | None:
+    """Quién tiene el turno ahora ({pid, tool, start, seconds}) o None. Solo lectura: la usan el panel y server_status."""
+    exists, info, age = _read_lock()
+    if not exists or _lock_orphan(info, age):
+        return None
+    info = info or {}
+    return {"pid": info.get("pid"), "tool": info.get("tool", "?"), "start": info.get("start"),
+            "seconds": round(time.time() - info.get("t", time.time()))}
+
+
+def _acquire(tool: str, wait_s: float) -> dict | None:
+    """Toma .inject.lock (O_EXCL). None si lo logra; si no, el dueño (dict) tras esperar wait_s."""
+    deadline = time.time() + max(0.0, wait_s)
+    while True:
+        try:
+            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError:  # existe (o Windows lo tiene a medio borrar)
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "tool": tool, "start": datetime.now().isoformat(timespec="seconds"),
+                           "t": time.time()}, f)
+            return None
+        exists, info, age = _read_lock()
+        if exists and _lock_orphan(info, age):
+            _log(f"turno: limpio candado huérfano {info}")
+            if _read_lock()[1] == info:  # si cambió, otro proceso ya lo limpió o lo tomó
+                try:
+                    LOCK_FILE.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            continue
+        if time.time() >= deadline:
+            return lock_holder() or {"pid": None, "tool": "?", "seconds": 0}
+        time.sleep(0.2)
+
+
+def _release() -> None:
+    exists, info, _ = _read_lock()
+    if exists and info and info.get("pid") == os.getpid():
+        try:
+            LOCK_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _touch_lock() -> None:
+    """Latido: una macro larga del dueño vivo no se confunde con un huérfano."""
+    try:
+        os.utime(LOCK_FILE, None)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _turn(tool: str, wait_s: float | None = None):
+    """Turno del solver. Rinde None si lo tiene (re-entrante en este proceso) o el dueño actual si sigue ocupado."""
+    global _turn_depth
+    with _lock:
+        if _turn_depth == 0:
+            holder = _acquire(tool, LOCK_WAIT if wait_s is None else wait_s)
+            if holder:
+                yield holder
+                return
+        _turn_depth += 1
+        try:
+            yield None
+        finally:
+            _turn_depth -= 1
+            if _turn_depth == 0:
+                _release()
+
+
+def _busy_msg(h: dict) -> str:
+    return f"el solver lo usa «{h.get('tool')}» (pid {h.get('pid')}) desde hace {h.get('seconds')} s; reintenta luego"
+
+
+def _busy_result(h: dict) -> dict:
+    """Resultado de _inject cuando no hay turno: mismas claves que uno normal, para que los llamadores no cambien."""
+    return {"ok": False, "busy": _busy_msg(h), "holder": h, "stdout": "", "stderr": "", "exception": "ocupado: " + _busy_msg(h),
+            "trace": None, "seconds": 0, "macro": None, "returncode": None}
+
+
+def _busy_only(h: dict) -> dict:
+    return {"ok": False, "busy": _busy_msg(h), "holder": h}
+
+
+# ----------------------------------------------------------------------------- inactividad
+def last_activity() -> float | None:
+    """Última actividad medida en DISCO (la ven todos los procesos: MCP de Claude Code, MCP del chat, panel):
+    la macro más reciente (.java o su .out, que crece en vivo mientras itera) o .server.json."""
+    ts = []
+    if MACROS.is_dir():
+        ts += [p.stat().st_mtime for p in MACROS.glob("Agent_*") if p.is_file()]
+    if STATE_FILE.is_file():
+        ts.append(STATE_FILE.stat().st_mtime)
+    return max(ts) if ts else None
+
+
+STALE_MACRO_H = 24  # una macro «sin terminar» más vieja que esto se da por abandonada (cliente muerto)
+
+
+def _macro_finished(out: Path) -> bool:
+    """La salida de una macro terminada trae AGENT_END, o «--- stderr» si el cliente falló."""
+    try:
+        with open(out, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 20_000))
+            t = f.read().decode("utf-8", "replace")
+    except OSError:
+        return True
+    return "AGENT_END" in t or t.startswith("--- stderr") or "\n--- stderr" in t
+
+
+def macro_running() -> bool:
+    """¿Hay una macro en marcha (en cualquier proceso)? Su .out aún no tiene AGENT_END y su cliente (Agent_*.pid)
+    sigue vivo; sin .pid, solo si el .out es de hace menos de 15 min. Una macro callada (malla de media hora) no
+    escribe en disco: sin esto el watchdog apagaría el solver a mitad de trabajo."""
+    now = time.time()
+    outs = []
+    for o in MACROS.glob("Agent_*.out") if MACROS.is_dir() else []:
+        try:
+            outs.append((o.stat().st_mtime, o))
+        except OSError:
+            pass
+    for mt, o in sorted(outs, reverse=True)[:8]:
+        age = now - mt
+        if age > STALE_MACRO_H * 3600 or _macro_finished(o):
+            continue
+        pf = o.with_suffix(".pid")
+        if pf.is_file():
+            try:
+                if _pid_alive(int(pf.read_text().strip())):
+                    return True
+            except (OSError, ValueError):
+                pass
+        elif age < 900:
+            return True
+    return False
+
+
+def idle_disk_seconds() -> float:
+    """Inactividad medida SOLO en disco (0 con una macro en marcha): lo que ven todos los procesos."""
+    if macro_running():
+        return 0.0
+    return time.time() - (last_activity() or 0)
+
+
+def idle_seconds() -> float:
+    return min(idle_disk_seconds(), time.time() - _last_tool)
+
+
+def _set_warning(st: dict, w: dict | None) -> None:
+    """Escribe/borra idle_warning en .server.json SIN contar como actividad (se restaura el mtime)."""
+    try:
+        s = STATE_FILE.stat()
+    except OSError:
+        return
+    st = dict(st)
+    if w:
+        st["idle_warning"] = w
+    else:
+        st.pop("idle_warning", None)
+    _write_state(st)
+    os.utime(STATE_FILE, ns=(s.st_atime_ns, s.st_mtime_ns))
+
+
+def _idle_stop() -> None:
+    st = _state()
+    if not (st.get("pid") and alive(st)):
+        return
+    idle = idle_seconds()
+    if idle <= IDLE_MIN * 60:
+        if st.get("idle_warning"):
+            _set_warning(st, None)  # hubo actividad: el aviso ya no vale
+        return
+    if _gui()["connected"]:
+        # con la GUI conectada alguien está mirando: no se apaga, se avisa al panel (que pregunta «¿apagar?»)
+        mins = int(idle // 60)
+        if (st.get("idle_warning") or {}).get("idle_min") != mins:
+            _set_warning(st, {"idle_min": mins, "gui": True, "at": datetime.now().isoformat(timespec="seconds"),
+                              "msg": f"solver encendido {mins} min sin actividad: ¿apagar?"})
+        return
+    with _lock:  # si una tool de este proceso tenía el candado, se reevalúa al liberarse
+        if idle_seconds() <= IDLE_MIN * 60:
+            return
+        r = server_stop(save=True)
+        if r.get("save_error") or r.get("busy"):
+            _log(f"watchdog: no apago: {r.get('save_error') or r.get('busy')}")
+
+
+def _idle_watchdog() -> None:
+    """Apagado por inactividad: PoD cobra por hora de sesión. Lo corre el MCP (proceso de larga vida)."""
+    while True:
+        time.sleep(60)
+        try:
+            _idle_stop()
+        except Exception as e:  # noqa: BLE001
+            _log(f"watchdog: {e}")
+
+
+_wd_started = False
+
+
+def start_watchdog() -> None:
+    global _wd_started
+    if not _wd_started:
+        _wd_started = True
+        threading.Thread(target=_idle_watchdog, daemon=True).start()
+
+
+def _log(msg: str) -> None:
+    with open(AGENT_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {_redact(msg)}\n")
+
+
+# ----------------------------------------------------------------------------- GUI conectada
+GUI_TTL = 10.0  # s de caché: listar procesos con PowerShell cuesta ~1,6 s
+_gui_cache: tuple[float, dict] | None = None
+
+
+def _list_procs() -> list[dict]:
+    """Procesos con «-host» en la línea de comandos: [{pid, name, cmd}]. [] si no se puede listar."""
+    try:
+        if os.name == "nt":
+            ps = ("Get-CimInstance Win32_Process -Filter \"CommandLine like '%-host%'\" | "
+                  "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress")
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=30).stdout
+            data = json.loads(out) if out.strip() else []
+            data = [data] if isinstance(data, dict) else data
+            return [{"pid": d["ProcessId"], "name": d.get("Name") or "", "cmd": d.get("CommandLine") or ""} for d in data]
+        out = subprocess.run(["ps", "-eo", "pid=,comm=,args="], capture_output=True, text=True, timeout=15).stdout
+        rows = []
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and "-host" in parts[2]:
+                rows.append({"pid": int(parts[0]), "name": parts[1], "cmd": parts[2]})
+        return rows
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _gui_clients(rows: list[dict], port: int) -> list[int]:
+    """Pids de clientes GUI: starccm+ con «-host …:PORT», sin -batch (cliente de macro) ni -server."""
+    pids = []
+    for r in rows:
+        c = r.get("cmd", "")
+        low = c.lower()
+        if ("starccm" in low and re.search(rf"-host\s+\S+:{port}\b", c) and "-batch" not in low
+                and "-server" not in low and not r.get("name", "").lower().startswith("powershell")):
+            pids.append(r["pid"])
+    return pids
+
+
+def _gui(fresh: bool = False) -> dict:
+    global _gui_cache
+    if not fresh and _gui_cache and time.time() - _gui_cache[0] < GUI_TTL:
+        return _gui_cache[1]
+    port = _state().get("port") or PORT
+    pids = _gui_clients(_list_procs(), port)
+    res = {"connected": bool(pids), "pids": pids, "port": port}
+    _gui_cache = (time.time(), res)
+    return res
+
+
+# ----------------------------------------------------------------------------- macro java
+IMPORTS = [
+    "star.common.*", "star.base.neo.*", "star.base.report.*", "star.meshing.*", "star.flow.*",
+    "star.kwturb.*", "star.vis.*", "star.cadmodeler.*", "star.prismmesher.*", "star.surfacewrapper.*",
+    "star.material.*", "star.segregatedflow.*", "star.turbulence.*", "star.motion.*", "star.metrics.*",
+    "star.resurfacer.*", "star.dualmesher.*",
+    "java.util.*", "java.io.*",
+]
+
+POLL_S = 1.0  # s entre sondeos al arrancar/apagar/esperar la GUI (el selftest lo baja)
+
+
+def _wrap(body: str, imports: str, tag: str) -> str:
+    extra = [i.strip().rstrip(";").removeprefix("import ").strip()
+             for i in imports.replace("\n", ",").split(",") if i.strip()]
+    imps = "\n".join(f"import {i};" for i in IMPORTS + [e for e in extra if e not in IMPORTS])
+    cls = f"Agent_{tag}"
+    return f"""{imps}
+
+public class {cls} extends StarMacro {{
+  public void execute() {{
+    Simulation sim = getActiveSimulation();
+    sim.println("AGENT_BEGIN {tag}");
+    try {{
+{body}
+    }} catch (Exception e) {{
+      StringWriter sw = new StringWriter();
+      e.printStackTrace(new PrintWriter(sw));
+      sim.println("AGENT_ERROR: " + e);
+      sim.println(sw.toString());
+    }}
+    sim.println("AGENT_END {tag}");
+  }}
+}}
+"""
+
+
+def _prune_macros() -> None:
+    files = sorted(MACROS.glob("Agent_*"), key=lambda p: p.stat().st_mtime)
+    for p in files[:-KEEP_MACROS]:
+        p.unlink(missing_ok=True)
+
+
+def _precompile(src: Path) -> str | None:
+    """Compila la macro con javac. Devuelve el texto del error o None si compila (o no hay javac)."""
+    jc = _javac()
+    if not jc:
+        return None
+    out = MACROS / ".classes"
+    out.mkdir(exist_ok=True)
+    r = subprocess.run([jc[0], "-nowarn", "-proc:none", "-cp", jc[1], "-d", str(out), str(src)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    if r.returncode != 0:
+        return (r.stderr or r.stdout)[-3000:]
+    return None
+
+
+def _inject(body: str, imports: str = "", timeout: float = 3600, expect_death: bool = False,
+            wait_s: float | None = None, tool: str = "inyección") -> dict:
+    """Toma el turno, escribe la macro, la ejecuta con el cliente batch contra el servidor y devuelve su salida.
+    Sin turno tras wait_s: {"ok": False, "busy": ...} (con las mismas claves que un resultado normal)."""
+    with _turn(tool, wait_s) as busy:
+        if busy:
+            return _busy_result(busy)
+        return _inject_locked(body, imports, timeout, expect_death)
+
+
+def _inject_locked(body: str, imports: str, timeout: float, expect_death: bool) -> dict:
+    st = _state()
+    if not st.get("pid") or not _pid_alive(st["pid"]):
+        raise RuntimeError("No hay servidor de STAR-CCM+ vivo. Usa server_start primero.")
+    if not _port_open(st.get("port", 0)):
+        raise RuntimeError(f"El proceso del servidor (pid {st['pid']}) sigue pero no responde en el puerto {st.get('port')}: "
+                           "si acaba de arrancar espera; si está colgado, server_stop() lo mata.")
+    _touch_lock()
+    MACROS.mkdir(exist_ok=True)
+    tag = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    src = MACROS / f"Agent_{tag}.java"
+    src.write_text(_wrap(body, imports, tag), encoding="utf-8")
+    t0 = time.time()
+    killed = False
+    err_c = _precompile(src)
+    if err_c:
+        # el .out marca la macro como terminada (no se da por «en marcha»)
+        src.with_suffix(".out").write_text(_redact(f"javac: no compila\n{err_c}\n--- stderr\n"), encoding="utf-8")
+        _touch()
+        return {"ok": False, "stdout": "", "stderr": "", "exception": "javac: no compila",
+                "trace": _redact(err_c), "seconds": round(time.time() - t0, 2), "macro": str(src), "returncode": 1}
+    rc, err, killed, out_file = _inject_local(st, src, timeout)
+    _touch_lock()
+    return _inject_result(st, src, tag, t0, rc, err, killed, out_file, expect_death)
+
+
+def _inject_local(st: dict, src: Path, timeout: float) -> tuple[int, str, bool, Path]:
+    killed = False
+    cmd = _starccm_cmd() + ["-host", f"localhost:{st['port']}", "-batch", str(src), "-noexit"] + _lic_flags()
+    # El stdout del cliente va EN VIVO a <macro>.out (el panel lo sigue mientras itera);
+    # una macro está en marcha mientras su .out no contiene AGENT_END.
+    out_file = src.with_suffix(".out")
+    with open(out_file, "w", encoding="utf-8", errors="replace") as fo:
+        p = subprocess.Popen(cmd, stdout=fo, stderr=subprocess.PIPE, text=True, cwd=str(MACROS),
+                             encoding="utf-8", errors="replace")
+        pidf = src.with_suffix(".pid")  # lo lee macro_running() desde otros procesos
+        pidf.write_text(str(p.pid))
+        try:
+            _, err = p.communicate(timeout=timeout)
+            rc = p.returncode
+        except subprocess.TimeoutExpired:
+            # subprocess.run solo mataba cmd.exe y esperaba al java hijo: se mata el árbol entero
+            if p.poll() is None:
+                _kill_tree(p.pid)
+            try:
+                _, e2 = p.communicate(timeout=15)
+            except Exception:  # noqa: BLE001
+                e2 = ""
+            rc, err = -1, f"timeout {timeout}s: cliente batch (pid {p.pid}) matado; la salida puede estar incompleta. {e2 or ''}"
+            killed = True
+        finally:
+            pidf.unlink(missing_ok=True)
+    return rc, err, killed, out_file
+
+
+def _inject_result(st: dict, src: Path, tag: str, t0: float, rc: int, err: str, killed: bool, out_file: Path,
+                   expect_death: bool = False) -> dict:
+    out = out_file.read_text(encoding="utf-8", errors="replace")
+    secs = round(time.time() - t0, 2)
+    # Salida de la macro: entre marcadores, del stdout del cliente; si no, del log del servidor.
+    text = _between(out, tag)
+    if text is None:
+        text = _between(_tail_log(st), tag)
+    err_match = re.search(r"AGENT_ERROR: (.*)", text or out)
+    # sin AGENT_END el .out se cierra con «--- stderr» (así macro_running() lo da por terminado)
+    out_file.write_text(_redact(out + ("\n--- stderr\n" + err if (err or text is None) else "")), encoding="utf-8")
+    _prune_macros()
+    _touch()
+    died = text is None and not killed and not expect_death and not alive(st)
+    if died:
+        _log(f"servidor {st.get('pid')} murió durante la macro {src.name} (rc {rc})")
+    return {
+        "ok": rc == 0 and not err_match and text is not None,
+        "stdout": _redact(text) if text is not None else _redact(out[-4000:]),
+        "stderr": _redact(err[-2000:]) if err else "",
+        "exception": _redact(err_match.group(1).strip()) if err_match else (
+            "El servidor de STAR-CCM+ murió o dejó de responder durante la macro; lo no guardado se perdió. "
+            "Relánzalo con server_start()." if died else None),
+        "trace": _redact(_trace(text)) if err_match else (_redact(_tail_log(st, 3000)) if died else None),
+        "seconds": secs,
+        "macro": str(src),
+        "returncode": rc,
+        **({"client_killed": True} if killed else {}),
+        **({"server_died": True} if died else {}),
+    }
+
+
+def _between(out: str, tag: str) -> str | None:
+    m = re.search(rf"AGENT_BEGIN {tag}\r?\n(.*?)AGENT_END {tag}", out or "", re.S)
+    return m.group(1).strip() if m else None
+
+
+def _trace(text: str) -> str:
+    m = re.search(r"AGENT_ERROR: .*?\n(.*)", text or "", re.S)
+    return (m.group(1).strip()[:3000]) if m else ""
+
+
+def _tail_log(st: dict, n: int = 200_000) -> str:
+    p = Path(st.get("log") or "")
+    if not p.is_file():
+        return ""
+    with open(p, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - n))
+        return f.read().decode("utf-8", "replace")
+
+
+# ----------------------------------------------------------------------------- MCP
+try:
+    from mcp.server.fastmcp import FastMCP  # mcp 1.x
+except ImportError:  # mcp 2.x
+    from mcp.server.mcpserver import MCPServer as FastMCP  # type: ignore
+
+mcp = FastMCP("starccm")
+
+
+def _tool(fn):
+    """Registra la tool en el MCP; todo lo que devuelve pasa por _scrub (la clave PoD nunca sale)."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        return _scrub(fn(*a, **k))
+    mcp.tool()(wrapper)
+    return wrapper
+
+
+_INIT_AUTOSAVE = ("AutoSave as = sim.getSimulationIterator().getAutoSave();\n"
+                  "as.setAutoSaveBatch(false); as.setAutoSaveMesh(false);\n"
+                  'sim.println("INIT autosave off");\n')
+
+
+def _run_init(st: dict) -> None:
+    """Primera macro tras arrancar: apaga el autoguardado en batch (en 2410 viene activo y deja <sim>@meshed.sim y
+    @NNNNN.sim, gigas en una bomba). Su resultado queda en st["init"]; no tumba el arranque."""
+    try:
+        st["init"] = _inject(_INIT_AUTOSAVE, timeout=600, tool="server_start")["stdout"][-200:]
+    except Exception as e:  # noqa: BLE001
+        st["init"] = f"init falló: {e}"
+    _write_state(st)
+
+
+def _save_macro(sp: str) -> str:
+    """Java que guarda el .sim en `sp` (ya escapado con _jstr) y lo anuncia."""
+    return f'sim.saveState("{sp}");\nsim.println("SAVED " + "{sp}");\n'
+
+
+def _try_save(sp: str) -> tuple[bool, str | None]:
+    """El guardado va en su propia macro: si falla, el servidor sigue vivo y el trabajo no se pierde."""
+    try:
+        r = _inject(_save_macro(sp), timeout=1800, tool="save")
+        return bool(r["ok"] and "SAVED" in (r["stdout"] or "")), r.get("exception") or r.get("stderr") or r.get("stdout")
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+def _save_failed(err) -> dict:
+    _log(f"server_stop: guardado falló, servidor sigue vivo: {err}")
+    return {"stopped": False, "saved": None, "save_error": str(err)[:500],
+            "reason": "no se pudo guardar; el servidor sigue vivo (save=False apaga sin guardar)"}
+
+
+@_tool
+def server_start(sim_path: str = "", name: str = "") -> dict:
+    """Levanta el servidor de STAR-CCM+ (o reutiliza el vivo). sim_path: .sim a abrir; se copia a
+    sims/<name>.sim y se trabaja sobre la copia, nunca sobre el original. Vacío = simulación nueva.
+    Devuelve host:port, pid, sim y segundos de arranque. Un solo servidor a la vez."""
+    with _lock:
+        _touch()
+        # un nombre con separadores, comillas o espacios no puede ser el de un archivo ni ir a un literal Java
+        name = re.sub(r'[\\/:*?"<>|\s]+', "_", name.strip()).strip("._") if name else ""
+        st = _state()
+        if st.get("pid") and alive(st):
+            want = (name or (Path(sim_path).stem if sim_path else "")).strip()
+            have = Path(st["sim"]).stem if st.get("sim") else ""
+            if want and want != have:  # otro caso cargado: no trabajar sobre la simulación equivocada
+                raise RuntimeError(f"Hay un servidor vivo con otro .sim cargado ({have or 'sin .sim'}). "
+                                   f"Guarda y apágalo con server_stop() antes de abrir {want}.")
+            return {"reused": True, **st}
+        if st.get("pid"):
+            if _pid_alive(st["pid"]) and _pid_is_ours(st["pid"]):
+                # proceso vivo con el puerto cerrado: otro proceso (panel o chat) lo está arrancando, o está colgado
+                try:
+                    age = (datetime.now() - datetime.fromisoformat(st["started"])).total_seconds()
+                except (KeyError, ValueError, TypeError):
+                    age = 1e9
+                if age < 600:
+                    raise RuntimeError(f"Otro proceso está arrancando el servidor (pid {st['pid']}, hace {age:.0f} s): "
+                                       "espera a que abra el puerto y vuelve a llamar a server_start.")
+                _log(f"servidor {st['pid']} colgado (puerto cerrado tras {age:.0f} s); lo mato")
+                _kill_tree(st["pid"])
+            _log(f"servidor {st.get('pid')} muerto; limpio .server.json")
+            STATE_FILE.unlink(missing_ok=True)
+        if not EXE.lower().endswith(".py") and not (Path(EXE).is_file() or shutil.which(EXE)):
+            raise RuntimeError(f"No encuentro el lanzador de STAR-CCM+ ({EXE}); define STARCCM_HOME o STARCCM_EXE en .env")
+        if _port_open(PORT):  # antes de copiar el .sim (158 MB): no se copia para nada
+            raise RuntimeError(f"Puerto {PORT} ocupado por otro proceso (¿un solver huérfano? mira `netstat -ano | findstr :{PORT}`); "
+                               "cambia STARCCM_PORT o libéralo.")
+        SIMS.mkdir(exist_ok=True)
+        sim = None
+        if sim_path:
+            srcp = Path(sim_path)
+            if not srcp.is_file():
+                raise FileNotFoundError(f"No existe {sim_path}")
+            dst = SIMS / f"{name or srcp.stem}.sim"
+            if srcp.resolve() != dst.resolve():
+                shutil.copy2(srcp, dst)
+            sim = dst
+        elif name:
+            sim = SIMS / f"{name}.sim"  # se creará con save()
+        log = SIMS / f"{(sim.stem if sim else 'nuevo')}.server.log"
+        cmd = _starccm_cmd() + ["-server", "-port", str(PORT), "-np", str(NP)] + _lic_flags()
+        if sim and sim.is_file():
+            cmd += ["-load", str(sim)]
+        t0 = time.time()
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        global _proc
+        with open(log, "ab") as logf:  # el hijo hereda el manejador: aquí se puede cerrar
+            _proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=str(SIMS), creationflags=flags)
+        st = {"pid": _proc.pid, "port": PORT, "host": "localhost", "sim": str(sim) if sim else None,
+              "log": str(log), "started": datetime.now().isoformat(timespec="seconds"), "np": NP,
+              "cmd": _redact(" ".join(cmd))}
+        _write_state(st)
+        deadline = t0 + 600
+        while time.time() < deadline:
+            if _proc.poll() is not None:
+                tail = _redact(_tail_log(st, 6000))
+                STATE_FILE.unlink(missing_ok=True)
+                hint = "\nFalta STARCCM_PODKEY en .env (sin clave pide licencia a flex y aborta)." if not os.environ.get("STARCCM_PODKEY") else ""
+                raise RuntimeError(f"El servidor terminó con código {_proc.returncode} a los "
+                                   f"{time.time()-t0:.0f}s. Cola del log:\n{tail[-3000:]}{hint}")
+            if _port_open(PORT) and "Server::start" in _tail_log(st, 20000):
+                break
+            time.sleep(POLL_S)
+        else:
+            _kill_tree(_proc.pid)
+            STATE_FILE.unlink(missing_ok=True)
+            raise RuntimeError("El servidor no abrió el puerto en 600 s")
+        st["startup_seconds"] = round(time.time() - t0, 1)
+        _write_state(st)
+        _run_init(st)  # (Simulation no tiene setPresentationName: el nombre lo da save())
+        if not alive(st):
+            raise RuntimeError(f"El servidor murió justo al arrancar ({st.get('init')}). Cola del log:\n{_redact(_tail_log(st, 3000))}")
+        _log(f"servidor pid={st['pid']} puerto={PORT} sim={sim} en {st['startup_seconds']}s; {st['init']}")
+        return st
+
+
+@_tool
+def server_stop(save: bool = True) -> dict:
+    """Guarda (si save) y apaga el servidor. Limpia .server.json. Si hay GUI conectada AVISA (gui_warning) pero apaga:
+    pregunta antes al usuario."""
+    with _turn("server_stop") as busy:
+        if busy:
+            return {"stopped": False, **_busy_only(busy)}
+        _touch()
+        st = _state()
+        if not st.get("pid"):
+            return {"stopped": False, "reason": "no había servidor"}
+        result = {"stopped": True, "saved": None}
+        if _pid_alive(st["pid"]) and _port_open(st["port"]):
+            g = _gui()
+            if g["connected"]:
+                result["gui_warning"] = (f"había GUI conectada (pid {g['pids']}): al apagar el servidor la GUI se desconecta; "
+                                         "el usuario debe elegir «desconectar»")
+            if save:  # sin .sim registrado (simulación nueva sin nombre) se guarda aparte: apagar no pierde el trabajo
+                sim = st.get("sim") or str(SIMS / f"nuevo_{datetime.now():%Y%m%d_%H%M%S}.sim")
+                ok, err = _try_save(_jstr(_jpath(sim)))
+                if not ok:
+                    return {**_save_failed(err), **({"gui_warning": result["gui_warning"]} if "gui_warning" in result else {})}
+                result["saved"] = sim
+                if (cp := mirror_sim(sim)):
+                    result["copia"] = cp
+            try:
+                r = _inject("sim.kill();\n", timeout=1800, expect_death=True, tool="server_stop")
+                result["stdout"] = r["stdout"]
+            except Exception as e:  # noqa: BLE001
+                result["kill_error"] = str(e)
+            for _ in range(60):
+                if not _pid_alive(st["pid"]):
+                    break
+                time.sleep(POLL_S)
+        if _pid_alive(st["pid"]):
+            if _pid_is_ours(st["pid"]):
+                _kill_tree(st["pid"])
+                result["forced"] = True
+            else:  # PID reasignado a otro proceso: no se toca, solo se limpia el estado
+                result["pid_reused"] = True
+        STATE_FILE.unlink(missing_ok=True)
+        _log(f"servidor {st['pid']} apagado {result}")
+        return result
+
+
+@_tool
+def server_status() -> dict:
+    """Estado del servidor: pid, puerto, sim, vivo o no, minutos de inactividad, GUI conectada, turno (quién tiene
+    el solver) e idle_warning si lo hay."""
+    st = _state()
+    a = alive(st)
+    out = {"alive": a, "idle_min": round(idle_seconds() / 60, 1), "turno": lock_holder(), **st}
+    if a:
+        g = _gui()
+        out["gui"] = g["connected"]
+        out["gui_pids"] = g["pids"]
+    return out
+
+
+@_tool
+def gui_status() -> dict:
+    """¿Hay una GUI de STAR-CCM+ conectada al servidor? (proceso starccm+ con -host localhost:PORT y sin -batch)."""
+    st = _state()
+    return {**_gui(fresh=True), "server_alive": alive(st)}
+
+
+@_tool
+def gui_attach(wait_s: int = 0) -> dict:
+    """Abre la GUI real de STAR-CCM+ conectada al servidor vivo (starccm+ -host localhost:PORT, proceso separado,
+    sin -podkey ni licencia propia). El árbol y el panel Output muestran lo que hace el agente. Nunca cierra una GUI.
+    wait_s: segundos que espera a verla conectada (la GUI tarda ~30 s en abrir)."""
+    st = _state()
+    if not alive(st):
+        return {"ok": False, "error": "no hay servidor vivo: usa server_start primero"}
+    g = _gui(fresh=True)
+    if g["connected"]:
+        return {"ok": True, "already": True, **g}
+    cmd = _starccm_cmd() + ["-host", f"localhost:{st['port']}"]  # sin _lic_flags(): la GUI no reserva licencia
+    flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
+    SIMS.mkdir(exist_ok=True)
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         cwd=str(SIMS), creationflags=flags, close_fds=True, start_new_session=(os.name != "nt"))
+    _log(f"gui_attach: lanzada pid {p.pid}: {_redact(' '.join(cmd))}")
+    deadline = time.time() + max(0, wait_s)
+    g = {"connected": False, "pids": []}
+    while time.time() < deadline:
+        time.sleep(POLL_S)
+        g = _gui(fresh=True)
+        if g["connected"]:
+            break
+    return {"ok": True, "launched": p.pid, "connected": g["connected"], "pids": g["pids"],
+            "note": "" if g["connected"] else "la GUI tarda ~30 s en conectar; confirma con gui_status()"}
+
+
+def _jpath(p: str | os.PathLike) -> str:
+    return str(p).replace("\\", "/")
+
+
+def _jstr(s: str) -> str:
+    """Escapa texto para un literal Java entre comillas (no se puede cerrar el string ni meter saltos)."""
+    return str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+
+
+@_tool
+def run_java(body: str, imports: str = "", timeout_s: int = 3600, wait_s: int = -1) -> dict:
+    """Ejecuta el cuerpo de execute() en el servidor. `sim` (Simulation) ya existe. Lo que se imprime
+    con sim.println vuelve en stdout. imports: extra separados por coma (p.ej. "star.energy.*").
+    Si falla, devuelve exception y trace. Si otro proceso tiene el turno del solver: espera wait_s (-1 = el
+    default, 120 s) y devuelve {"ok": false, "busy": ...}. Antes de inventar Java: recipe_search y docs_search."""
+    return _inject(body, imports, timeout=timeout_s, wait_s=None if wait_s < 0 else wait_s, tool="run_java")
+
+
+# ----------------------------------------------------------------------------- run_steps
+def _jval(v) -> str:
+    return ("true" if v else "false") if isinstance(v, bool) else str(v)
+
+
+def _subst(body: str, params: dict) -> str:
+    """Sustituye ${nombre} SOLO para las claves de params (las expresiones de STAR-CCM+ también usan ${Flujo},
+    ${HReport}…: esas no se tocan). Los valores van tal cual: un texto para un literal Java va ya escapado."""
+    for k, v in (params or {}).items():
+        body = body.replace("${" + str(k) + "}", _jval(v))
+    return body
+
+
+def _recipe_file(name: str) -> Path | None:
+    stem = _safe(name.removesuffix(".java"))
+    for cand in (stem, stem.lower()):
+        p = RECIPES / f"{cand}.java"
+        if p.is_file():
+            return p
+    return None
+
+
+def _build_steps(steps: list, stop_on_error: bool) -> tuple[str, list[str], list[str], str | None]:
+    """(cuerpo Java, etiquetas, avisos, error). Cada paso va en su bloque y su try/catch con STEP_BEGIN/STEP_END."""
+    if not isinstance(steps, list) or not steps:
+        return "", [], [], "steps debe ser una lista no vacía de {recipe, params} o {java}"
+    labels, warns, parts = [], [], ["boolean _stop = false;"]
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict) or ("recipe" in s) == ("java" in s):
+            return "", [], [], f"paso {i}: debe tener exactamente uno de «recipe» o «java»"
+        params = s.get("params") or {}
+        if "recipe" in s:
+            p = _recipe_file(str(s["recipe"]))
+            if not p:
+                return "", [], [], f"paso {i}: no existe la receta «{s['recipe']}» en {RECIPES}"
+            body, label = p.read_text(encoding="utf-8", errors="replace"), p.name
+            if "no verificado" in body.lower():
+                warns.append(f"paso {i}: la receta {p.name} está marcada «no verificado»")
+            m = re.search(r"^//\s*PARAMS:\s*(.+)$", body, re.M)  # parámetros obligatorios declarados en la cabecera
+            need = [x for x in re.split(r"[,\s]+", m.group(1).strip()) if x] if m else []
+            miss = [x for x in need if x not in params]
+            if miss:
+                return "", [], [], f"paso {i} ({p.name}): faltan parámetros {miss}"
+        else:
+            body, label = str(s["java"]), str(s.get("name") or "java")
+        unused = [k for k in params if "${" + str(k) + "}" not in body]
+        if unused:
+            warns.append(f"paso {i} ({label}): parámetros sin uso en el cuerpo: {unused}")
+        body = _subst(body, params)
+        labels.append(label)
+        parts.append(f"""// ---- paso {i}: {label}
+if (_stop) {{ sim.println("STEP_SKIPPED {i}"); }} else {{
+  long _t{i} = System.currentTimeMillis();
+  sim.println("STEP_BEGIN {i}");
+  try {{
+    {{
+{body}
+    }}
+    sim.println("STEP_OK {i}");
+  }} catch (Throwable _e{i}) {{
+    StringWriter _sw{i} = new StringWriter();
+    _e{i}.printStackTrace(new PrintWriter(_sw{i}));
+    sim.println("STEP_ERROR {i}: " + _e{i});
+    sim.println(_sw{i}.toString());
+    _stop = {'true' if stop_on_error else 'false'};
+  }}
+  sim.println("STEP_END {i} " + (System.currentTimeMillis() - _t{i}));
+}}""")
+    return "\n".join(parts), labels, warns, None
+
+
+def _parse_steps(stdout: str, labels: list[str] | None = None) -> list[dict]:
+    """Lee STEP_* de la salida de una macro: [{i, name, ok, skipped, stdout, error, trace, seconds}]."""
+    steps: dict[int, dict] = {}
+    cur = None
+    in_trace = False
+    for line in (stdout or "").splitlines():
+        m = re.match(r"STEP_(BEGIN|OK|ERROR|END|SKIPPED) (\d+)(?::| |$)(.*)", line)
+        if m:
+            kind, i, rest = m.group(1), int(m.group(2)), m.group(3).strip()
+            name = labels[i] if labels and i < len(labels) else f"paso {i}"
+            if kind == "SKIPPED":
+                steps[i] = {"i": i, "name": name, "ok": None, "skipped": True}
+            elif kind == "BEGIN":
+                cur = steps[i] = {"i": i, "name": name, "ok": None, "skipped": False, "stdout": "", "_open": True}
+                in_trace = False
+            elif cur and cur["i"] == i:
+                if kind == "OK":
+                    cur["ok"] = True
+                elif kind == "ERROR":
+                    cur.update(ok=False, error=rest, trace="")
+                    in_trace = True
+                elif kind == "END":
+                    cur["_open"] = False
+                    if cur["ok"] is None:
+                        cur["ok"] = True  # cerró sin STEP_ERROR (los pipelines pueden no imprimir STEP_OK)
+                    if rest.isdigit():
+                        cur["seconds"] = round(int(rest) / 1000, 2)
+                    cur = None
+                    in_trace = False
+            continue
+        if cur is not None:
+            if in_trace:
+                cur["trace"] = (cur["trace"] + "\n" + line).strip()[:2000]
+            else:
+                cur["stdout"] = (cur["stdout"] + "\n" + line).strip()
+    out = []
+    for i in range(max([*steps, len(labels or []) - 1], default=-1) + 1):
+        s = steps.get(i) or {"i": i, "name": labels[i] if labels and i < len(labels) else f"paso {i}", "ok": None,
+                             "skipped": True, "not_run": True}
+        if s.pop("_open", False):
+            s.update(ok=False, error=s.get("error") or "la macro se cortó antes del STEP_END")
+        out.append(s)
+    return out
+
+
+@_tool
+def run_steps(steps: list[dict], stop_on_error: bool = True, timeout_s: int = 3600, imports: str = "",
+              wait_s: int = -1) -> dict:
+    """Varios pasos en UNA macro (ahorra los 8-10 s de arranque del cliente Java por paso). steps = lista de
+    {"recipe": "bomba-regiones", "params": {"rpm": 1450}} o {"java": "cuerpo", "name": "etiqueta", "params": {...}}.
+    En el cuerpo, ${nombre} se sustituye por params[nombre] (solo las claves dadas; ${Flujo} y otras expresiones de
+    STAR-CCM+ quedan intactas; una receta puede exigir parámetros con «// PARAMS: a, b» en su cabecera). Cada paso va
+    en su try/catch y devuelve ok/stdout/error/seconds. stop_on_error: tras un fallo el resto se salta
+    (skipped); False los intenta todos. ponytail: un error de javac no dice qué paso; los pasos comparten un solo
+    método Java (límite de 64 KB de bytecode)."""
+    body, labels, warns, err = _build_steps(steps, stop_on_error)
+    if err:
+        return {"ok": False, "error": err}
+    with _turn("run_steps", None if wait_s < 0 else wait_s) as busy:
+        if busy:
+            return _busy_only(busy)
+        r = _inject(body, imports, timeout=timeout_s, tool="run_steps")
+    res = _parse_steps(r["stdout"], labels)
+    failed = next((s["i"] for s in res if s.get("ok") is False), None)
+    return {"ok": bool(r["ok"]) and failed is None and all(s.get("ok") for s in res if not s.get("skipped")),
+            "steps": res, "failed_at": failed, "seconds": r["seconds"], "macro": r["macro"],
+            **({"warnings": warns} if warns else {}),
+            **({"exception": r["exception"], "trace": r["trace"]} if r["exception"] else {}),
+            **({"stdout": r["stdout"][-1500:]} if not res or all(s.get("not_run") for s in res) else {})}
+
+
+_INSPECT = {
+    "regions": """
+for (Region r : sim.getRegionManager().getRegions()) {
+  sim.println("REGION\\t" + r.getPresentationName() + "\\t" + r.getRegionType().getPresentationName());
+  for (Boundary b : r.getBoundaryManager().getBoundaries())
+    sim.println("BOUNDARY\\t" + r.getPresentationName() + "/" + b.getPresentationName() + "\\t" + b.getBoundaryType().getPresentationName());
+}
+for (Interface i : sim.getInterfaceManager().getObjects())
+  sim.println("INTERFACE\\t" + i.getPresentationName() + "\\t" + i.getClass().getSimpleName());
+""",
+    "physics": """
+for (Continuum c : sim.getContinuumManager().getObjects()) {
+  sim.println("CONTINUUM\\t" + c.getPresentationName() + "\\t" + c.getClass().getSimpleName());
+  if (c instanceof PhysicsContinuum)
+    for (Model m : ((PhysicsContinuum) c).getModelManager().getObjects())
+      sim.println("MODEL\\t" + c.getPresentationName() + "/" + m.getPresentationName() + "\\t" + m.getClass().getSimpleName());
+}
+""",
+    "mesh_ops": """
+for (MeshOperation op : sim.get(MeshOperationManager.class).getObjects())
+  sim.println("MESH_OP\\t" + op.getPresentationName() + "\\t" + op.getClass().getSimpleName());
+""",
+    "parts": """
+for (GeometryPart p : sim.get(SimulationPartManager.class).getParts()) {
+  sim.println("PART\\t" + p.getPresentationName() + "\\t" + p.getClass().getSimpleName());
+  for (PartSurface s : p.getPartSurfaces())
+    sim.println("SURFACE\\t" + p.getPresentationName() + "/" + s.getPresentationName() + "\\t");
+}
+""",
+    "reports": """
+for (Report rep : sim.getReportManager().getObjects()) {
+  String v;
+  try { v = String.valueOf(rep.getReportMonitorValue()); } catch (Exception e) { v = "n/a"; }
+  sim.println("REPORT\\t" + rep.getPresentationName() + "\\t" + rep.getClass().getSimpleName() + "\\t" + v);
+}
+""",
+    "monitors": """
+for (Monitor m : sim.getMonitorManager().getObjects())
+  sim.println("MONITOR\\t" + m.getPresentationName() + "\\t" + m.getClass().getSimpleName());
+""",
+    "scenes": """
+for (Scene s : sim.getSceneManager().getScenes())
+  sim.println("SCENE\\t" + s.getPresentationName() + "\\t");
+""",
+    "solver": """
+sim.println("ITERATION\\t" + sim.getSimulationIterator().getCurrentIteration() + "\\t");
+sim.println("SIM\\t" + sim.getPresentationName() + "\\t" + sim.getSessionPath());
+for (Solver s : sim.getSolverManager().getObjects())
+  sim.println("SOLVER\\t" + s.getPresentationName() + "\\t" + s.getClass().getSimpleName());
+""",
+}
+# Cada sección en su propio try/catch: un gestor ausente (p.ej. MeshOperationManager en una
+# simulación vacía) avisa con WARN y no tumba el resto.
+_INSPECT = {k: "try {\n" + v + "\n} catch (Exception e) { sim.println(\"WARN\\t" + k
+            + "\\t\" + String.valueOf(e.getMessage()).replace('\\n', ' ')); }"
+            for k, v in _INSPECT.items()}
+_INSPECT["tree"] = "\n".join(_INSPECT[k] for k in ("solver", "parts", "regions", "physics", "mesh_ops", "reports", "monitors", "scenes"))
+
+
+
+
+@_tool
+def inspect(path: str = "tree") -> dict:
+    """Lee un nodo del árbol de la simulación: tree (todo), regions, physics, mesh_ops, parts,
+    reports, monitors, scenes, solver. JSON con nombres, tipos y valores principales."""
+    key = (path or "tree").strip().lower()
+    if key not in _INSPECT:
+        return {"error": f"nodo desconocido '{path}'", "nodos": sorted(_INSPECT)}
+    r = _inject(_INSPECT[key], tool="inspect")
+    items: dict[str, list] = {}
+    for line in r["stdout"].splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0].isupper():
+            items.setdefault(parts[0].lower(), []).append(
+                {"name": parts[1], "type": parts[2] if len(parts) > 2 else "",
+                 **({"value": parts[3]} if len(parts) > 3 else {})})
+    return {"ok": r["ok"], "path": key, "seconds": r["seconds"], **items, **_err(r)}
+
+
+def _err(r: dict) -> dict:
+    """Campos de error/ocupado de un resultado de _inject, para copiarlos a la respuesta de una tool."""
+    return {**({"busy": r["busy"]} if r.get("busy") else {}),
+            **({"exception": r["exception"], "trace": r["trace"]} if r.get("exception") else {})}
+
+
+# ----------------------------------------------------------------------------- iterate
+_iter_hist: list[dict] = []  # [{it, vals: {reporte: valor}}] muestras de fin de bloque; se reinicia si cambia el servidor
+_iter_pid = None
+
+
+def _iter_block(k: int, timeout_s: float) -> dict:
+    """Corre k iteraciones y lee reportes y residuales. Devuelve {ok, iteration, reports, residuals, res_rows, ...}."""
+    # Residuales: exportando el plot "Residuals" a CSV (MonitorManager.export falla en batch 2410:
+    # "StarUpdate unexpectedly missing"). Reportes: valor directo de cada Report.
+    csv = MACROS / "residuals.csv"
+    csv.unlink(missing_ok=True)
+    body = f"""
+sim.getSimulationIterator().step({int(k)});
+sim.println("ITERATION " + sim.getSimulationIterator().getCurrentIteration());
+try {{
+  StarPlot rp = sim.getPlotManager().getPlot("Residuals");
+  rp.export("{_jpath(csv)}", ",");
+  sim.println("RESIDUALS_CSV ok");
+}} catch (Exception e) {{ sim.println("RESIDUALS_CSV n/a " + e.getMessage()); }}
+for (Report rep : sim.getReportManager().getObjects()) {{
+  try {{ sim.println("REPORT\\t" + rep.getPresentationName() + "\\t" + rep.getReportMonitorValue()); }}
+  catch (Exception e) {{ sim.println("REPORT\\t" + rep.getPresentationName() + "\\tn/a"); }}
+}}
+"""
+    r = _inject(body, timeout=timeout_s, tool="iterate")
+    out = {"ok": r["ok"], "seconds": r["seconds"], "stdout": r["stdout"], **_err(r)}
+    m = re.search(r"ITERATION (\d+)", r["stdout"])
+    if m:
+        out["iteration"] = int(m.group(1))
+    reports = {}
+    for line in r["stdout"].splitlines():
+        parts = line.split("\t")
+        if parts[0] == "REPORT" and len(parts) == 3:
+            try:
+                reports[parts[1]] = float(parts[2])
+            except ValueError:
+                reports[parts[1]] = parts[2]
+    out["reports"] = reports
+    out["residuals"], out["res_rows"] = None, []
+    if csv.is_file():
+        rows = [ln.split(",") for ln in csv.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+        if len(rows) >= 2:
+            hdr = [h.strip().strip('"') for h in rows[0]]
+            res = {}
+            for h, v in zip(hdr, rows[-1]):
+                try:
+                    res[h] = float(v)
+                except ValueError:
+                    res[h] = v.strip()
+            out["residuals"] = res
+            for idx, row in enumerate(rows[1:], 1):  # (iteración, mayor residual) por fila
+                vals = []
+                for v in row[1:]:
+                    try:
+                        vals.append(abs(float(v)))
+                    except ValueError:
+                        pass
+                try:
+                    it = float(row[0]) if hdr[0].lower().startswith("iter") else idx
+                except ValueError:
+                    it = idx
+                if vals:
+                    out["res_rows"].append((it, max(vals)))
+    return out
+
+
+def _variation(samples: list[float]) -> float:
+    """(máx - mín) / |media| de las muestras."""
+    mean = sum(samples) / len(samples)
+    return (max(samples) - min(samples)) / max(abs(mean), 1e-30)
+
+
+def _judge(hist: list[dict], names: list[str], window: float, tol: float, res_rows: list, plateau_its: float):
+    """('stable'|'plateau'|None, variación por reporte). Estable: cada reporte varía < tol en `window` iteraciones
+    (ponytail: sobre muestras de fin de bloque, no iteración a iteración). Plateau: estable, pero el mayor residual
+    no bajó un 10 % en plateau_its iteraciones."""
+    last = hist[-1]
+    if hist[0]["it"] > last["it"] - window:
+        return None, {}  # aún no hay `window` iteraciones de historia
+    recent = [h for h in hist if h["it"] >= last["it"] - window]
+    var = {n: _variation([h["vals"][n] for h in recent]) for n in names}
+    if any(v >= tol for v in var.values()):
+        return None, var
+    old = [(it, r) for it, r in res_rows if it <= last["it"] - plateau_its]
+    if old and res_rows and res_rows[-1][1] >= 0.9 * old[-1][1]:
+        return "plateau", var
+    return "stable", var
+
+
+def _short(hist: list[dict], n: int = 12) -> list[dict]:
+    pts = hist if len(hist) <= n else [hist[round(i * (len(hist) - 1) / (n - 1))] for i in range(n)]
+    return [{"it": h["it"], **{k: round(v, 6) for k, v in h["vals"].items()}, **({"res": h["res"]} if h.get("res") else {})}
+            for h in pts]
+
+
+@_tool
+def iterate(n: int = 100, until: str = "stable", reports: list[str] = ["H", "M"], window: int = 100,
+            tol: float = 0.005, block: int = 50, timeout_s: int = 7200, plateau_its: int = 300) -> dict:
+    """Corre hasta n iteraciones por bloques de `block`. until="stable": para cuando cada reporte de `reports`
+    (nombres de Report del .sim) varía < tol (0,5 %) en `window` iteraciones; stopped="plateau" si además el mayor
+    residual no bajó un 10 % en plateau_its (300); stopped="max" si llega a n. until="n": un solo bloque de n, sin
+    criterio. Devuelve stopped, iterations_run, iteration, reports y residuals (última fila), variation, history
+    (corta) y segundos. timeout_s es por bloque."""
+    global _iter_hist, _iter_pid
+    n, block = max(1, int(n)), max(1, int(block))
+    with _turn("iterate") as busy:
+        if busy:
+            return _busy_only(busy)
+        pid = _state().get("pid")
+        if pid != _iter_pid:
+            _iter_hist, _iter_pid = [], pid
+        done, t0, blocks, last = 0, time.time(), 0, {}
+        stopped, var, names = "max", {}, list(reports or [])
+        while done < n:
+            k = min(block, n - done) if until == "stable" else n
+            last = _iter_block(k, timeout_s)
+            blocks += 1
+            if not last["ok"] or "iteration" not in last:
+                return {"ok": False, "stopped": "error", "iterations_run": done, "blocks": blocks,
+                        "stdout": last["stdout"][-1500:], **_err(last)}
+            done += k
+            it = last["iteration"]
+            if _iter_hist and it <= _iter_hist[-1]["it"]:
+                _iter_hist = []  # el .sim volvió atrás (otra simulación): historia nueva
+            if until != "stable":
+                break
+            low = {r.lower(): (r, v) for r, v in last["reports"].items()}
+            miss = [x for x in names if x.lower() not in low]
+            bad = [x for x in names if x.lower() in low and not isinstance(low[x.lower()][1], float)]
+            if miss or bad:
+                return {"ok": False, "stopped": "error", "iterations_run": done, "iteration": it, "blocks": blocks,
+                        "error": f"reportes {miss or bad} sin valor; hay {sorted(last['reports'])}. "
+                                 "Pasa reports=[...] con nombres existentes o until='n'",
+                        "reports": last["reports"]}
+            res_rows = last["res_rows"]
+            _iter_hist.append({"it": it, "vals": {x: low[x.lower()][1] for x in names},
+                               "res": res_rows[-1][1] if res_rows else None})
+            reason, var = _judge(_iter_hist, names, window, tol, res_rows, plateau_its)
+            if reason:
+                stopped = reason
+                break
+        out = {"ok": True, "stopped": stopped, "iterations_run": done, "iteration": last.get("iteration"), "blocks": blocks,
+               "seconds": round(time.time() - t0, 1), "reports": last.get("reports", {}),
+               "variation_pct": {k: round(v * 100, 3) for k, v in var.items()}, "history": _short(_iter_hist)}
+        if last.get("residuals"):
+            out["residuals"] = last["residuals"]
+        else:
+            out["stdout"] = last.get("stdout", "")[-1500:]
+        return out
+
+
+# ----------------------------------------------------------------------------- pipeline de bomba
+def _load_pipeline():
+    """Importa pipelines/bomba.py en cada llamada (así una edición se nota sin reiniciar el MCP)."""
+    p = Path(PIPELINE_BOMBA)
+    if not p.is_file():
+        raise FileNotFoundError(f"No existe {p}: el pipeline de bomba (parse_ccm, macro_body) aún no está escrito")
+    spec = importlib.util.spec_from_file_location("pipelines_bomba", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for f in ("parse_ccm", "macro_body"):
+        if not callable(getattr(mod, f, None)):
+            raise AttributeError(f"{p} no define {f}()")
+    return mod
+
+
+@_tool
+def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", params: dict | None = None,
+              timeout_s: int = 3600, dry_run: bool = False) -> dict:
+    """Bomba estándar de CFturbo en UNA macro: importa los STEP de cad_dir y el .cfturbo-ccm (rpm, caudal, eje,
+    nombres), regiones, interfaces, malla (mode "rapida" o "normal"), física, MRF, fronteras y reportes (H, M, eta,
+    Euler), vía pipelines/bomba.py. Arranca el servidor con el nombre del caso si no hay uno. ccm vacío = el
+    *.cfturbo-ccm de cad_dir. params se pasa tal cual al pipeline. dry_run: solo genera la macro y la describe."""
+    if mode not in ("rapida", "normal"):
+        return {"ok": False, "error": f"mode debe ser 'rapida' o 'normal', no '{mode}'"}
+    cad = Path(cad_dir)
+    if not cad.is_dir():
+        return {"ok": False, "error": f"no existe la carpeta de CAD {cad_dir}"}
+    ccm_path = Path(ccm) if ccm else next(iter(sorted(cad.glob("*.cfturbo-ccm")) or sorted(cad.rglob("*.cfturbo-ccm"))), None)
+    if not ccm_path or not ccm_path.is_file():
+        return {"ok": False, "error": f"no encuentro el .cfturbo-ccm (en {cad_dir} o en ccm=)"}
+    try:
+        mod = _load_pipeline()
+        ccm_d = mod.parse_ccm(str(ccm_path))
+        case_dir = CASES / _safe(case)
+        case_dir.mkdir(parents=True, exist_ok=True)
+        body = mod.macro_body(_jpath(case_dir), _jpath(cad), ccm_d, mode, dict(params or {}))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"pipeline de bomba: {type(e).__name__}: {e}"}
+    imports = str(getattr(mod, "IMPORTS", "") or "")
+    info = {"case": case, "mode": mode, "ccm_file": str(ccm_path), "ccm": ccm_d, "macro_chars": len(body)}
+    if dry_run:
+        return {"ok": True, "dry_run": True, **info, "macro_head": body[:600]}
+    with _turn("pump_case") as busy:
+        if busy:
+            return _busy_only(busy)
+        try:
+            server_start(name=case)  # reutiliza el vivo; se niega si hay otro .sim cargado
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)[:1500], **info}
+        r = _inject(body, imports, timeout=timeout_s, tool="pump_case")
+    steps = _parse_steps(r["stdout"])
+    failed = next((s["i"] for s in steps if s.get("ok") is False), None)
+    return {**info, "ok": bool(r["ok"]) and failed is None, "steps": steps, "failed_at": failed, "seconds": r["seconds"],
+            "macro": r["macro"], "stdout": r["stdout"][-3000:], **_err(r)}
+
+
+@_tool
+def export_scene(name: str, path: str = "", width: int = 1600, height: int = 1000) -> dict:
+    """Exporta la escena `name` a PNG. path vacío = casos/_scenes/<name>.png."""
+    out = Path(path) if path else CASES / "_scenes" / f"{_safe(name)}.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    nm, outp = _jstr(name), _jstr(_jpath(out))
+    # createScene("X") puede dejar la escena como "X 1": se acepta nombre exacto o prefijo.
+    body = f"""
+Scene sc = null;
+for (Scene s : sim.getSceneManager().getScenes())
+  if (s.getPresentationName().equals("{nm}")) sc = s;
+if (sc == null)
+  for (Scene s : sim.getSceneManager().getScenes())
+    if (s.getPresentationName().startsWith("{nm}")) {{ sc = s; break; }}
+if (sc == null) throw new RuntimeException("No hay escena '{nm}'");
+sim.println("SCENE " + sc.getPresentationName());
+sc.printAndWait(resolvePath("{outp}"), 1, {int(width)}, {int(height)}, true, false);
+sim.println("PNG " + "{outp}");
+"""
+    r = _inject(body, tool="export_scene")
+    return {"ok": r["ok"] and out.is_file(), "png": str(out), "seconds": r["seconds"], **_err(r)}
+
+
+@_tool
+def save(path: str = "") -> dict:
+    """Guarda el .sim (en sims/ por defecto, o en path). Actualiza .server.json."""
+    st = _state()
+    target = Path(path) if path else (Path(st["sim"]) if st.get("sim") else SIMS / "nuevo.sim")
+    if not target.suffix:
+        target = target.with_suffix(".sim")
+    if not target.is_absolute():
+        target = SIMS / target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _turn("save") as busy:
+        if busy:
+            return {"sim": str(target), **_busy_only(busy)}
+        r = _inject(_save_macro(_jstr(_jpath(target))), timeout=1800, tool="save")
+        if r["ok"]:
+            st["sim"] = str(target)
+            _write_state(st)
+    mirror = mirror_sim(target) if r["ok"] else None
+    return {"ok": r["ok"], "sim": str(target), "seconds": r["seconds"], **({"copia": mirror} if mirror else {}), **_err(r)}
+
+
+def sim_destino(case: str) -> str | None:
+    """Ruta donde el usuario quiere tener el .sim del caso (casos/<caso>/caso.json → sim_destino), o None."""
+    f = CASES / case / "caso.json"
+    try:
+        d = json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {}
+    except ValueError:
+        return None
+    p = d.get("sim_destino") if isinstance(d, dict) else None
+    return p if isinstance(p, str) and p.lower().endswith(".sim") else None
+
+
+def mirror_sim(sim: Path | str) -> dict | None:
+    """Tras cada guardado, copia el .sim de trabajo (sims/<caso>.sim) a la ruta elegida en caso.json. Copia a un
+    temporal y lo renombra: un corte a mitad no deja un .sim roto en el destino."""
+    sim = Path(sim)
+    dest = sim_destino(sim.stem)
+    if not dest or not sim.is_file() or Path(dest).resolve() == sim.resolve():
+        return None
+    d = Path(dest)
+    tmp = d.with_name(d.name + ".copiando")
+    try:
+        d.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sim, tmp)
+        os.replace(tmp, d)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        _log(f"copia del .sim a {d} falló: {e}")
+        return {"ok": False, "dest": str(d), "error": str(e)}
+    _log(f"copia del .sim: {sim} -> {d}")
+    return {"ok": True, "dest": str(d)}
+
+
+def _safe(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_") or "x"
+
+
+# ----------------------------------------------------------------------------- memoria
+@_tool
+def recipe_search(query: str = "") -> list[dict]:
+    """Busca en conocimiento/recetas/ (snippets Java verificados). Devuelve nombre, cabecera y coincidencias.
+    Vacío = lista todas. Úsalas con run_java o run_steps."""
+    _touch()
+    terms = [t.lower() for t in re.findall(r"\w+", query)]
+    hits = []
+    for p in sorted(RECIPES.glob("*.java")) + sorted(RECIPES.glob("*.md")):
+        if p.name.lower() == "readme.md":
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        low = (p.name + "\n" + text).lower()
+        score = sum(low.count(t) for t in terms) if terms else 1
+        if score:
+            head = [ln.strip() for ln in text.splitlines()[:4] if ln.strip()]
+            hits.append({"name": p.name, "score": score, "head": head,
+                         "unverified": "no verificado" in text.lower()})
+    hits.sort(key=lambda h: -h["score"])
+    return hits[:20]
+
+
+@_tool
+def recipe_save(name: str, body: str, note: str = "") -> str:
+    """Guarda un snippet que funcionó como conocimiento/recetas/<verbo>-<objeto>.java con cabecera QUE/VERSION/FECHA.
+    Para que run_steps lo parametrice: ${nombre} en el cuerpo y «// PARAMS: nombre» en la cabecera.
+    Guardar tras CADA run_java que logre algo nuevo."""
+    _touch()
+    RECIPES.mkdir(parents=True, exist_ok=True)
+    fname = _safe(name.removesuffix(".java")).lower() + ".java"
+    header = f"// QUE: {note or name}\n// VERSION: {_version_tag()}\n// FECHA: {datetime.now():%Y-%m-%d}\n"
+    p = RECIPES / fname
+    p.write_text(header + body.rstrip() + "\n", encoding="utf-8")
+    return str(p)
+
+
+def _version_tag() -> str:
+    return HOME.name.replace("STAR-CCM+", "") if HOME else "?"
+
+
+_doc_index: list[tuple[str, Path]] | None = None
+
+
+def _docs() -> list[tuple[str, Path]]:
+    global _doc_index
+    if _doc_index is None:
+        _doc_index = []
+        if DOC_DIR and DOC_DIR.is_dir():
+            for p in DOC_DIR.rglob("*.html"):
+                rel = p.relative_to(DOC_DIR).as_posix()
+                if "/" in rel and "class-use/" not in rel and not p.name.startswith(("index", "overview", "package-")):
+                    _doc_index.append((rel[:-5].replace("/", "."), p))
+    return _doc_index
+
+
+_member_idx: dict[str, list[str]] | None = None
+
+
+def _members() -> dict[str, list[str]]:
+    """clase calificada -> miembros, de member-search-index.js (0,1 s; sustituye al rastreo de las 22 k páginas)."""
+    global _member_idx
+    if _member_idx is None:
+        _member_idx = {}
+        f = DOC_DIR / "member-search-index.js" if DOC_DIR else None
+        if f and f.is_file():
+            txt = f.read_text(encoding="utf-8", errors="replace")
+            for m in json.loads(txt[txt.index("["):txt.rindex("]") + 1]):
+                _member_idx.setdefault(f"{m['p']}.{m['c']}", []).append(m["l"])
+    return _member_idx
+
+
+def _html_text(p: Path) -> str:
+    t = p.read_text(encoding="utf-8", errors="replace")
+    t = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", t, flags=re.S | re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = html.unescape(t)
+    t = re.sub(r"[ \t\xa0]+", " ", t)
+    # firmas con la lista de argumentos partida en varias líneas -> una sola línea
+    return re.sub(r"\(\s*([^()]*?)\s*\)", lambda m: "(" + " ".join(m.group(1).split()) + ")", t, flags=re.S)
+
+
+@_tool
+def docs_search(query: str, max_classes: int = 5) -> dict:
+    """Busca en el javadoc de STAR-CCM+ ($STARCCM_HOME/doc/client/html): clases cuyo nombre
+    coincide y, dentro, las firmas de métodos que contienen los términos. Fuente de verdad de
+    nombres de clases y métodos."""
+    _touch()
+    terms = [t for t in re.findall(r"\w+", query) if len(t) > 1]
+    if not terms:
+        return {"error": "query vacía"}
+    docs = _docs()
+    if not docs:
+        return {"error": f"No encuentro el javadoc en {DOC_DIR}"}
+    low = [t.lower() for t in terms]
+    scored = []
+    for fq, p in docs:
+        name = fq.rsplit(".", 1)[-1].lower()
+        s = sum(3 for t in low if t in name) + sum(1 for t in low if t in fq.lower())
+        if s:
+            scored.append((s, -len(name), fq, p))
+    scored.sort(reverse=True)
+    result = {"query": query, "classes": []}
+    for s, _, fq, p in scored[:max_classes]:
+        text = _html_text(p)
+        sigs = []
+        for line in re.split(r"\n+", text):
+            l = line.strip()
+            if ("(" in l and ")" in l and len(l) < 220 and any(t in l.lower() for t in low)) \
+                    or l.startswith(("public ", "class ", "interface ")):
+                if l not in sigs:
+                    sigs.append(l)
+        result["classes"].append({"class": fq, "file": str(p), "matches": sigs[:25]})
+    if not result["classes"]:
+        # ningún nombre de clase coincide: se busca entre los 146 k miembros del índice del javadoc
+        hits, members = [], {}
+        for fq, ms in _members().items():
+            joined = " ".join(ms).lower()
+            if all(t in joined for t in low):
+                exact = [m for m in ms if all(t in m.lower() for t in low)]
+                hits.append((0 if exact else 1, fq))
+                members[fq] = (exact or ms)[:5]
+        hits.sort()
+        result["content_hits"] = [fq for _, fq in hits[:max_classes]]
+        result["members"] = {fq: members[fq] for fq in result["content_hits"]}
+    return result
+
+
+
+
+# ----------------------------------------------------------------------------- selftest
+_HOLD = ("import json,os,sys,time;p=sys.argv[1];"
+         "open(p,'w').write(json.dumps({'pid':os.getpid(),'tool':'panel_demo','start':'x','t':time.time()}));"
+         "print('HELD',flush=True);time.sleep(float(sys.argv[2]));os.path.exists(p) and os.remove(p)")
+
+_FAKE_BOMBA = '''
+IMPORTS = ""
+def parse_ccm(path):
+    return {"rpm": 1450, "caudal_m3h": 36.0, "nombre": "bomba falsa"}
+def macro_body(case_dir, cad_dir, ccm, mode, params):
+    fail = 'sim.println("AGENT_FAKE_FAIL");' if params.get("fallar") else ""
+    return ('sim.println("STEP_BEGIN 0");\\nsim.println("importado %s %s");\\nsim.println("STEP_END 0");\\n'
+            'sim.println("STEP_BEGIN 1");\\n%s\\nsim.println("regiones listas");\\nsim.println("STEP_END 1");'
+            % (ccm["rpm"], mode, fail))
+'''
+
+
+def _selftest() -> int:
+    global EXE, PORT, SIMS, MACROS, CASES, RECIPES, STATE_FILE, LOCK_FILE, AGENT_LOG, IDLE_MIN, LOCK_WAIT
+    global PIPELINE_BOMBA, GUI_TTL, POLL_S, _inject_local, _gui_cache, _list_procs, _iter_hist, _iter_pid
+    import tempfile
+    t_all = time.time()
+    fake = HERE / "tests" / "fake_starccm.py"
+    os.environ["STARCCM_EXE"] = str(fake)
+    EXE = str(fake)
+    KEY = "FAKEKEY-selftest-9f3a7c"
+    os.environ["STARCCM_PODKEY"] = KEY  # clave de mentira: se comprueba que NUNCA sale; la real no se toca
+    with socket.socket() as sk:  # puerto libre: dos selftests a la vez no se pisan
+        sk.bind(("127.0.0.1", 0))
+        PORT = sk.getsockname()[1]
+    tmp = Path(tempfile.mkdtemp(prefix="starccm-selftest-"))
+    # Todo lo que escribe el falso va al temporal: ni sims/, ni macros/, ni .server.json, ni .inject.lock reales
+    # (un selftest antiguo borró el .server.json de un solver vivo de otra sesión).
+    real_lock = LOCK_FILE
+    real = (SIMS, MACROS, STATE_FILE)
+    _real_files = lambda: {(str(p), p.stat().st_mtime_ns) for d in real for p in ([d] if d.is_file() else d.glob("*") if d.is_dir() else [])}
+    real_before = _real_files()
+    SIMS, MACROS, STATE_FILE, AGENT_LOG = tmp / "sims", tmp / "macros", tmp / ".server.json", tmp / "agent.log"
+    LOCK_FILE, CASES, RECIPES = tmp / ".inject.lock", tmp / "casos", tmp / "recetas"
+    RECIPES.mkdir()
+    (RECIPES / "paso-ok.java").write_text('// QUE: paso de prueba\n// PARAMS: nombre\nsim.println("hola ${nombre} y ${Flujo}");\n', encoding="utf-8")
+    (RECIPES / "paso-falla.java").write_text('sim.println("AGENT_FAKE_FAIL");\nsim.println("no llega");\n', encoding="utf-8")
+    scen = tmp / "scen.txt"
+    os.environ["FAKE_SCEN_FILE"] = str(scen)
+    LOCK_WAIT, POLL_S, GUI_TTL = 0.5, 0.2, 1e9
+    real_list = _list_procs
+    seen_rows: list = []
+    _list_procs = lambda: []  # sin PowerShell salvo en la sección de la GUI
+    fails = []
+    gui_pid = None
+    sleepers = []
+
+    def check(cond, msg):
+        print(f"  {time.time() - t_all:5.1f}s " + ("ok   " if cond else "FAIL ") + msg)
+        if not cond:
+            fails.append(msg)
+
+    def wlock(pid, tool="otro", age_s=0):
+        LOCK_FILE.write_text(json.dumps({"pid": pid, "tool": tool, "start": "x", "t": time.time() - age_s}), encoding="utf-8")
+        if age_s:
+            os.utime(LOCK_FILE, (time.time() - age_s, time.time() - age_s))
+
+    print(f"selftest: starccm+ falso = {fake} · escribe solo en {tmp}")
+    try:
+        r = subprocess.run(_starccm_cmd() + ["-version"], capture_output=True, text=True)
+        check("FAKE" in r.stdout, "-version del falso")
+        st = server_start()
+        check(st.get("pid") and _port_open(PORT), f"server_start -> pid {st.get('pid')} puerto {PORT} en {st.get('startup_seconds')}s")
+        check(KEY not in json.dumps(st) and KEY not in STATE_FILE.read_text(encoding="utf-8"), "la clave PoD no sale de server_start ni de .server.json")
+        st2 = server_start()
+        check(st2.get("reused"), "server_start reutiliza el servidor vivo")
+        r = run_java('sim.println("OK");')
+        check(r["ok"] and r["stdout"].strip() == "OK", f"run_java OK ({r['seconds']}s)")
+        check(not LOCK_FILE.exists(), "el turno se libera al terminar la tool")
+        r = run_java('sim.println("AGENT_FAKE_FAIL");\nsim.println("no llega");')
+        check(not r["ok"] and r["exception"] and "fallo simulado" in r["exception"], "run_java captura excepción")
+        r = inspect("regions")
+        check(r["ok"] and r["path"] == "regions", "inspect(regions) responde")
+        r = inspect("nodo_que_no_existe")
+        check("error" in r, "inspect rechaza nodo desconocido")
+        p = recipe_save("probar-selftest", 'sim.println("hola");', "receta de prueba del selftest")
+        check(Path(p).is_file() and Path(p).parent == RECIPES, "recipe_save (en la carpeta de recetas)")
+        hits = recipe_search("selftest hola")
+        check(any(h["name"] == "probar-selftest.java" for h in hits), "recipe_search encuentra la receta")
+        check(RECIPES.parent == tmp and (HERE / "conocimiento" / "recetas").is_dir(), "las recetas reales viven en conocimiento/recetas")
+        d = docs_search("Simulation saveState")
+        check(("classes" in d and d["classes"]) or "error" in d, "docs_search responde (con o sin javadoc)")
+        if DOC_DIR and DOC_DIR.is_dir():
+            check(any(c["class"].endswith("Simulation") for c in d.get("classes", [])), "docs_search encuentra star.common.Simulation")
+        r = save(str(tmp / "prueba.sim"))
+        check(r["ok"], "save")
+        if DOC_DIR and DOC_DIR.is_dir() and (DOC_DIR / "member-search-index.js").is_file():
+            d2 = docs_search("setRelativeToModelLength")
+            check(any(c.endswith("GlyphSettings") for c in d2.get("content_hits", [])), "docs_search encuentra un método por el índice de miembros")
+        check(_jstr('a"b' + chr(92) + 'c' + chr(10) + 'd') == 'a' + chr(92) + '"b' + chr(92) * 2 + 'c' + chr(92) + 'nd',
+              "_jstr escapa comillas, barras y saltos")
+        r = export_scene('x"); System.exit(0); //')
+        macs = sorted(MACROS.glob("Agent_*.java"), key=lambda q: q.stat().st_mtime)
+        check('equals("x\\"); System.exit(0); //")' in macs[-1].read_text(encoding="utf-8"), "export_scene escapa el nombre en el Java")
+        check(idle_seconds() < 60, "last_activity en disco ve la actividad reciente")
+
+        # --- redacción de la clave
+        r = run_java(f'sim.println("clave={KEY}");')
+        outs = "".join(q.read_text(encoding="utf-8", errors="replace") for q in MACROS.glob("Agent_*.out"))
+        check(KEY not in json.dumps(r) and "***PODKEY***" in r["stdout"], "run_java: la clave impresa por una macro sale redactada")
+        check(KEY not in outs and KEY not in AGENT_LOG.read_text(encoding="utf-8"), "la clave no queda en macros/*.out ni en agent.log")
+        check(_redact(f"a {KEY} b") == "a ***PODKEY*** b" and KEY not in json.dumps(_scrub({"x": [f"k={KEY}", {"y": KEY}]})),
+              "_redact y _scrub")
+
+        # --- turnos entre procesos (.inject.lock)
+        child = subprocess.Popen([sys.executable, "-I", "-c", _HOLD, str(LOCK_FILE), "3.0"], stdout=subprocess.PIPE, text=True)
+        check(child.stdout.readline().strip() == "HELD", "otro proceso toma el turno")
+        t0 = time.time()
+        r = run_java('sim.println("x");', wait_s=1)
+        check(r["ok"] is False and "panel_demo" in (r.get("busy") or "") and 0.8 < time.time() - t0 < 4,
+              f"run_java con el turno ocupado espera y devuelve busy ({r.get('busy')})")
+        sstat = server_status()
+        check((sstat.get("turno") or {}).get("tool") == "panel_demo", "server_status dice quién tiene el turno")
+        r = server_stop()
+        check(r["stopped"] is False and r.get("busy") and alive(), "server_stop con el turno ocupado no apaga")
+        r = run_java('sim.println("tras la espera");', wait_s=10)
+        check(r["ok"] and r["stdout"] == "tras la espera", "run_java espera el turno y corre al liberarse")
+        child.wait(timeout=10)
+        check(not LOCK_FILE.exists(), "turno liberado tras la espera")
+        wlock(999999, "muerto")
+        r = run_java('sim.println("1");')
+        check(r["ok"] and not LOCK_FILE.exists(), "candado huérfano (pid muerto) se limpia")
+        sl = subprocess.Popen([sys.executable, "-I", "-c", "import time;time.sleep(60)"])
+        sleepers.append(sl)
+        wlock(sl.pid, "viejo", age_s=3 * 3600)
+        r = run_java('sim.println("2");')
+        check(r["ok"], "candado sin latido en 2 h se limpia aunque el pid viva")
+        wlock(os.getpid(), "mio-roto")
+        r = run_java('sim.println("3");')
+        check(r["ok"], "candado propio sin uso (resto de un fallo) se limpia")
+        wlock(sl.pid, "vivo")
+        r = run_java('sim.println("4");', wait_s=0)
+        check(r["ok"] is False and "vivo" in (r.get("busy") or ""), "candado vivo y reciente da busy")
+        LOCK_FILE.unlink()
+        _kill_tree(sl.pid)
+
+        # --- run_steps
+        r = run_steps([{"recipe": "paso-ok", "params": {"nombre": "mundo"}}, {"recipe": "paso-falla"},
+                       {"java": 'sim.println("tercero");', "name": "mi-java"}], stop_on_error=False)
+        s = r.get("steps", [])
+        check(len(s) == 3 and s[0]["ok"] is True and s[0]["stdout"] == "hola mundo y ${Flujo}", f"run_steps: paso 0 ok con params y ${{Flujo}} intacto ({s[0] if s else r})")
+        check(s[1]["ok"] is False and "fallo simulado" in s[1].get("error", ""), "run_steps: el paso que falla trae su error")
+        check(s[2]["ok"] is True and s[2]["stdout"] == "tercero" and s[2]["name"] == "mi-java", "run_steps: con stop_on_error=False el siguiente corre")
+        check(r["ok"] is False and r["failed_at"] == 1, "run_steps: ok False y failed_at=1")
+        check("// ---- paso 1: paso-falla.java" in Path(r["macro"]).read_text(encoding="utf-8"), "run_steps: UNA macro con los tres pasos")
+        r = run_steps([{"recipe": "paso-ok", "params": {"nombre": "x"}}, {"recipe": "paso-falla"}, {"java": 'sim.println("nunca");'}])
+        s = r["steps"]
+        check(s[1]["ok"] is False and s[2]["skipped"] is True and s[2]["ok"] is None, "run_steps: stop_on_error salta el resto")
+        r = run_steps([{"recipe": "paso-ok"}])
+        check(r["ok"] is False and "faltan parámetros" in r["error"], "run_steps: exige los PARAMS de la receta")
+        r = run_steps([{"recipe": "no-existe"}])
+        check(r["ok"] is False and "no existe la receta" in r["error"], "run_steps: receta inexistente")
+        r = run_steps([{"recipe": "paso-ok", "java": "x"}])
+        check(r["ok"] is False and "exactamente uno" in r["error"], "run_steps: paso mal formado")
+        r = run_steps([{"recipe": "paso-ok", "params": {"nombre": "a", "sobra": 1}}])
+        check(r["ok"] and any("sin uso" in w for w in r.get("warnings", [])), "run_steps avisa de parámetros sin uso")
+
+        # --- iterate con criterio de parada
+        scen.write_text("stable")
+        r = iterate(n=1000, block=100)
+        check(r["ok"] and r["stopped"] == "stable" and 200 <= r["iteration"] <= 600 and r["reports"].get("H"),
+              f"iterate until=stable para al asentarse: {r.get('stopped')} en {r.get('iteration')} it, var {r.get('variation_pct')}")
+        check(r["iterations_run"] < 1000 and r["history"] and "residuals" in r and "res" in r["history"][-1], "iterate: historia corta y residuales")
+        scen.write_text("plateau")
+        r = iterate(n=1000, block=100)
+        check(r["ok"] and r["stopped"] == "plateau" and r["iteration"] >= 300, f"iterate marca plateau: {r.get('stopped')} en {r.get('iteration')} it")
+        scen.write_text("drift")
+        r = iterate(n=100, block=100)
+        check(r["ok"] and r["stopped"] == "max" and r["iterations_run"] == 100, "iterate llega a n sin estabilizarse: stopped=max")
+        scen.write_text("stable")
+        r = iterate(n=30, until="n")
+        check(r["ok"] and r["blocks"] == 1 and r["stopped"] == "max" and r["iteration"] == 30 and r["residuals"], "iterate until='n' es un solo bloque")
+        r = iterate(n=50, reports=["Q_no_existe"])
+        check(r["ok"] is False and "Q_no_existe" in r.get("error", ""), "iterate con un reporte inexistente falla con mensaje claro")
+
+        # --- vigilante: macro en marcha, y apagado por inactividad (sin GUI)
+        real_sim = _state().get("sim")
+        _write_state({**_state(), "sim": str(tmp / "AGENT_FAKE_FAIL.sim")})
+        r = server_stop(save=True)
+        check(r["stopped"] is False and r.get("save_error") and _port_open(PORT), "server_stop con guardado fallido no apaga ni dice «saved»")
+        _write_state({**_state(), "sim": real_sim})
+        check(server_status()["alive"], "server_status vivo")
+        IDLE_MIN = 0.001  # 0,06 s
+        fake_m = MACROS / "Agent_19990101_000000_000"
+        fake_m.with_suffix(".java").write_text("// macro callada", encoding="utf-8")
+        fake_m.with_suffix(".out").write_text("AGENT_BEGIN 19990101_000000_000\n", encoding="utf-8")
+        check(macro_running() and idle_seconds() == 0, "macro_running ve un .out sin AGENT_END")
+        _idle_stop()
+        check(_port_open(PORT) and STATE_FILE.exists(), "watchdog no apaga con una macro en marcha")
+        fake_m.with_suffix(".pid").write_text("999999")  # su cliente murió: macro abandonada
+        check(not macro_running(), "macro con cliente muerto no cuenta como en marcha")
+        fake_m.with_suffix(".pid").unlink()
+        fake_m.with_suffix(".out").write_text("AGENT_BEGIN x\nAGENT_END x\n", encoding="utf-8")
+        check(not macro_running(), "macro con AGENT_END ya no cuenta")
+        time.sleep(0.2)
+        _idle_stop()
+        check(not _port_open(PORT) and not STATE_FILE.exists(), "watchdog apaga el solver inactivo (y guarda) cuando no hay GUI")
+        IDLE_MIN = 30
+        # puerto ocupado por otro proceso: se niega sin copiar el .sim
+        srcsim = tmp / "otra.sim"
+        srcsim.write_bytes(b"x")
+        with socket.socket() as busy:
+            busy.bind(("127.0.0.1", 0))
+            busy.listen(1)
+            real_port, PORT = PORT, busy.getsockname()[1]
+            try:
+                server_start(sim_path=str(srcsim))
+                msg = ""
+            except RuntimeError as e:
+                msg = str(e)
+            PORT = real_port
+        check("ocupado" in msg and not (SIMS / "otra.sim").exists(), "puerto ocupado: error claro y sin copiar el .sim")
+        # otro proceso lo está arrancando (pid vivo, puerto cerrado, reciente): no se lanza un segundo
+        with socket.socket() as sk2:
+            sk2.bind(("127.0.0.1", 0))
+            free = sk2.getsockname()[1]
+        _write_state({"pid": os.getpid(), "port": free, "started": datetime.now().isoformat(timespec="seconds")})
+        try:
+            server_start()
+            msg = ""
+        except RuntimeError as e:
+            msg = str(e)
+        check("arrancando" in msg and STATE_FILE.exists(), "server_start no pisa un arranque en curso de otro proceso")
+        # .server.json viejo (pid muerto): server_start limpia y relanza; un nombre raro no sale de sims/ ni rompe el Java
+        _write_state({"pid": 999999, "port": PORT, "sim": None})
+        st = server_start(name='../mi caso"x')
+        check(st.get("pid") and st["pid"] != 999999 and _port_open(PORT), "server_start con .server.json viejo relanza")
+        check(Path(st["sim"]).parent == SIMS and Path(st["sim"]).name == "mi_caso_x.sim", f"nombre raro saneado -> {Path(st['sim']).name}")
+
+        # --- GUI conectada
+        rows = [{"pid": 1, "name": "starccm+.exe", "cmd": f'"C:\\x\\starccm+.exe" -host localhost:{PORT}'},
+                {"pid": 2, "name": "starccm+.exe", "cmd": f'"C:\\x\\starccm+.exe" -host localhost:{PORT} -batch M.java -noexit'},
+                {"pid": 3, "name": "starccm+.exe", "cmd": f"starccm+.exe -server -port {PORT} -host localhost:{PORT}"},
+                {"pid": 4, "name": "starccm+.exe", "cmd": '"C:\\x\\starccm+.exe" -host localhost:1'},
+                {"pid": 5, "name": "powershell.exe", "cmd": f"powershell ... starccm -host localhost:{PORT}"}]
+        check(_gui_clients(rows, PORT) == [1], "_gui_clients: solo la GUI (sin -batch, sin -server, mismo puerto)")
+        g = gui_status()
+        check(g["connected"] is False and g["server_alive"], "gui_status sin GUI: no conectada")
+
+        def spy():
+            res = real_list()
+            seen_rows.append(res)
+            return res
+        _list_procs = spy  # desde aquí el listado de procesos es el real (PowerShell, ~1,5 s por llamada)
+        GUI_TTL = 60
+        t0 = time.time()
+        r = gui_attach(wait_s=20)
+        gui_pid = r.get("launched")
+        mine = [x for x in (seen_rows[-1] if seen_rows else []) if x["pid"] in r.get("pids", [])]
+        check(r["ok"] and r["connected"] and mine, f"gui_attach lanza la GUI y se la ve conectada ({time.time()-t0:.1f}s, pids {r.get('pids')})")
+        check(mine and "-podkey" not in mine[0]["cmd"] and KEY not in mine[0]["cmd"] and f"-host localhost:{PORT}" in mine[0]["cmd"],
+              "la GUI se lanza con -host localhost:PORT y sin -podkey")
+        _list_procs = lambda: list(seen_rows[-1])  # sin PowerShell: la misma foto
+        check(gui_attach().get("already") is True, "gui_attach con GUI conectada no lanza otra")
+        st = _state()
+        check(server_status().get("gui") is True and st.get("port") == PORT, "server_status informa gui=True")
+        # vigilante CON GUI: no apaga, deja idle_warning y eso no cuenta como actividad
+        IDLE_MIN = 0.001
+        time.sleep(0.2)
+        _gui_cache = None
+        _idle_stop()
+        st = _state()
+        check(alive() and (st.get("idle_warning") or {}).get("gui") is True and "¿apagar?" in st["idle_warning"]["msg"],
+              f"vigilante con GUI: no apaga y deja idle_warning ({st.get('idle_warning')})")
+        check(idle_seconds() > IDLE_MIN * 60, "escribir idle_warning no cuenta como actividad")
+        IDLE_MIN = 30
+        run_java('sim.println("vuelvo");')
+        _idle_stop()
+        check("idle_warning" not in _state(), "al haber actividad se borra idle_warning")
+        # server_stop con GUI: avisa pero apaga (simulación nueva sin nombre: guarda aparte)
+        _write_state({**_state(), "sim": None})
+        r = server_stop(save=True)
+        check(r["stopped"] and r.get("gui_warning") and r.get("saved") and Path(r["saved"]).parent == SIMS and not STATE_FILE.exists(),
+              "server_stop con GUI avisa (gui_warning), guarda en sims/nuevo_*.sim y apaga")
+        _kill_tree(gui_pid)
+        gui_pid = None
+        _list_procs, GUI_TTL = (lambda: []), 10.0
+
+        # --- pump_case con la bomba falsa
+        PIPELINE_BOMBA = tmp / "bomba_falsa.py"
+        cad = tmp / "cad"
+        cad.mkdir()
+        (tmp / "vacia").mkdir()
+        (cad / "bomba.cfturbo-ccm").write_text("<ccm/>", encoding="utf-8")
+        r = pump_case("BombaFalsa", str(cad))
+        check(r["ok"] is False and "No existe" in r.get("error", ""), "pump_case sin pipelines/bomba.py: error claro")
+        PIPELINE_BOMBA.write_text(_FAKE_BOMBA, encoding="utf-8")
+        r = pump_case("BombaFalsa", str(cad), dry_run=True)
+        check(r["ok"] and r["dry_run"] and r["ccm"]["rpm"] == 1450 and r["macro_chars"] > 50, "pump_case dry_run: genera la macro con la bomba falsa")
+        check(pump_case("B", str(cad), mode="lenta")["ok"] is False and pump_case("B", str(tmp / "nada"))["ok"] is False
+              and pump_case("B", str(tmp / "vacia"))["ok"] is False, "pump_case valida mode, cad_dir y .cfturbo-ccm")
+        r = pump_case("BombaFalsa", str(cad), mode="rapida")
+        check(r["ok"] and [s["ok"] for s in r["steps"]] == [True, True] and "importado 1450 rapida" in r["steps"][0]["stdout"]
+              and (CASES / "BombaFalsa").is_dir() and Path(_state()["sim"]).stem == "BombaFalsa",
+              f"pump_case arranca el servidor del caso e inyecta UNA macro ({r.get('seconds')}s; {r.get('error') or r.get('exception') or r.get('steps')})")
+        r = pump_case("BombaFalsa", str(cad), mode="normal", params={"fallar": True})
+        check(r["ok"] is False and r["failed_at"] == 1 and r["steps"][0]["ok"] is True, "pump_case: un paso que falla se reporta con su índice")
+        r = pump_case("OtroCaso", str(cad))
+        check(r["ok"] is False and "otro .sim" in r.get("error", ""), "pump_case se niega si hay otro .sim cargado")
+
+        # --- el servidor muere a mitad de una macro: error claro, no un «ok» vacío
+        real_inject = _inject_local
+
+        def dying(st_, src, timeout):
+            _kill_tree(st_["pid"])
+            time.sleep(0.5)
+            out = src.with_suffix(".out")
+            out.write_text("AGENT_BEGIN medio\n", encoding="utf-8")
+            return 1, "conexión perdida", False, out
+        _inject_local = dying
+        try:
+            r = run_java('sim.println("nunca");')
+        finally:
+            _inject_local = real_inject
+        check(not r["ok"] and r.get("server_died") and "murió" in (r["exception"] or ""), "servidor muerto a mitad de macro: server_died + mensaje claro")
+        check(not macro_running() and not LOCK_FILE.exists(), "tras el fallo, su .out queda cerrado y el turno liberado")
+        check(not server_status()["alive"], "server_status: no vivo tras morir")
+        r2 = server_stop()
+        check(r2["stopped"] is False or r2.get("saved") is None, "server_stop con el servidor muerto no falla")
+        check(KEY not in AGENT_LOG.read_text(encoding="utf-8"), "agent.log sin la clave")
+        # otra sesión puede estar usando el solver real mientras tanto: solo miramos que lo nuevo no sea del falso ni nuestro
+        new = [Path(p) for p, _ in _real_files() - real_before]
+        check(not any(p.suffix in (".log", ".out", ".json") and "FAKE" in p.read_text(encoding="utf-8", errors="replace")[:400] for p in new if p.is_file()),
+              "sims/, macros/ y .server.json reales sin rastro del starccm+ falso")
+        mine_real = real_lock.is_file() and f'"pid": {os.getpid()}' in real_lock.read_text(encoding="utf-8", errors="replace")
+        check(not mine_real, ".inject.lock real intacto")
+        secs = time.time() - t_all
+        check(secs < 30, f"el selftest tarda {secs:.1f} s (< 30 s)")
+    finally:
+        for pid in [gui_pid] + [s.pid for s in sleepers]:
+            if pid:
+                _kill_tree(pid)
+        st = _state()
+        if st.get("pid") and _pid_alive(st["pid"]):
+            _kill_tree(st["pid"])
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"selftest: {len(fails)} fallos" if fails else "selftest: todo en verde")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
+    start_watchdog()
+    mcp.run()
