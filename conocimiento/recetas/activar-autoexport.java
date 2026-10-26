@@ -1,9 +1,9 @@
 // QUE: activar la exportación automática de superficies con campo (EnSight) cada N iteraciones, para el 3D en vivo del visor
 // VERSION: 19.06.009-R8 · FECHA: 2026-10-24 · ESTADO: compila con javac; verificado con el solver local (ver CLAUDE.md)
-// CADA: cada cuántas iteraciones (50 recomendado). OUT: carpeta destino (cases/<caso>/surfaces/_raw/vivo).
+// CADA: cada cuántas iteraciones (mínimo 100: se sube solo; exportar más seguido frena la corrida). ESTADO por defecto: apagado. OUT: carpeta destino (cases/<caso>/surfaces/_raw/vivo).
 // FUNCS: field functions escalares separadas por coma (los vectores se exportan como magnitud).
 // Mismas fronteras que exportar-superficies-ensight (sin interfaces). Para apagarla: ae.setEnabled(false).
-int cada = CADA;
+int cada = Math.max(100, CADA);
 AutoExport ae = sim.getSimulationIterator().getAutoExport();
 java.util.Vector<Boundary> bnds = new java.util.Vector<Boundary>();
 StringBuilder meta = new StringBuilder();

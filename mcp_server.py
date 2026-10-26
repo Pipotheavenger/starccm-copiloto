@@ -27,17 +27,28 @@ Env (se leen también de .env en la raíz del repo y de ~/.starccm-agent.env, fo
                    Con GUI conectada NO apaga: deja `idle_warning` en .server.json.
   STARCCM_LOCK_WAIT_S segundos que una tool espera el turno (default 120)
   STARCCM_PRECOMPILE 1 (default) compila la macro con el javac del JDK de STAR-CCM+ antes de
-                   inyectarla: un error de sintaxis o de nombre de clase vuelve en 2 s sin tocar
-                   el servidor. 0 para saltarlo.
+                   inyectarla SOLO en la vía batch (fallback): un error de sintaxis o de nombre de clase vuelve en
+                   2 s sin tocar el servidor; con caché por hash del cuerpo. 0 para saltarlo. La vía residente
+                   no precompila (compila en el propio cliente en ~0,6 s y devuelve el error).
+  STARCCM_RESIDENT 1 (default) inyecta con un cliente residente (un solo cliente batch -noexit que vigila un
+                   inbox y ejecuta cada macro con StarScript: ~0,7-1 s por macro en vez de ~8,6 s). 0 = siempre
+                   el cliente batch de siempre.
+  COPILOTO_WORK    carpeta de trabajo pesada FUERA de OneDrive (default %LOCALAPPDATA%\\starccm-copiloto): sims/,
+                   macros/, residente/ (inbox, out, latido, log del residente) y tiempos.csv.
 
-Carpetas (en la raíz del repo): sims/ (.sim de trabajo, nunca el original del usuario), macros/ (cada macro
-inyectada, con su salida .out), casos/<caso>/ (cad, reportes, imágenes, RESUMEN.md), conocimiento/recetas/
-(snippets Java que funcionaron), pipelines/ (guiones fijos). Estado del servidor en .server.json.
+Carpetas: en COPILOTO_WORK sims/ (.sim de trabajo, nunca el original del usuario), macros/ (cada macro inyectada,
+con su salida .out), residente/, logs del solver (sims/*.server.log), tiempos.csv. En la raíz del repo: casos/<caso>/
+(cad, reportes, imágenes, RESUMEN.md), conocimiento/recetas/ (snippets Java que funcionaron), pipelines/ (guiones
+fijos). Estado del servidor en .server.json y turnos en .inject.lock (pequeños, en la raíz: el panel los lee).
+
+Medición: cada respuesta de tool trae `ms` (total) y `via` (residente | batch | mixto | ninguno); además se anota
+en WORK/tiempos.csv (fecha, herramienta, ms, via, ok, inyecciones).
 """
 from __future__ import annotations
 
 import functools
 import glob
+import hashlib
 import html
 import importlib.util
 import json
@@ -55,8 +66,23 @@ from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SIMS = HERE / "sims"
-MACROS = HERE / "macros"
+
+
+def _work_dir(env: dict | None = None) -> Path:
+    """Carpeta de trabajo pesada (fuera de OneDrive: sincronizaría cada .sim de 50-150 MB en cada guardado).
+    COPILOTO_WORK manda; si no, %LOCALAPPDATA%\\starccm-copiloto (en otros SO ~/.local/share/starccm-copiloto)."""
+    env = os.environ if env is None else env
+    if env.get("COPILOTO_WORK"):
+        return Path(env["COPILOTO_WORK"])
+    base = env.get("LOCALAPPDATA") or (str(Path.home() / ".local" / "share") if os.name != "nt" else str(Path.home() / "AppData" / "Local"))
+    return Path(base) / "starccm-copiloto"
+
+
+WORK = _work_dir()
+SIMS = WORK / "sims"
+MACROS = WORK / "macros"
+RES_DIR = WORK / "residente"
+TIEMPOS = WORK / "tiempos.csv"
 CASES = HERE / "casos"
 RECIPES = HERE / "conocimiento" / "recetas"
 PIPELINE_BOMBA = HERE / "pipelines" / "bomba.py"
@@ -202,9 +228,9 @@ def _pid_is_ours(pid: int) -> bool:
     return bool(m) and re.search(r"cmd|star|java|python|mpi|ccm|hydra|smpd", m.group(1), re.I) is not None
 
 
-def _port_open(port: int, host: str = "127.0.0.1") -> bool:
+def _port_open(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> bool:
     try:
-        with socket.create_connection((host, port), timeout=1.0):
+        with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
         return False
@@ -572,24 +598,54 @@ def _prune_macros() -> None:
         p.unlink(missing_ok=True)
 
 
-def _precompile(src: Path) -> str | None:
-    """Compila la macro con javac. Devuelve el texto del error o None si compila (o no hay javac)."""
+def _run_javac(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+
+
+def _precompile(src: Path, key: str = "") -> str | None:
+    """Compila la macro con javac (solo vía batch). Devuelve el texto del error o None si compila (o no hay javac).
+    key = hash del cuerpo: si ya compiló una vez no se recompila lo mismo (la clase cambia de nombre, el cuerpo no)."""
     jc = _javac()
     if not jc:
         return None
+    mark = MACROS / ".cache" / key if key else None
+    if mark and mark.is_file():
+        return None
     out = MACROS / ".classes"
     out.mkdir(exist_ok=True)
-    r = subprocess.run([jc[0], "-nowarn", "-proc:none", "-cp", jc[1], "-d", str(out), str(src)],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    r = _run_javac([jc[0], "-nowarn", "-proc:none", "-cp", jc[1], "-d", str(out), str(src)])
     if r.returncode != 0:
         return (r.stderr or r.stdout)[-3000:]
+    if mark:
+        mark.parent.mkdir(exist_ok=True)
+        mark.write_text("", encoding="utf-8")
     return None
+
+
+# AutoExport del 3D en vivo: apagado por defecto; si una receta lo activa, cada >= AUTOEXPORT_MIN_IT iteraciones
+# (exportar superficies cada 50 it frena la corrida).
+AUTOEXPORT_MIN_IT = 100
+_AE_FREQ = re.compile(r"(getIterationUpdateFrequency\(\)\s*\.setIterations\(\s*)(\d+)(\s*\))")
+
+
+def _guard_autoexport(body: str) -> tuple[str, list[str]]:
+    """Sube a AUTOEXPORT_MIN_IT cualquier frecuencia literal menor en un cuerpo que usa AutoExport."""
+    if "getAutoExport" not in body:
+        return body, []
+    warns = []
+
+    def fix(m):
+        if int(m.group(2)) < AUTOEXPORT_MIN_IT:
+            warns.append(f"AutoExport cada {m.group(2)} it subido a {AUTOEXPORT_MIN_IT} (exportar más seguido frena la corrida)")
+            return f"{m.group(1)}{AUTOEXPORT_MIN_IT}{m.group(3)}"
+        return m.group(0)
+    return _AE_FREQ.sub(fix, body), warns
 
 
 def _inject(body: str, imports: str = "", timeout: float = 3600, expect_death: bool = False,
             wait_s: float | None = None, tool: str = "inyección") -> dict:
-    """Toma el turno, escribe la macro, la ejecuta con el cliente batch contra el servidor y devuelve su salida.
-    Sin turno tras wait_s: {"ok": False, "busy": ...} (con las mismas claves que un resultado normal)."""
+    """Toma el turno, escribe la macro, la ejecuta (residente por defecto, cliente batch de respaldo) y devuelve su
+    salida. Sin turno tras wait_s: {"ok": False, "busy": ...} (con las mismas claves que un resultado normal)."""
     with _turn(tool, wait_s) as busy:
         if busy:
             return _busy_result(busy)
@@ -604,22 +660,311 @@ def _inject_locked(body: str, imports: str, timeout: float, expect_death: bool) 
         raise RuntimeError(f"El proceso del servidor (pid {st['pid']}) sigue pero no responde en el puerto {st.get('port')}: "
                            "si acaba de arrancar espera; si está colgado, server_stop() lo mata.")
     _touch_lock()
-    MACROS.mkdir(exist_ok=True)
+    MACROS.mkdir(parents=True, exist_ok=True)
+    body, warns = _guard_autoexport(body)
+    key = hashlib.sha1((imports + "\0" + body).encode("utf-8", "replace")).hexdigest()[:20]
     tag = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     src = MACROS / f"Agent_{tag}.java"
     src.write_text(_wrap(body, imports, tag), encoding="utf-8")
     t0 = time.time()
-    killed = False
-    err_c = _precompile(src)
+    why = None
+    if RES_ON:
+        r, why = _inject_resident(st, src, tag, t0, timeout, expect_death)
+        if r is not None:
+            _note_via("residente")
+            return {**r, "via": "residente", **({"warnings": warns} if warns else {})}
+        _log(f"inyección por batch (residente no disponible): {why}")
+    _note_via("batch", why)
+    err_c = _precompile(src, key)
     if err_c:
         # el .out marca la macro como terminada (no se da por «en marcha»)
         src.with_suffix(".out").write_text(_redact(f"javac: no compila\n{err_c}\n--- stderr\n"), encoding="utf-8")
         _touch()
-        return {"ok": False, "stdout": "", "stderr": "", "exception": "javac: no compila",
+        return {"ok": False, "stdout": "", "stderr": "", "exception": "javac: no compila", "via": "batch",
                 "trace": _redact(err_c), "seconds": round(time.time() - t0, 2), "macro": str(src), "returncode": 1}
     rc, err, killed, out_file = _inject_local(st, src, timeout)
     _touch_lock()
-    return _inject_result(st, src, tag, t0, rc, err, killed, out_file, expect_death)
+    r = _inject_result(st, src, tag, t0, rc, err, killed, out_file, expect_death)
+    return {**r, "via": "batch", **({"via_fallback": why} if why else {}), **({"warnings": warns} if warns else {})}
+
+
+# ----------------------------------------------------------------------------- cliente residente
+# Un único cliente batch (-batch Residente.java -noexit) lanzado una vez; vigila RES_DIR/inbox y ejecuta cada .java con
+# StarScript (compila y corre dentro del cliente, sin otra JVM: ~0,7-1 s por macro frente a ~8,6 s). Su stdout (la salida de
+# sim.println) va a un log por servidor; el MCP recorta de ahí lo que hay entre AGENT_BEGIN/AGENT_END <tag>. Un hilo
+# aparte escribe `heartbeat` cada ~1 s. Estado en RES_DIR/residente.json (lo ven todos los procesos MCP).
+RES_ON = os.environ.get("STARCCM_RESIDENT", "1") != "0"
+RES_HB_STALE = 5.0        # s sin latido => muerto (antes de enviar una macro)
+RES_BUSY_STALE = 60.0     # s sin latido => colgado, MIENTRAS corre una macro (más holgado: no matar un cliente ocupado)
+RES_START_WAIT = 60.0     # s esperando el primer latido tras lanzarlo
+RES_POLL = 0.03
+RES_PAUSE_S = 300.0       # tras fallar el residente dos veces, el batch directo durante este tiempo
+_res_off_until = 0.0
+_res_proc: subprocess.Popen | None = None
+_res_launches = 0
+
+_RESIDENTE_JAVA = """import star.common.*;
+import java.io.*;
+import java.nio.file.*;
+// Cliente residente del copiloto (generado por mcp_server.py). Vigila inbox/, ejecuta cada .java con StarScript y escribe
+// out/<macro>.res (primera linea OK|ERR ms; luego el error). Latido en un hilo aparte. STOP en inbox/ lo termina.
+public class Residente extends StarMacro {
+  public void execute() {
+    final File base = new File("%BASE%");
+    final File inbox = new File(base, "inbox"), out = new File(base, "out"), hb = new File(base, "heartbeat");
+    final boolean[] run = {true};
+    Thread t = new Thread(new Runnable() { public void run() {
+      while (run[0]) {
+        try { Files.write(hb.toPath(), Long.toString(System.currentTimeMillis()).getBytes("UTF-8")); } catch (Exception e) { }
+        try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
+      } } });
+    t.setDaemon(true);
+    t.start();
+    System.out.println("RESIDENTE listo");
+    long fin = System.currentTimeMillis() + 12L * 3600 * 1000;
+    while (System.currentTimeMillis() < fin) {
+      if (new File(inbox, "STOP").exists()) break;
+      File[] fs = inbox.listFiles(new FilenameFilter() { public boolean accept(File d, String n) { return n.endsWith(".java"); } });
+      if (fs != null && fs.length > 0) {
+        java.util.Arrays.sort(fs);
+        for (File f : fs) {
+          long t0 = System.nanoTime();
+          String err = "";
+          try { new StarScript(getActiveRootObject(), f).play(); }
+          catch (Throwable e) { StringWriter sw = new StringWriter(); e.printStackTrace(new PrintWriter(sw)); err = sw.toString(); }
+          double ms = (System.nanoTime() - t0) / 1e6;
+          System.out.println("RESIDENTE_FIN " + f.getName());
+          System.out.flush();
+          System.err.flush();
+          try {
+            File tmp = new File(out, f.getName() + ".tmp");
+            Files.write(tmp.toPath(), ((err.isEmpty() ? "OK " : "ERR ") + ms + "\\n" + (err.length() > 8000 ? err.substring(0, 8000) : err)).getBytes("UTF-8"));
+            Files.move(tmp.toPath(), new File(out, f.getName() + ".res").toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+          } catch (Exception e) { }
+          f.delete();
+        }
+      }
+      try { Thread.sleep(30); } catch (InterruptedException e) { break; }
+    }
+    run[0] = false;
+    System.out.println("RESIDENTE fin");
+  }
+}
+"""
+
+
+def _res_info() -> dict:
+    try:
+        d = json.loads((RES_DIR / "residente.json").read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _hb_age() -> float:
+    try:
+        return time.time() - (RES_DIR / "heartbeat").stat().st_mtime
+    except OSError:
+        return 1e9
+
+
+def _res_healthy(st: dict) -> bool:
+    ri = _res_info()
+    return (bool(ri.get("pid")) and ri.get("server_pid") == st.get("pid") and _pid_alive(ri["pid"])
+            and _hb_age() < RES_HB_STALE)
+
+
+def _res_kill(why: str) -> None:
+    """Mata el residente (nunca el servidor) y borra su estado."""
+    global _res_proc
+    ri = _res_info()
+    if ri.get("pid") and _pid_alive(ri["pid"]):
+        _log(f"residente {ri['pid']} matado: {why}")
+        _kill_tree(ri["pid"])
+    (RES_DIR / "residente.json").unlink(missing_ok=True)
+    (RES_DIR / "heartbeat").unlink(missing_ok=True)
+    _res_proc = None
+
+
+def _res_stop(wait: float = 8.0) -> bool:
+    """Detiene el residente con el archivo STOP; si no sale en `wait` s lo mata. True si había uno vivo."""
+    ri = _res_info()
+    pid = ri.get("pid")
+    had = bool(pid) and _pid_alive(pid)
+    if had:
+        try:
+            (RES_DIR / "inbox").mkdir(parents=True, exist_ok=True)
+            (RES_DIR / "inbox" / "STOP").write_text("", encoding="utf-8")
+        except OSError:
+            pass
+        end = time.time() + wait
+        while time.time() < end and _pid_alive(pid):
+            time.sleep(0.1)
+    _res_kill("parada")
+    return had
+
+
+def _res_launch(st: dict) -> tuple[bool, str]:
+    """Lanza el residente desacoplado y espera su primer latido. (ok, motivo del fallo)."""
+    global _res_proc, _res_launches
+    inbox, out = RES_DIR / "inbox", RES_DIR / "out"
+    for d in (inbox, out):
+        d.mkdir(parents=True, exist_ok=True)
+        for f in d.glob("*"):
+            f.unlink(missing_ok=True)
+    (RES_DIR / "heartbeat").unlink(missing_ok=True)
+    java = RES_DIR / "Residente.java"
+    java.write_text(_RESIDENTE_JAVA.replace("%BASE%", _jpath(RES_DIR)), encoding="utf-8")
+    log = RES_DIR / f"residente-{st.get('port')}-{st.get('pid')}.log"
+    cmd = _starccm_cmd() + ["-host", f"localhost:{st['port']}", "-batch", str(java), "-noexit"] + _lic_flags()
+    flags = (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0
+    t_launch = time.time()
+    with open(log, "ab") as lf:  # el hijo hereda el manejador: aquí se puede cerrar
+        _res_proc = p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, cwd=str(RES_DIR),
+                                         creationflags=flags, close_fds=True, start_new_session=(os.name != "nt"))
+    _res_launches += 1
+    (RES_DIR / "residente.json").write_text(json.dumps({
+        "pid": p.pid, "server_pid": st.get("pid"), "port": st.get("port"), "log": str(log),
+        "started": datetime.now().isoformat(timespec="seconds")}), encoding="utf-8")
+    _log(f"residente lanzado pid {p.pid} (servidor {st.get('pid')}): {_redact(' '.join(cmd))}")
+    while time.time() - t_launch < RES_START_WAIT:
+        if p.poll() is not None:
+            tail = _redact(log.read_text(encoding="utf-8", errors="replace")[-600:])
+            return False, f"el residente terminó con código {p.returncode} al arrancar: {tail}"
+        try:
+            if (RES_DIR / "heartbeat").stat().st_mtime >= t_launch - 0.5:
+                return True, ""
+        except OSError:
+            pass
+        time.sleep(0.05)
+    return False, f"el residente no dio latido en {RES_START_WAIT:.0f} s"
+
+
+def _res_ensure(st: dict) -> tuple[bool, str]:
+    """Residente sano para este servidor: lo reutiliza, o lo (re)lanza una vez más si falla. (ok, motivo)."""
+    global _res_off_until
+    if time.time() < _res_off_until:
+        return False, "residente en pausa tras fallar dos veces (se reintenta en unos minutos)"
+    if _res_healthy(st):
+        return True, ""
+    if _res_info().get("pid"):
+        _res_kill("sin latido, muerto o de otro servidor")
+    why = ""
+    for _ in range(2):  # lanzar y, si falla, una vez más
+        ok, why = _res_launch(st)
+        if ok:
+            return True, ""
+        _res_kill(why)
+    _res_off_until = time.time() + RES_PAUSE_S
+    return False, why
+
+
+def _copy_live(log: Path, pos: int, out_file: Path) -> tuple[int, str]:
+    """Copia lo nuevo del log del residente al .out de la macro (el panel lo sigue en vivo). (pos nuevo, texto nuevo)."""
+    try:
+        if log.stat().st_size <= pos:
+            return pos, ""
+        with open(log, "rb") as f:
+            f.seek(pos)
+            data = f.read()
+    except OSError:
+        return pos, ""
+    if not data:
+        return pos, ""
+    txt = data.decode("utf-8", "replace")
+    with open(out_file, "a", encoding="utf-8", errors="replace") as fo:
+        fo.write(_redact(txt))
+    return pos + len(data), txt
+
+
+def _inject_resident(st: dict, src: Path, tag: str, t0: float, timeout: float,
+                     expect_death: bool) -> tuple[dict | None, str]:
+    """Ejecuta la macro con el residente. (resultado, "") o (None, motivo) si no se pudo y toca el batch.
+    Una vez enviada la macro NUNCA se repite por batch (podría duplicar efectos): los errores vuelven como resultado."""
+    ok, why = _res_ensure(st)
+    if not ok:
+        return None, why
+    ri = _res_info()
+    rpid, log = ri["pid"], Path(ri["log"])
+    name = src.name
+    resf = RES_DIR / "out" / (name + ".res")
+    resf.unlink(missing_ok=True)
+    out_file, pidf = src.with_suffix(".out"), src.with_suffix(".pid")
+    out_file.write_text("", encoding="utf-8")
+    pidf.write_text(str(rpid))  # macro_running() lo lee desde otros procesos
+    pos = log.stat().st_size if log.is_file() else 0
+    tmpf = RES_DIR / "inbox" / (name + ".tmp")
+    tmpf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    os.replace(tmpf, RES_DIR / "inbox" / name)  # el residente solo ve *.java: nunca una macro a medias
+    acc, res, killed, died, last_chk, last_pid = "", None, False, False, 0.0, 0.0
+    deadline = time.time() + timeout  # tras comprobar el residente: lanzarlo no gasta el tiempo de la macro
+    try:
+        while True:
+            if resf.is_file():
+                try:
+                    res = resf.read_text(encoding="utf-8", errors="replace")
+                    break
+                except OSError:
+                    pass
+            now = time.time()
+            if now > deadline:
+                killed = True
+                break
+            if now - last_pid > 0.1:  # barato (microsegundos): detecta pronto un residente muerto
+                last_pid = now
+                if not _pid_alive(rpid) or _hb_age() > RES_BUSY_STALE:
+                    died = True
+                    break
+            if now - last_chk > 0.4:
+                last_chk = now
+                pos, new = _copy_live(log, pos, out_file)
+                acc += new
+                _touch_lock()
+                if expect_death and not alive(st):  # (cada 0,4 s)
+                    break  # sim.kill(): el servidor se fue, no habrá resultado
+            time.sleep(RES_POLL)
+        if killed or died:
+            reason = (f"timeout {timeout}s" if killed else "el residente murió o dejó de dar latido") + \
+                     "; residente matado (el servidor sigue vivo) y relanzado"
+            _res_kill(reason)
+            (RES_DIR / "inbox" / name).unlink(missing_ok=True)
+            relaunch = ""
+            if alive(st):
+                try:
+                    ok2, relaunch = _res_launch(st)
+                    relaunch = "" if ok2 else f" (no pude relanzarlo: {relaunch})"
+                except Exception as e:  # noqa: BLE001
+                    relaunch = f" (no pude relanzarlo: {e})"
+            pos, new = _copy_live(log, pos, out_file)
+            acc += new
+            err = reason + relaunch
+        else:
+            err = ""
+            pos, new = _copy_live(log, pos, out_file)
+            acc += new
+            if res is not None:
+                head, _, rest = res.partition("\n")
+                if head.startswith("ERR"):
+                    err = rest.strip() or "error en el residente"
+            if res is not None and not err:  # el latido y el stdout van por canales distintos: espera el AGENT_END
+                end = time.time() + 3
+                while _between(acc, tag) is None and time.time() < end:
+                    time.sleep(0.1)
+                    pos, new = _copy_live(log, pos, out_file)
+                    acc += new
+    finally:
+        pidf.unlink(missing_ok=True)
+    rc = 0 if not (killed or died or err) else (-1 if killed else 1)
+    r = _inject_result(st, src, tag, t0, rc, err, killed, out_file, expect_death)
+    if died:
+        r["resident_died"] = True
+    if err and not killed and not died and _between(acc, tag) is None and not r.get("exception"):
+        # error de compilación (o de ejecución antes de AGENT_BEGIN): lo devuelve el propio residente
+        r["exception"] = "el cliente residente no pudo compilar/ejecutar la macro: " + err.strip().splitlines()[0][:300]
+        r["trace"] = _redact(err[-3000:])
+    if (killed or died) and not r.get("exception"):
+        r["exception"] = err
+    return r, ""
 
 
 def _inject_local(st: dict, src: Path, timeout: float) -> tuple[int, str, bool, Path]:
@@ -713,18 +1058,74 @@ except ImportError:  # mcp 2.x
 mcp = FastMCP("starccm")
 
 
+_ctx = threading.local()  # contexto de la tool en curso en este hilo: profundidad, vías usadas, motivos de fallback
+
+
+def _note_via(via: str, reason: str | None = None) -> None:
+    seen = getattr(_ctx, "seen", None)
+    if seen is not None:
+        seen.append(via)
+        if reason:
+            _ctx.reasons.append(reason)
+
+
+def _record_time(tool: str, ms: int, via: str, ok, n: int) -> None:
+    """Una fila por tool (solo la de primer nivel) en WORK/tiempos.csv, para comparar residente y batch."""
+    try:
+        TIEMPOS.parent.mkdir(parents=True, exist_ok=True)
+        new = not TIEMPOS.exists()
+        with open(TIEMPOS, "a", encoding="utf-8", newline="") as f:
+            if new:
+                f.write("fecha,herramienta,ms,via,ok,inyecciones\n")
+            f.write(f"{datetime.now():%Y-%m-%dT%H:%M:%S},{tool},{ms},{via},{ok},{n}\n")
+    except OSError:
+        pass
+
+
 def _tool(fn):
-    """Registra la tool en el MCP; todo lo que devuelve pasa por _scrub (la clave PoD nunca sale)."""
+    """Registra la tool en el MCP. Todo lo que devuelve pasa por _scrub (la clave PoD nunca sale) y, en la tool de primer
+    nivel, lleva `ms` (total) y `via` (residente | batch | mixto | ninguno); una lista o un texto se envuelven en
+    {"resultado": ...}. La fila va a tiempos.csv. Las tools que llaman a otras (pump_case -> server_start) no duplican."""
     @functools.wraps(fn)
     def wrapper(*a, **k):
-        return _scrub(fn(*a, **k))
+        depth = getattr(_ctx, "depth", 0)
+        if depth == 0:
+            _ctx.seen, _ctx.reasons = [], []
+        _ctx.depth = depth + 1
+        t0 = time.perf_counter()
+        try:
+            res = _scrub(fn(*a, **k))
+        except Exception:
+            if depth == 0:
+                _record_time(fn.__name__, round((time.perf_counter() - t0) * 1000), _via_label(), False, len(_ctx.seen))
+            raise
+        finally:
+            _ctx.depth = depth
+        if depth:
+            return res
+        ms = round((time.perf_counter() - t0) * 1000)
+        if not isinstance(res, dict):
+            res = {"resultado": res}
+        via = _via_label()
+        res = {**res, "ms": ms, "via": via}
+        if _ctx.reasons:
+            res["via_fallback"] = "; ".join(sorted(set(_ctx.reasons)))
+        _record_time(fn.__name__, ms, via, res.get("ok", "error" not in res), len(_ctx.seen))
+        return res
     mcp.tool()(wrapper)
     return wrapper
 
 
+def _via_label() -> str:
+    v = set(_ctx.seen)
+    return "ninguno" if not v else v.pop() if len(v) == 1 else "mixto"
+
+
 _INIT_AUTOSAVE = ("AutoSave as = sim.getSimulationIterator().getAutoSave();\n"
                   "as.setAutoSaveBatch(false); as.setAutoSaveMesh(false);\n"
-                  'sim.println("INIT autosave off");\n')
+                  # el AutoExport del 3D en vivo arranca apagado (una receta puede activarlo, con frecuencia >= 100)
+                  "try { sim.getSimulationIterator().getAutoExport().setEnabled(false); } catch (Throwable e) { }\n"
+                  'sim.println("INIT autosave off, autoexport off");\n')
 
 
 def _run_init(st: dict) -> None:
@@ -790,10 +1191,11 @@ def server_start(sim_path: str = "", name: str = "") -> dict:
             STATE_FILE.unlink(missing_ok=True)
         if not EXE.lower().endswith(".py") and not (Path(EXE).is_file() or shutil.which(EXE)):
             raise RuntimeError(f"No encuentro el lanzador de STAR-CCM+ ({EXE}); define STARCCM_HOME o STARCCM_EXE en .env")
-        if _port_open(PORT):  # antes de copiar el .sim (158 MB): no se copia para nada
+        if _port_open(PORT, timeout=0.25):  # antes de copiar el .sim (158 MB): no se copia para nada (un puerto libre en Windows tarda todo el timeout)
             raise RuntimeError(f"Puerto {PORT} ocupado por otro proceso (¿un solver huérfano? mira `netstat -ano | findstr :{PORT}`); "
                                "cambia STARCCM_PORT o libéralo.")
-        SIMS.mkdir(exist_ok=True)
+        _res_kill("servidor nuevo")  # un residente de un servidor anterior no sirve
+        SIMS.mkdir(parents=True, exist_ok=True)
         sim = None
         if sim_path:
             srcp = Path(sim_path)
@@ -852,6 +1254,7 @@ def server_stop(save: bool = True) -> dict:
         _touch()
         st = _state()
         if not st.get("pid"):
+            _res_stop(3.0)
             return {"stopped": False, "reason": "no había servidor"}
         result = {"stopped": True, "saved": None}
         if _pid_alive(st["pid"]) and _port_open(st["port"]):
@@ -876,6 +1279,8 @@ def server_stop(save: bool = True) -> dict:
                 if not _pid_alive(st["pid"]):
                     break
                 time.sleep(POLL_S)
+        if _res_stop(3.0):  # el residente (archivo STOP) no sobrevive al servidor
+            result["residente"] = "detenido"
         if _pid_alive(st["pid"]):
             if _pid_is_ours(st["pid"]):
                 _kill_tree(st["pid"])
@@ -921,7 +1326,7 @@ def gui_attach(wait_s: int = 0) -> dict:
         return {"ok": True, "already": True, **g}
     cmd = _starccm_cmd() + ["-host", f"localhost:{st['port']}"]  # sin _lic_flags(): la GUI no reserva licencia
     flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
-    SIMS.mkdir(exist_ok=True)
+    SIMS.mkdir(parents=True, exist_ok=True)
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          cwd=str(SIMS), creationflags=flags, close_fds=True, start_new_session=(os.name != "nt"))
     _log(f"gui_attach: lanzada pid {p.pid}: {_redact(' '.join(cmd))}")
@@ -1349,11 +1754,14 @@ def _load_pipeline():
 
 @_tool
 def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", params: dict | None = None,
-              timeout_s: int = 3600, dry_run: bool = False) -> dict:
+              timeout_s: int = 3600, dry_run: bool = False, until: str = "", n: int = 1000,
+              reports: list[str] = ["H", "M"], block: int = 50) -> dict:
     """Bomba estándar de CFturbo en UNA macro: importa los STEP de cad_dir y el .cfturbo-ccm (rpm, caudal, eje,
     nombres), regiones, interfaces, malla (mode "rapida" o "normal"), física, MRF, fronteras y reportes (H, M, eta,
     Euler), vía pipelines/bomba.py. Arranca el servidor con el nombre del caso si no hay uno. ccm vacío = el
-    *.cfturbo-ccm de cad_dir. params se pasa tal cual al pipeline. dry_run: solo genera la macro y la describe."""
+    *.cfturbo-ccm de cad_dir. params se pasa tal cual al pipeline. dry_run: solo genera la macro y la describe.
+    Va por el cliente residente en UNA macro. until="stable" (o "n"): tras la macro, si salió bien, itera hasta n con
+    el criterio de iterate (bloques de `block`, reportes `reports`) en el mismo turno, sin crear un cliente por bloque."""
     if mode not in ("rapida", "normal"):
         return {"ok": False, "error": f"mode debe ser 'rapida' o 'normal', no '{mode}'"}
     cad = Path(cad_dir)
@@ -1382,10 +1790,18 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e)[:1500], **info}
         r = _inject(body, imports, timeout=timeout_s, tool="pump_case")
-    steps = _parse_steps(r["stdout"])
-    failed = next((s["i"] for s in steps if s.get("ok") is False), None)
-    return {**info, "ok": bool(r["ok"]) and failed is None, "steps": steps, "failed_at": failed, "seconds": r["seconds"],
-            "macro": r["macro"], "stdout": r["stdout"][-3000:], **_err(r)}
+        steps = _parse_steps(r["stdout"])
+        failed = next((s["i"] for s in steps if s.get("ok") is False), None)
+        out = {**info, "ok": bool(r["ok"]) and failed is None, "steps": steps, "failed_at": failed, "seconds": r["seconds"],
+               "macro": r["macro"], "stdout": r["stdout"][-3000:], **_err(r)}
+        if until in ("stable", "n") and out["ok"]:
+            it = iterate(n=n, until=until, reports=list(reports), block=block)  # mismo turno (re-entrante)
+            out["iterate"] = {k: it.get(k) for k in ("ok", "stopped", "iterations_run", "iteration", "blocks", "seconds",
+                                                    "reports", "variation_pct", "error", "exception", "busy") if k in it}
+            out["ok"] = bool(it.get("ok"))
+        elif until and until not in ("stable", "n"):
+            out["warnings"] = [f"until={until!r} no es «stable» ni «n»: no se iteró"]
+        return out
 
 
 @_tool
@@ -1470,9 +1886,9 @@ def _safe(s: str) -> str:
 
 # ----------------------------------------------------------------------------- memoria
 @_tool
-def recipe_search(query: str = "") -> list[dict]:
+def recipe_search(query: str = "") -> dict:
     """Busca en conocimiento/recetas/ (snippets Java verificados). Devuelve nombre, cabecera y coincidencias.
-    Vacío = lista todas. Úsalas con run_java o run_steps."""
+    Vacío = lista todas (en `resultado`). Úsalas con run_java o run_steps."""
     _touch()
     terms = [t.lower() for t in re.findall(r"\w+", query)]
     hits = []
@@ -1491,10 +1907,10 @@ def recipe_search(query: str = "") -> list[dict]:
 
 
 @_tool
-def recipe_save(name: str, body: str, note: str = "") -> str:
+def recipe_save(name: str, body: str, note: str = "") -> dict:
     """Guarda un snippet que funcionó como conocimiento/recetas/<verbo>-<objeto>.java con cabecera QUE/VERSION/FECHA.
     Para que run_steps lo parametrice: ${nombre} en el cuerpo y «// PARAMS: nombre» en la cabecera.
-    Guardar tras CADA run_java que logre algo nuevo."""
+    Guardar tras CADA run_java que logre algo nuevo. La ruta del archivo va en `resultado`."""
     _touch()
     RECIPES.mkdir(parents=True, exist_ok=True)
     fname = _safe(name.removesuffix(".java")).lower() + ".java"
@@ -1617,6 +2033,7 @@ def macro_body(case_dir, cad_dir, ccm, mode, params):
 def _selftest() -> int:
     global EXE, PORT, SIMS, MACROS, CASES, RECIPES, STATE_FILE, LOCK_FILE, AGENT_LOG, IDLE_MIN, LOCK_WAIT
     global PIPELINE_BOMBA, GUI_TTL, POLL_S, _inject_local, _gui_cache, _list_procs, _iter_hist, _iter_pid
+    global WORK, RES_DIR, TIEMPOS, RES_ON, RES_HB_STALE, RES_START_WAIT, _res_off_until, _javac, _run_javac, _precompile
     import tempfile
     t_all = time.time()
     fake = HERE / "tests" / "fake_starccm.py"
@@ -1631,17 +2048,21 @@ def _selftest() -> int:
     # Todo lo que escribe el falso va al temporal: ni sims/, ni macros/, ni .server.json, ni .inject.lock reales
     # (un selftest antiguo borró el .server.json de un solver vivo de otra sesión).
     real_lock = LOCK_FILE
-    real = (SIMS, MACROS, STATE_FILE)
+    real = (SIMS, MACROS, STATE_FILE, RES_DIR)
+    real_work = _work_dir()
     _real_files = lambda: {(str(p), p.stat().st_mtime_ns) for d in real for p in ([d] if d.is_file() else d.glob("*") if d.is_dir() else [])}
     real_before = _real_files()
-    SIMS, MACROS, STATE_FILE, AGENT_LOG = tmp / "sims", tmp / "macros", tmp / ".server.json", tmp / "agent.log"
+    WORK = tmp / "work"
+    SIMS, MACROS, RES_DIR, TIEMPOS = WORK / "sims", WORK / "macros", WORK / "residente", WORK / "tiempos.csv"
+    STATE_FILE, AGENT_LOG = tmp / ".server.json", tmp / "agent.log"
+    RES_HB_STALE, RES_START_WAIT = 2.0, 8.0
     LOCK_FILE, CASES, RECIPES = tmp / ".inject.lock", tmp / "casos", tmp / "recetas"
     RECIPES.mkdir()
     (RECIPES / "paso-ok.java").write_text('// QUE: paso de prueba\n// PARAMS: nombre\nsim.println("hola ${nombre} y ${Flujo}");\n', encoding="utf-8")
     (RECIPES / "paso-falla.java").write_text('sim.println("AGENT_FAKE_FAIL");\nsim.println("no llega");\n', encoding="utf-8")
     scen = tmp / "scen.txt"
     os.environ["FAKE_SCEN_FILE"] = str(scen)
-    LOCK_WAIT, POLL_S, GUI_TTL = 0.5, 0.2, 1e9
+    LOCK_WAIT, POLL_S, GUI_TTL = 0.5, 0.05, 1e9
     real_list = _list_procs
     seen_rows: list = []
     _list_procs = lambda: []  # sin PowerShell salvo en la sección de la GUI
@@ -1678,8 +2099,9 @@ def _selftest() -> int:
         r = inspect("nodo_que_no_existe")
         check("error" in r, "inspect rechaza nodo desconocido")
         p = recipe_save("probar-selftest", 'sim.println("hola");', "receta de prueba del selftest")
+        p = p["resultado"]
         check(Path(p).is_file() and Path(p).parent == RECIPES, "recipe_save (en la carpeta de recetas)")
-        hits = recipe_search("selftest hola")
+        hits = recipe_search("selftest hola")["resultado"]
         check(any(h["name"] == "probar-selftest.java" for h in hits), "recipe_search encuentra la receta")
         check(RECIPES.parent == tmp and (HERE / "conocimiento" / "recetas").is_dir(), "las recetas reales viven en conocimiento/recetas")
         d = docs_search("Simulation saveState")
@@ -1706,8 +2128,104 @@ def _selftest() -> int:
         check(_redact(f"a {KEY} b") == "a ***PODKEY*** b" and KEY not in json.dumps(_scrub({"x": [f"k={KEY}", {"y": KEY}]})),
               "_redact y _scrub")
 
+        # --- carpetas de trabajo fuera de OneDrive
+        check(_work_dir({"COPILOTO_WORK": str(tmp / "w")}) == tmp / "w"
+              and _work_dir({"LOCALAPPDATA": "C:/X"}) == Path("C:/X") / "starccm-copiloto",
+              "_work_dir: COPILOTO_WORK manda; si no, %LOCALAPPDATA%/starccm-copiloto")
+        check(bool(os.environ.get("COPILOTO_WORK")) or (HERE not in real_work.parents and "onedrive" not in str(real_work).lower()),
+              f"carpeta de trabajo real fuera del repo y de OneDrive ({real_work})")
+        check(all(tmp in q.parents for q in (SIMS, MACROS, RES_DIR, TIEMPOS)) and Path(_state()["log"]).parent == SIMS
+              and CASES.parent == tmp and (HERE / "casos").is_dir(),
+              "sims, macros, residente, tiempos.csv y log del solver cuelgan de la carpeta de trabajo; casos/ se queda en el repo")
+
+        # --- cliente residente (vía por defecto)
+        ri = _res_info()
+        rpid = ri.get("pid")
+        n_launch = _res_launches
+        check(rpid and _pid_alive(rpid) and (RES_DIR / "heartbeat").is_file() and (RES_DIR / "Residente.java").is_file()
+              and ri.get("server_pid") == _state().get("pid"), f"server_start dejó un residente vivo con latido (pid {rpid})")
+        pc_calls = []
+        real_pc = _precompile
+        _precompile = lambda *a, **k: (pc_calls.append(a), None)[1]
+        r = run_java('sim.println("res1");')
+        r2 = run_java('sim.println("res2");')
+        _precompile = real_pc
+        check(r["ok"] and r["stdout"] == "res1" and r2["stdout"] == "res2" and r["via"] == "residente" and r2["via"] == "residente"
+              and isinstance(r["ms"], int) and _res_info()["pid"] == rpid and _res_launches == n_launch,
+              f"run_java por el residente: via, ms y el MISMO residente ({r['ms']} ms, {r2['ms']} ms)")
+        check(not pc_calls, "la vía residente no precompila con javac")
+        check("AGENT_END" in Path(r["macro"]).with_suffix(".out").read_text(encoding="utf-8")
+              and "AGENT_BEGIN" in Path(_res_info()["log"]).read_text(encoding="utf-8") and not macro_running(),
+              "la salida va al log del residente y al .out de la macro; macro_running no la da por viva")
+        r = run_java('sim.println("AGENT_FAKE_COMPILE_ERROR");')
+        check(r["ok"] is False and "compilar" in (r["exception"] or "") and "cannot find symbol" in (r["trace"] or "")
+              and r["via"] == "residente" and _res_info()["pid"] == rpid, "error de compilación: lo devuelve el residente y sigue vivo")
+        r = run_java('sim.println("tras el error");')
+        check(r["ok"] and r["stdout"] == "tras el error" and _res_info()["pid"] == rpid, "tras el error de compilación el residente sigue sirviendo")
+        t0 = time.time()
+        r = _inject('sim.println("AGENT_FAKE_HANG");', timeout=0.4, tool="selftest")
+        npid = _res_info().get("pid")
+        check(r["ok"] is False and r.get("client_killed") and "timeout" in (r["exception"] or "") and not _pid_alive(rpid)
+              and npid and npid != rpid and _pid_alive(npid) and alive() and time.time() - t0 < 12,
+              f"macro colgada: se mata el residente (no el servidor), se relanza y responde error ({time.time() - t0:.1f}s)")
+        rpid = npid
+        r = run_java('sim.println("tras el cuelgue");')
+        check(r["ok"] and r["via"] == "residente" and _res_info()["pid"] == rpid, "tras el cuelgue el residente nuevo sirve")
+        r = run_java('sim.println("AGENT_FAKE_DIE");')
+        npid = _res_info().get("pid")
+        check(r["ok"] is False and r.get("resident_died") and not _pid_alive(rpid) and npid and npid != rpid and alive(),
+              "residente muerto a mitad de macro: error claro (sin repetir la macro por batch) y relanzado")
+        rpid = npid
+        _kill_tree(rpid)
+        r = run_java('sim.println("revive");')
+        check(r["ok"] and r["via"] == "residente" and _res_info()["pid"] != rpid, "residente muerto entre macros: se relanza solo (vía residente)")
+        rpid = _res_info()["pid"]
+        os.environ["FAKE_RESIDENT_MODE"] = "broken"
+        _kill_tree(rpid)
+        n_launch = _res_launches
+        r = run_java('sim.println("por batch");')
+        check(r["ok"] and r["stdout"] == "por batch" and r["via"] == "batch" and "terminó" in (r.get("via_fallback") or "")
+              and _res_launches == n_launch + 2 and not _res_info(),
+              f"residente que no arranca (relanzado una vez): cae al batch y lo dice ({str(r.get('via_fallback'))[:60]})")
+        r = run_java('sim.println("batch 2");')
+        check(r["ok"] and r["via"] == "batch" and _res_launches == n_launch + 2 and "pausa" in (r.get("via_fallback") or ""),
+              "tras fallar dos veces el batch sigue sin reintentar el residente cada macro (pausa)")
+        os.environ.pop("FAKE_RESIDENT_MODE")
+        _res_off_until = 0.0
+        r = run_java('sim.println("de vuelta");')
+        check(r["ok"] and r["via"] == "residente" and _pid_alive(_res_info()["pid"]), "al volver a estar sano el residente vuelve a ser la vía")
+        # guardas de AutoExport
+        b, w = _guard_autoexport("getAutoExport();\nae.getStarUpdate().getIterationUpdateFrequency().setIterations(25);")
+        b2, w2 = _guard_autoexport("getAutoExport();\nae.getStarUpdate().getIterationUpdateFrequency().setIterations(250);")
+        check("setIterations(100)" in b and w and "setIterations(250)" in b2 and not w2
+              and _guard_autoexport("x.setIterations(5);") == ("x.setIterations(5);", []), "AutoExport: frecuencia < 100 sube a 100")
+        r = run_java('sim.getSimulationIterator().getAutoExport(); ae.getIterationUpdateFrequency().setIterations(10);')
+        check("setIterations(100)" in Path(r["macro"]).read_text(encoding="utf-8") and r.get("warnings"), "run_java aplica la guarda de AutoExport")
+        check("setEnabled(false)" in _INIT_AUTOSAVE and "Math.max(100, CADA)" in (HERE / "conocimiento" / "recetas" / "activar-autoexport.java").read_text(encoding="utf-8"),
+              "AutoExport apagado al arrancar y la receta nunca baja de 100")
+        # caché de javac por hash del cuerpo (solo vía batch)
+        calls = []
+        real_javac, real_run = _javac, _run_javac
+        _javac = lambda: ("javac", "cp")
+        _run_javac = lambda cmd: (calls.append(cmd), subprocess.CompletedProcess(cmd, 0, "", ""))[1]
+        fj = MACROS / "Agent_x.java"
+        fj.write_text("x", encoding="utf-8")
+        e = [_precompile(fj, "hashA"), _precompile(fj, "hashA"), _precompile(fj, "hashB")]
+        _run_javac = lambda cmd: (calls.append(cmd), subprocess.CompletedProcess(cmd, 1, "", "boom"))[1]
+        e += [_precompile(fj, "hashC"), _precompile(fj, "hashC")]
+        _javac, _run_javac = real_javac, real_run
+        check(e[:3] == [None] * 3 and e[3:] == ["boom", "boom"] and len(calls) == 4, "precompilación batch: caché por hash (los errores no se cachean)")
+        fj.unlink()
+        # tiempos.csv
+        rows = [ln.split(",") for ln in TIEMPOS.read_text(encoding="utf-8").splitlines()]
+        check(rows[0] == ["fecha", "herramienta", "ms", "via", "ok", "inyecciones"]
+              and any(x[1] == "run_java" and x[3] == "residente" and x[2].isdigit() for x in rows[1:])
+              and any(x[1] == "run_java" and x[3] == "batch" for x in rows[1:]), f"tiempos.csv con herramienta, ms y via ({len(rows) - 1} filas)")
+        ri = recipe_search("selftest")
+        check(ri["via"] == "ninguno" and isinstance(ri["ms"], int), "toda respuesta trae ms y via (también las que no inyectan)")
+
         # --- turnos entre procesos (.inject.lock)
-        child = subprocess.Popen([sys.executable, "-I", "-c", _HOLD, str(LOCK_FILE), "3.0"], stdout=subprocess.PIPE, text=True)
+        child = subprocess.Popen([sys.executable, "-I", "-c", _HOLD, str(LOCK_FILE), "2.2"], stdout=subprocess.PIPE, text=True)
         check(child.stdout.readline().strip() == "HELD", "otro proceso toma el turno")
         t0 = time.time()
         r = run_java('sim.println("x");', wait_s=1)
@@ -1873,7 +2391,9 @@ def _selftest() -> int:
         check("idle_warning" not in _state(), "al haber actividad se borra idle_warning")
         # server_stop con GUI: avisa pero apaga (simulación nueva sin nombre: guarda aparte)
         _write_state({**_state(), "sim": None})
+        rpid = _res_info().get("pid")
         r = server_stop(save=True)
+        check(rpid and not _pid_alive(rpid) and not _res_info() and r.get("residente") == "detenido", "server_stop detiene el residente")
         check(r["stopped"] and r.get("gui_warning") and r.get("saved") and Path(r["saved"]).parent == SIMS and not STATE_FILE.exists(),
               "server_stop con GUI avisa (gui_warning), guarda en sims/nuevo_*.sim y apaga")
         _kill_tree(gui_pid)
@@ -1899,6 +2419,11 @@ def _selftest() -> int:
               f"pump_case arranca el servidor del caso e inyecta UNA macro ({r.get('seconds')}s; {r.get('error') or r.get('exception') or r.get('steps')})")
         r = pump_case("BombaFalsa", str(cad), mode="normal", params={"fallar": True})
         check(r["ok"] is False and r["failed_at"] == 1 and r["steps"][0]["ok"] is True, "pump_case: un paso que falla se reporta con su índice")
+        scen.write_text("stable")
+        n_launch = _res_launches
+        r = pump_case("BombaFalsa", str(cad), until="stable", n=600, block=100)
+        check(r["ok"] and r["via"] == "residente" and r["iterate"]["stopped"] == "stable" and r["iterate"]["blocks"] >= 2
+              and _res_launches == n_launch, f"pump_case until=stable: una macro y luego bloques por el MISMO residente ({r.get('iterate')})")
         r = pump_case("OtroCaso", str(cad))
         check(r["ok"] is False and "otro .sim" in r.get("error", ""), "pump_case se niega si hay otro .sim cargado")
 
@@ -1911,11 +2436,11 @@ def _selftest() -> int:
             out = src.with_suffix(".out")
             out.write_text("AGENT_BEGIN medio\n", encoding="utf-8")
             return 1, "conexión perdida", False, out
-        _inject_local = dying
+        _inject_local, RES_ON = dying, False
         try:
             r = run_java('sim.println("nunca");')
         finally:
-            _inject_local = real_inject
+            _inject_local, RES_ON = real_inject, True
         check(not r["ok"] and r.get("server_died") and "murió" in (r["exception"] or ""), "servidor muerto a mitad de macro: server_died + mensaje claro")
         check(not macro_running() and not LOCK_FILE.exists(), "tras el fallo, su .out queda cerrado y el turno liberado")
         check(not server_status()["alive"], "server_status: no vivo tras morir")
@@ -1937,6 +2462,8 @@ def _selftest() -> int:
         st = _state()
         if st.get("pid") and _pid_alive(st["pid"]):
             _kill_tree(st["pid"])
+        _res_kill("selftest")
+        os.environ.pop("FAKE_RESIDENT_MODE", None)
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"selftest: {len(fails)} fallos" if fails else "selftest: todo en verde")
     return 1 if fails else 0

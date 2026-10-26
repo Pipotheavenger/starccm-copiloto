@@ -10,6 +10,13 @@ Imita lo justo del CLI real:
                                     al cliente, que lo reimprime. `AGENT_FAKE_FAIL` en la macro
                                     simula una excepción (rama catch del wrapper o del paso de run_steps).
   -host localhost:P (sin -batch)    «cliente GUI» falso: queda vivo hasta que lo matan (máx. 120 s)
+  -host ... -batch Residente.java   «cliente residente» falso: vigila <base>/inbox (la ruta sale del propio
+                                    Residente.java), manda cada .java al servidor falso, imprime su salida por stdout
+                                    (el log del residente), escribe <base>/out/<macro>.res y late en <base>/heartbeat
+                                    cada 0,3 s. Termina con <base>/inbox/STOP. Simulaciones por texto de la macro:
+                                    AGENT_FAKE_COMPILE_ERROR (error de compilación, sin AGENT_BEGIN), AGENT_FAKE_HANG
+                                    (se cuelga sin resultado), AGENT_FAKE_DIE (el residente muere). Por entorno
+                                    FAKE_RESIDENT_MODE: broken (sale al arrancar) | silent (vive pero no late).
 Entiende además los marcadores de run_steps (STEP_BEGIN/OK/ERROR/END/SKIPPED, `_stop = true;`) y simula iterate:
 `.step(N)` avanza una iteración falsa, el plot Residuals se exporta a CSV y cada Report imprime su valor. La
 curva sale de la escena que dice el archivo $FAKE_SCEN_FILE: stable | plateau | drift (cambiar de escena
@@ -67,6 +74,8 @@ def main(argv):
         macro_path = argv[argv.index("-batch") + 1]
         with open(macro_path, encoding="utf-8") as f:
             text = f.read()
+        if os.path.basename(macro_path).startswith("Residente"):
+            return resident(host, int(port), text)
         c = socket.create_connection(("127.0.0.1" if host == "localhost" else host, int(port)), timeout=10)  # localhost -> ::1 primero tardaba 2 s en Windows
         c.sendall(text.encode("utf-8") + END)
         c.shutdown(socket.SHUT_WR)
@@ -85,6 +94,69 @@ def main(argv):
         return 0
     print("fake_starccm: argumentos no soportados: " + " ".join(argv), file=sys.stderr)
     return 2
+
+
+def send_macro(host, port, text):
+    """Manda una macro al servidor falso y devuelve su salida (lo que hace el cliente batch de un solo uso)."""
+    c = socket.create_connection(("127.0.0.1" if host == "localhost" else host, port), timeout=10)
+    c.sendall(text.encode("utf-8") + END)
+    c.shutdown(socket.SHUT_WR)
+    out = b""
+    while True:
+        chunk = c.recv(65536)
+        if not chunk:
+            break
+        out += chunk
+    c.close()
+    return out.decode("utf-8", "replace")
+
+
+def resident(host, port, text):
+    import threading
+    mode = os.environ.get("FAKE_RESIDENT_MODE", "")
+    if mode == "broken":
+        print("fake residente roto: no arranca", flush=True)
+        return 1
+    base = re.search(r'new File\("([^"]+)"\)', text).group(1)
+    inbox, out, hb = os.path.join(base, "inbox"), os.path.join(base, "out"), os.path.join(base, "heartbeat")
+    run = [True]
+
+    def beat():
+        while run[0] and mode != "silent":
+            with open(hb, "w") as f:
+                f.write(str(time.time()))
+            time.sleep(0.3)
+    threading.Thread(target=beat, daemon=True).start()
+    print("RESIDENTE listo", flush=True)
+    while True:
+        if os.path.exists(os.path.join(inbox, "STOP")):
+            break
+        for name in sorted(n for n in os.listdir(inbox) if n.endswith(".java")):
+            p = os.path.join(inbox, name)
+            with open(p, encoding="utf-8") as f:
+                macro = f.read()
+            err = ""
+            if "AGENT_FAKE_DIE" in macro:
+                os._exit(3)
+            if "AGENT_FAKE_HANG" in macro:
+                time.sleep(300)
+            if "AGENT_FAKE_COMPILE_ERROR" in macro:
+                err = "java.lang.RuntimeException: compilation failed\n\tAgent.java:7: error: cannot find symbol (fake)"
+            else:
+                try:
+                    print(send_macro(host, port, macro), flush=True)
+                except Exception as e:  # noqa: BLE001
+                    err = f"conexión con el servidor: {e!r}"
+            print("RESIDENTE_FIN " + name, flush=True)
+            os.remove(p)
+            tmp = os.path.join(out, name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(("ERR " if err else "OK ") + "1.0\n" + err)
+            os.replace(tmp, os.path.join(out, name + ".res"))
+        time.sleep(0.02)
+    run[0] = False
+    print("RESIDENTE fin", flush=True)
+    return 0
 
 
 _LITERAL = re.compile(r'^"((?:[^"\\]|\\.)*)"$')

@@ -13,9 +13,10 @@ Todo es herencia de `starccm-agent/starccm` (2026-10-23 a 26) salvo lo marcado �
 | `memoria/*.md` | memoria de Claude sobre Sebastián, la licencia PoD y el estado del agente al 2026-10-23 |
 | `recetas/README.md` | formato de receta: cabecera QUE/VERSION/FECHA(/ESTADO); el cuerpo es lo de dentro de `execute()` |
 | `casos/<caso>/RESUMEN.md` | resumen de cada caso; guiones `run.py` (BombaRapida) y `pump.py` (cursocfturbo) |
-| `../pipelines/bomba.py` | nuevo: genera una macro de bomba desde el `.cfturbo-ccm` + STEP |
+| `../pipelines/bomba.py` | nuevo: genera una macro de bomba desde el `.cfturbo-ccm` + STEP; opcional `iterar` (H y M estables, máx. 1000) y `post` (planos, PNG, y+, resultados); `post_body`, `iterate_body`, `recetas()` |
+| `plantillas_casos.md` | nuevo: recetas de caso listas para `run_steps` con pasos, parámetros y tiempos: tubería/cilindro (verificada con pasos fijos), perfil NACA desde STL con 4 superficies (no verificada), misma bomba con otro `Flujo` |
 
-## Recetas (34)
+## Recetas (36)
 
 ### Bomba por pasos (de cursocfturbo; el pipeline las reemplaza con nombres tomados del ccm)
 
@@ -53,6 +54,8 @@ Todo es herencia de `starccm-agent/starccm` (2026-10-23 a 26) salvo lo marcado �
 |---|---|---|
 | `reportes-euler-triangulos` | U, Vu, Vr, UVu, H_Euler, eta_Euler, factor de deslizamiento, TotalHead, gráficos; fronteras del rotor por nombre; validación final con AVISO | nuevo (2026-10-26): **no verificado con solver**; la versión previa fallaba en BombaPruebaNR |
 | `iterar-y-leer-residuales` | N iteraciones, exporta `Residuals` a CSV y lee reportes (base de `iterate`) | verificado |
+| `iterar-hasta-estable` | bloques de 50 hasta que los reportes dados varían < 0,5 % en 100 it (máx. `max_iter`); residual y meseta solo se reportan; para `run_steps` (PARAMS: case_dir, max_iter, reportes) | nuevo (2026-10-26): compila; juez probado con datos de BombaRapida; **no verificado con solver** |
+| `post-bomba` | planos auto, escenas presion_alabes / velocidad_relativa / yplus a PNG, y+ en álabes, RESULT, balance de masa y validación de Euler en una macro (PARAMS: case_dir) | nuevo: compila; **no verificado con solver** |
 | `informe-detalle` | vuelca el detalle del .sim para el informe PDF (reflexión + try/catch) | compila; verificado con solver local |
 | `print-tree` | regiones, fronteras, continuos y reportes (base de `inspect`) | no verificado |
 | `desactivar-autosave` | apaga el autoguardado batch | verificado |

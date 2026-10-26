@@ -20,12 +20,22 @@ REPO = HERE.parent
 ESTADO = HERE / ".estado.json"
 
 ESTILO = (
-    "Eres el copiloto de STAR-CCM+ de Sebastián. Responde en español, con frases cortas y los números en tablas. "
-    "El usuario mira la GUI real de STAR-CCM+ conectada al mismo servidor: di qué mirar allí "
-    "(p. ej. «abre Scenes › presion_alabes»). No toques nada mientras el usuario edita en la GUI: si no estás seguro, "
-    "pregunta. Antes de cada herramienta escribe UNA frase corta de qué vas a hacer. Pregunta antes de lo caro "
-    "(mallas grandes, muchas iteraciones, apagar el solver). Termina con una línea: qué quedó hecho."
+    "Copiloto de STAR-CCM+ de Sebastián. Español, 1-3 frases, números en tablas. Velocidad: cada turno del modelo cuesta "
+    "más que el solver. Bomba de CFturbo: pump_case, no pasos sueltos. Agrupa pasos con run_steps. iterate con "
+    "until=\"stable\". No verifiques con macros aparte lo que el resultado ya trae; no repitas pasos que ya funcionaron. "
+    "Si falta un dato, UNA sola pregunta. El usuario mira la GUI real: di qué abrir (p. ej. «Scenes › presion_alabes»). "
+    "No toques nada mientras edita en la GUI. Pregunta antes de lo caro (mallas grandes, apagar). Cierra con qué quedó hecho."
 )
+
+MODOS = {"rapido": ("Rápido", "PANEL_MODEL_RAPIDO", "sonnet", "low"),
+         "preciso": ("Preciso", "PANEL_MODEL_PRECISO", "opus", "medium")}
+PREFIJO_COLA = "MENSAJE DEL USUARIO MIENTRAS TRABAJABAS:\n"
+
+
+def modo_flags(modo: str) -> list[str]:
+    _, var, model, effort = MODOS.get(modo, MODOS["rapido"])
+    return ["--model", os.environ.get(var) or model, "--effort", effort]
+
 
 # ---------- traducción de herramientas ----------
 TOOLS = {
@@ -88,7 +98,7 @@ def parse_event(line: str) -> list[tuple]:
                 txt = c if isinstance(c, str) else " ".join(x.get("text", "") for x in (c or []) if isinstance(x, dict))
                 ev.append(("tool_result", b.get("tool_use_id", ""), txt[:300], bool(b.get("is_error"))))
     elif t == "result":
-        ev.append(("result", o.get("session_id"), o.get("subtype"), bool(o.get("is_error"))))
+        ev.append(("result", o.get("session_id"), o.get("subtype"), bool(o.get("is_error")), o.get("num_turns")))
     return ev
 
 
@@ -103,7 +113,7 @@ def claude_bin() -> str | None:
 DEFAULT_TOOLS = "mcp__starccm__*,Read,Glob,Grep"
 
 
-def build_cmd(msg: str, sid: str | None, allowed: str = DEFAULT_TOOLS) -> list[str] | None:
+def build_cmd(msg: str, sid: str | None, allowed: str = DEFAULT_TOOLS, modo: str = "rapido") -> list[str] | None:
     b = claude_bin()
     if not b:
         return None
@@ -111,6 +121,7 @@ def build_cmd(msg: str, sid: str | None, allowed: str = DEFAULT_TOOLS) -> list[s
     cmd = pre + ["-p", msg, "--output-format", "stream-json", "--verbose"]
     if sid:
         cmd += ["--resume", sid]
+    cmd += modo_flags(modo)
     cmd += ["--mcp-config", str(REPO / ".mcp.json"), "--strict-mcp-config", "--allowedTools", allowed,
             "--append-system-prompt", ESTILO]
     return cmd
@@ -135,8 +146,8 @@ class Runner:
     def busy(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def send(self, msg: str, sid: str | None, allowed: str = DEFAULT_TOOLS) -> bool:
-        cmd = build_cmd(msg, sid, allowed)
+    def send(self, msg: str, sid: str | None, allowed: str = DEFAULT_TOOLS, modo: str = "rapido") -> bool:
+        cmd = build_cmd(msg, sid, allowed, modo)
         if not cmd:
             self.q.put(("error", "no encuentro la CLI `claude` (PATH o PANEL_CLAUDE_BIN)"))
             self.q.put(("done", -1, False))
@@ -172,18 +183,39 @@ class Runner:
 
 
 # ---------- sesión y estado ----------
-def load_sid() -> str | None:
+def load_estado() -> dict:
     try:
-        return json.loads(ESTADO.read_text(encoding="utf-8")).get("session_id")
+        d = json.loads(ESTADO.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
-        return None
+        return {}
+
+
+def save_estado(**kw) -> None:
+    d = load_estado()
+    d.update(kw)
+    try:
+        ESTADO.write_text(json.dumps(d), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_sid() -> str | None:
+    return load_estado().get("session_id")
 
 
 def save_sid(sid: str | None) -> None:
-    try:
-        ESTADO.write_text(json.dumps({"session_id": sid}), encoding="utf-8")
-    except OSError:
-        pass
+    save_estado(session_id=sid)
+
+
+def load_modo() -> str:
+    m = load_estado().get("modo")
+    return m if m in MODOS else "rapido"
+
+
+def fmt_s(x: float) -> str:
+    x = int(round(x))
+    return f"{x} s" if x < 60 else f"{x // 60} min {x % 60:02d} s"
 
 
 def pid_alive(pid) -> bool:
@@ -264,6 +296,11 @@ class Panel:
         self.sid = load_sid()
         self.last_msg = ""
         self.tools: dict[str, tuple[str, float]] = {}
+        self.pending: list[tuple[str, str]] = []  # (mark, texto) mensajes en cola
+        self.turn_t0 = 0.0
+        self.tool_s = 0.0
+        self.n_tools = 0
+        self.npend = 0
         self.confirm: dict[str, float] = {}
         root.title("Copiloto STAR-CCM+")
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -279,6 +316,16 @@ class Panel:
         self.status.pack(side="left", fill="x", expand=True, padx=6, pady=3)
         tk.Checkbutton(bar, text="Encima", variable=self.top, command=self.toggle_top, bg="#e8ebf0", font=FONT).pack(side="right", padx=4)
         bar.bind("<Configure>", lambda e: self.status.config(wraplength=max(e.width - 100, 100)))
+        mbar = tk.Frame(root, bg="#e8ebf0")
+        mbar.pack(fill="x")
+        tk.Label(mbar, text="Modo:", bg="#e8ebf0", font=FONT).pack(side="left", padx=(6, 2))
+        self.modo = tk.StringVar(value=load_modo())
+        for k, (nombre, *_r) in MODOS.items():
+            tk.Radiobutton(mbar, text=nombre, value=k, variable=self.modo, command=self.on_modo, bg="#e8ebf0",
+                           activebackground="#e8ebf0", font=FONT).pack(side="left", padx=2)
+        self.modo_info = tk.Label(mbar, text="", bg="#e8ebf0", fg="#666", font=(FONT[0], 9))
+        self.modo_info.pack(side="left", padx=6)
+        self.on_modo(save=False)
 
         foot = tk.Frame(root, bg="#f5f6f8")
         foot.pack(side="bottom", fill="x")
@@ -286,14 +333,16 @@ class Panel:
         row.pack(fill="x", padx=6, pady=(4, 0))
         self.btn = {}
         for key, txt, cmd in (("enviar", "Enviar", self.on_send), ("detener", "Detener", self.on_stop),
-                              ("nueva", "Nueva conversación", self.on_new), ("gui", "Abrir GUI", self.on_gui),
+                              ("nueva", "Nueva", self.on_new), ("gui", "Abrir GUI", self.on_gui),
                               ("apagar", "Apagar solver", self.on_off)):
-            b = tk.Button(row, text=txt, command=cmd, font=FONT, padx=6)
+            b = tk.Button(row, text=txt, command=cmd, font=FONT, padx=4)
             b.pack(side="left", padx=2, pady=2)
             self.btn[key] = b
         self.btn["enviar"].config(bg="#2563eb", fg="white")
         self.entry = tk.Text(foot, height=3, wrap="word", font=FONT, relief="solid", bd=1)
         self.entry.pack(fill="x", padx=6, pady=6)
+        self.live = tk.Label(root, text="", anchor="w", bg="#f5f6f8", fg="#1d4ed8", font=FONT)
+        self.live.pack(side="bottom", fill="x", padx=8)
 
         self.hist = tk.Text(root, wrap="word", state="disabled", font=FONT, bg="#ffffff", fg="#1b1b1b", relief="flat",
                             padx=8, pady=6, spacing3=3)
@@ -311,6 +360,8 @@ class Panel:
         h.tag_config("bad", foreground="#c62828")
         h.tag_config("err", foreground="#c62828", font=(FONT[0], FONT[1], "bold"))
         h.tag_config("sys", foreground="#777777")
+        h.tag_config("stat", foreground="#888888", font=(FONT[0], 9), spacing1=2, spacing3=8)
+        h.tag_config("queued", foreground="#b45309", font=(FONT[0], 9, "italic"))
 
         self.entry.bind("<Return>", lambda e: (self.on_send(), "break")[1])
         self.entry.bind("<Shift-Return>", lambda e: None)
@@ -354,15 +405,45 @@ class Panel:
         msg = (msg if isinstance(msg, str) else self.entry.get("1.0", "end")).strip()
         if not msg:
             return
-        if self.runner.busy:
-            self.say("Espera a que termine o pulsa Detener.", "sys")
-            return
         self.last_msg = msg
-        self.put(msg + "\n", "user")
         self.entry.delete("1.0", "end")
-        self.btn["enviar"].config(state="disabled")
-        if not self.runner.send(msg, self.sid):
-            self.btn["enviar"].config(state="normal")
+        if self.runner.busy:  # cola: se envía con --resume al terminar el paso en curso
+            self.put(msg, "user")
+            self.npend += 1
+            mk = f"q_{self.npend}"
+            self.put("  · en cola", "queued")
+            self.hist.mark_set(mk, "end-1c")
+            self.hist.mark_gravity(mk, "left")
+            self.put("\n")
+            self.pending.append((mk, msg))
+            return
+        self.put(msg + "\n", "user")
+        self.start(msg)
+
+    def on_modo(self, save=True):
+        fl = modo_flags(self.modo.get())
+        self.modo_info.config(text=f"{fl[1]} · esfuerzo {fl[3]}")
+        if save:
+            save_estado(modo=self.modo.get())
+
+    def start(self, msg):
+        self.turn_t0, self.tool_s, self.n_tools = time.time(), 0.0, 0
+        self.runner.send(msg, self.sid, modo=self.modo.get())
+
+    def flush_queue(self):
+        if not self.pending:
+            return
+        items, self.pending = self.pending, []
+        self.hist.config(state="normal")
+        for mk, _ in items:  # quita la marca «en cola»
+            r = self.hist.tag_ranges("queued")
+            for i in range(0, len(r), 2):
+                if self.hist.compare(r[i + 1], "==", mk):
+                    self.hist.delete(r[i], r[i + 1])
+                    break
+        self.hist.config(state="disabled")
+        self.say("▸ enviando tus mensajes pendientes…", "sys")
+        self.start(PREFIJO_COLA + "\n".join(m for _, m in items))
 
     def on_up(self, e):
         if not self.entry.get("1.0", "end").strip() and self.last_msg:
@@ -371,8 +452,10 @@ class Panel:
 
     def on_stop(self):
         if self.runner.busy:
+            n = len(self.pending)
+            self.pending.clear()
             self.runner.stop()
-            self.say("Detenido.", "sys")
+            self.say("Detenido." + (f" Descarté {n} mensaje(s) en cola." if n else ""), "sys")
 
     def twice(self, key, button, normal, action):
         """Confirmación dentro del panel: el primer clic pide confirmar; el segundo (en 4 s) ejecuta."""
@@ -395,13 +478,13 @@ class Panel:
         def go():
             self.runner.stop()
             self.sid = None
+            self.pending.clear()
             save_sid(None)
             self.hist.config(state="normal")
             self.hist.delete("1.0", "end")
             self.hist.config(state="disabled")
-            self.btn["enviar"].config(state="normal")
             self.say("Conversación nueva.", "sys")
-        self.twice("nueva", self.btn["nueva"], "Nueva conversación", go)
+        self.twice("nueva", self.btn["nueva"], "Nueva", go)
 
     def on_gui(self):
         self.on_send("Abre la GUI con gui_attach")
@@ -423,6 +506,7 @@ class Panel:
         elif k == "text":
             self.agent_text(ev[1])
         elif k == "tool":
+            self.n_tools += 1
             self.put(f"▶ {ev[2]} … ", "tool")
             self.hist.mark_set("m_" + ev[1], "end-1c")
             self.hist.mark_gravity("m_" + ev[1], "left")
@@ -431,6 +515,7 @@ class Panel:
         elif k == "tool_result":
             if ev[1] in self.tools:
                 _, t0 = self.tools.pop(ev[1])
+                self.tool_s += time.time() - t0
                 self.hist.config(state="normal")
                 self.hist.insert("m_" + ev[1], f"{round(time.time() - t0)} s ", "tool", "✗" if ev[3] else "✓", "bad" if ev[3] else "ok")
                 self.hist.config(state="disabled")
@@ -442,13 +527,22 @@ class Panel:
                 save_sid(self.sid)
             if ev[3]:
                 self.say("La conversación terminó con error.", "err")
+            if self.turn_t0:
+                tot = time.time() - self.turn_t0
+                nt = ev[4] if len(ev) > 4 and ev[4] else "?"
+                self.say(f"⏱ {fmt_s(tot)} en total · {nt} turnos del modelo · {fmt_s(self.tool_s)} en herramientas "
+                         f"({self.n_tools}) · {fmt_s(max(tot - self.tool_s, 0))} pensando", "stat")
+                self.turn_t0 = 0.0
         elif k == "error":
             self.say(ev[1], "err")
         elif k == "raw":
             self.say(ev[1], "sys")
         elif k == "done":
             self.tools.clear()
-            self.btn["enviar"].config(state="normal")
+            self.live.config(text="")
+            if ev[2] or ev[1] != 0:
+                self.pending.clear()
+            self.flush_queue()
 
     def pump(self):
         try:
@@ -456,7 +550,17 @@ class Panel:
                 self.handle(self.q.get_nowait())
         except queue.Empty:
             pass
+        self.tick()
         self.root.after(100, self.pump)
+
+    def tick(self):
+        if self.tools:
+            label, t0 = max(self.tools.values(), key=lambda v: v[1])
+            self.live.config(text=f"▶ {label} … {fmt_s(time.time() - t0)}", fg="#1d4ed8")
+        elif self.runner.busy:
+            self.live.config(text=f"… la IA piensa {fmt_s(time.time() - self.turn_t0)}" if self.turn_t0 else "", fg="#777777")
+        else:
+            self.live.config(text="")
 
     def refresh(self):
         s = read_status()
@@ -503,6 +607,19 @@ def selftest():
     cmd = build_cmd("hola", "sid-1")
     check(cmd and "--resume" in cmd and cmd[cmd.index("--resume") + 1] == "sid-1" and "--strict-mcp-config" in cmd, "comando con --resume y MCP estricto")
     check("--resume" not in build_cmd("hola", None), "sin sesión no hay --resume")
+    c = build_cmd("hola", None)
+    check(c[c.index("--model") + 1] == "sonnet" and c[c.index("--effort") + 1] == "low", "modo Rápido por defecto: sonnet / low")
+    c = build_cmd("hola", None, modo="preciso")
+    check(c[c.index("--model") + 1] == "opus" and c[c.index("--effort") + 1] == "medium", "modo Preciso: opus / medium")
+    os.environ["PANEL_MODEL_RAPIDO"] = "haiku"
+    check(build_cmd("x", None)[build_cmd("x", None).index("--model") + 1] == "haiku", "PANEL_MODEL_RAPIDO configurable")
+    del os.environ["PANEL_MODEL_RAPIDO"]
+    check(len(ESTILO) < 900 and "pump_case" in ESTILO and "run_steps" in ESTILO and "stable" in ESTILO, f"prompt de velocidad corto ({len(ESTILO)} car.)")
+    save_sid("s-9")
+    save_estado(modo="preciso")
+    check(load_modo() == "preciso" and load_sid() == "s-9", "modo persistente sin pisar la sesión")
+    save_estado(modo="rapido", session_id=None)
+    check(parse_event(json.dumps({"type": "result", "session_id": "a", "subtype": "success", "num_turns": 4}))[0][4] == 4, "result trae num_turns")
     os.environ["CLAUDE_CODE_X"] = "1"
     check(not any(k.startswith("CLAUDE") for k in clean_env()), "entorno sin CLAUDE*")
 
@@ -562,14 +679,36 @@ def selftest():
     except Exception as e:  # sin pantalla
         print("OMITE parte visual:", str(e)[:60])
     else:
+        os.environ["FAKE_PAUSE"] = "0.4"
         p = Panel(root)
+
+        def spin(cond, secs=15):
+            end = time.time() + secs
+            while time.time() < end and not cond():
+                root.update()
+                time.sleep(0.02)
+            return cond()
+        t_ini = time.time()
         p.on_send("hola")
-        end = time.time() + 15
-        while time.time() < end and not (p.btn["enviar"]["state"] == "normal" and "Listo: 3 partes" in p.hist.get("1.0", "end")):
-            root.update()
-            time.sleep(0.02)
+        check(spin(lambda: p.live.cget("text").startswith("▶ Macro: importar los STEP del caso … ")), "cronómetro en vivo de la herramienta")
+        p.modo.set("preciso")
+        p.on_modo()
+        check(load_modo() == "preciso", "selector de modo guarda en .estado.json")
+        p.on_send("segundo mensaje")  # CLI ocupada -> cola
+        check(len(p.pending) == 1 and "en cola" in p.hist.get("1.0", "end"), "mensaje encolado visible como «en cola»")
+        check(spin(lambda: "Recibido: segundo mensaje" in p.hist.get("1.0", "end") and not p.runner.busy and not p.pending), "cola enviada con --resume al terminar")
         txt = p.hist.get("1.0", "end")
-        check("▶ Macro: importar los STEP del caso … 0 s ✓" in txt and "Listo: 3 partes" in txt, "ventana: historial con línea de herramienta ✓")
+        check("en cola" not in txt and txt.count("⏱") == 2 and "turnos del modelo" in txt and "en herramientas" in txt, "línea gris de tiempos por turno (2 turnos)")
+        check("▶ Macro: importar los STEP del caso … 0 s ✓" in txt.replace("… 0 s", "… 0 s") or "Macro: importar los STEP del caso … " in txt, "ventana: historial con línea de herramienta")
+        check(load_estado().get("modo") == "preciso", "modo sigue guardado")
+        p.on_send("otro")
+        p.on_send("y otro")
+        p.on_stop()
+        spin(lambda: not p.runner.busy)
+        check(not p.pending, "Detener descarta la cola")
+        spin(lambda: p.live.cget("text") == "", 3)
+        p.modo.set("rapido")
+        p.on_modo()
         check(load_sid() == "fake-0001", "ventana: sesión guardada")
         p.agent_text("**fuerte** y `cod`\n| a | b |\n|---|---|")
         check("fuerte y cod" in p.hist.get("1.0", "end"), "markdown renderizado")

@@ -5,6 +5,43 @@ Diseño y piezas: [ARQUITECTURA.md](ARQUITECTURA.md) (manda). Todo lo heredado d
 `conocimiento/` (mapa en [conocimiento/INDICE.md](conocimiento/INDICE.md)); las lecciones del remoto retirado y de
 la interfaz web antigua (`ui/`, puerto 8767) quedan solo en [conocimiento/CLAUDE_agente_anterior.md](conocimiento/CLAUDE_agente_anterior.md).
 
+## Velocidad (leer primero)
+
+Objetivo: que todo funcione lo más rápido posible sin depender de los núcleos del solver. Medido el 2026-10-26 con la
+misma bomba: corrida improvisada **45 min** frente a **3 min 45 s** con el guion fijo de BombaRapida (12×). El 65 % de los
+45 min (≈ 29 min) fue la IA pensando entre macros: física configurada 3 veces, 11 macros para los reportes de Euler, 6
+escenas una por una y un criterio de residual < 1e-4 que no se alcanza aunque H y M estén estables desde la iteración 100.
+
+| # | regla | cifra que la respalda |
+|---|---|---|
+| 1 | **Pipeline primero.** Bomba de CFturbo: `pump_case(case, cad_dir, params={"iterar": true, "post": true})` va de importar a resultados, PNG y validación de Euler en UNA inyección | BombaRapida 3 min 45 s con 300 it; con parada estable (~200 it) ≈ 3 min (estimado, sin correr) |
+| 2 | **`run_steps` agrupa; nunca una macro por escena ni por reporte.** Varios pasos, una llamada (recetas de caso: `conocimiento/plantillas_casos.md`) | 11 macros de Euler = 11 turnos de IA + 95 s de arranque batch; la misma lógica va en el pipeline |
+| 3 | **`iterate(until="stable")`** (o `iterar` del pipeline / receta `iterar-hasta-estable`): para cuando H y M varían < 0,5 % en 100 it; **máximo 1000** (no 2000) | BombaPruebaNR: H 14,145 → 14,082 entre it 100 y 200 (0,45 %), corrió 700 it (430 s) sin cambiar nada |
+| 4 | **El residual < 1e-4 NO es condición de parada**: se reporta (`RESIDUAL`) y la meseta sale como aviso. Frozen rotor se queda en ~1e-2 | BombaPruebaNR: plateau 3e-2 con H y M estables; BombaRapida: H a 0,5 % en it 100 |
+| 5 | **No reconfigurar física ni fronteras ya creadas**: `inspect` una vez antes de tocar; reusar continuo, parámetro `Flujo` y reportes | física configurada 3 veces en la corrida de 45 min |
+| 6 | **Preguntar una sola vez**, todas las dudas juntas con opciones y la cifra de coste; lo demás se decide con los defaults de este archivo y se dice en una línea | cada ida y vuelta con el usuario son minutos |
+| 7 | **Respuestas cortas**: una tabla de números y qué abrir en la GUI; sin narrar pasos ni repetir lo que la GUI ya muestra | |
+| 8 | **Panel en modo Rápido** (sonnet, esfuerzo bajo; es el defecto) salvo diagnóstico difícil (diverge, interfaces, Euler mal): ahí Preciso | la IA es el 65 % del tiempo |
+
+Dos vías equivalentes para iterar un caso nuevo: `params={"iterar": true}` (dentro de la misma macro, ninguna inyección
+más) o `pump_case(until="stable")` (después, por bloques con `iterate`). Usar una, no las dos.
+
+Criterio de parada por defecto, para todo caso: H y M estables (< 0,5 % en 100 iteraciones, comprobado cada 50) y máximo
+1000 iteraciones. Si llega a 1000 sin estabilizarse o diverge, no dar el resultado como convergido. Una magnitud con media
+≈ 0 (p. ej. Cl a 0°) no sirve como criterio: la variación es relativa a la media.
+
+### Lecciones de velocidad
+- **Cliente residente** (`poc_residente/RESULTADO.md`, 2026-10-26, solver real): un solo cliente batch `-noexit` vigila una
+  carpeta y ejecuta cada macro con `StarScript`: **0,7–1 s por macro frente a 8,6 s** (≈ 10×; ~50 macros por caso ≈ 7 min).
+  Es la vía por defecto del MCP (`STARCCM_RESIDENT=1`; cada respuesta trae `via`; cae al cliente batch si falla) y no
+  precompila: un error de compilación vuelve en ~0,6 s. Consecuencia: el coste de una macro ya no es el arranque sino el
+  turno de la IA; seguir agrupando.
+- **Carpetas fuera de OneDrive**: `sims/`, `macros/`, `residente/` y `tiempos.csv` viven en `COPILOTO_WORK` (por defecto
+  `%LOCALAPPDATA%\starccm-copiloto`), no en el repo: OneDrive sincronizaría cada `.sim` de 50–150 MB en cada guardado y
+  bloquea archivos mientras se escriben (lecturas fallidas de `.server.json`). En el repo solo cosas pequeñas:
+  `casos/<caso>/` (CAD, reportes, PNG, RESUMEN.md), recetas, `.server.json`, `.inject.lock`. Todo `.sim` o carpeta de
+  resultados grande se guarda fuera de OneDrive.
+
 ## Modelo de trabajo (nuevo)
 
 El usuario trabaja con la **GUI real de STAR-CCM+** conectada al MISMO servidor que el agente, y te habla desde el
@@ -17,17 +54,19 @@ operara la GUI. Reglas:
    corre el usuario NO toca la GUI; avisarle al empezar algo largo («no toques la GUI hasta que termine»).
 3. **Decir qué abrir en la GUI** después de cada hito, con la ruta del árbol: «abre Scenes › presion_alabes»,
    «Reports › H», «Plots › Residuals». `scene.open()` en una macro abre la escena en el cliente batch, NO en la GUI.
-4. **`pump_case` primero** para una bomba de CFturbo (importar a malla lista en una macro, ~1 min). `run_java` solo
-   para lo que el pipeline no cubre; antes `recipe_search`, luego `docs_search`, inventar al final.
+4. **`pump_case` primero** para una bomba de CFturbo (importar a malla lista en una macro, ~1 min; con
+   `params={"iterar": true, "post": true}` sigue hasta resultados y PNG). `run_java` solo para lo que el pipeline no
+   cubre; antes `recipe_search` y `plantillas_casos.md`, luego `docs_search`, inventar al final.
 5. **Agrupar con `run_steps`**: cada inyección cuesta 8–10 s de arranque del cliente Java; varios pasos = una macro.
-6. **`iterate(n, until="stable")`**: corre por bloques y para solo cuando H y M varían < 0,5 % en 100 iteraciones
-   (o plateau de residuales); dice el motivo. No fijar 2000 iteraciones a ciegas.
-7. **Preguntar antes de lo caro**: malla fina (> ~400 k celdas), > 500 iteraciones, curvas de caudales, cambiar de
-   caso con otro .sim cargado, apagar con la GUI conectada. Las cifras de coste van en la pregunta.
+6. **`iterate(n=1000, until="stable")`**: corre por bloques y para cuando H y M varían < 0,5 % en 100 iteraciones; avisa
+   si los residuales están en meseta y dice el motivo. Máximo 1000 por defecto; el residual < 1e-4 no es condición.
+7. **Preguntar antes de lo caro, una sola vez** (todas las dudas juntas): malla fina (> ~400 k celdas), > 1000
+   iteraciones, curvas de caudales, cambiar de caso con otro .sim cargado, apagar con la GUI conectada. Las cifras de
+   coste van en la pregunta.
 8. **Apagar el solver al terminar** (`server_stop`, guarda). Con GUI conectada el vigilante no apaga: deja
    `idle_warning` en `.server.json` y el panel pregunta. Nunca matar la GUI; al cerrarla el usuario elige
    «desconectar», no «terminar servidor». `server_stop` avisa si hay GUI conectada.
-9. Trabajar sobre copias en `sims/`, nunca sobre el .sim original del usuario.
+9. Trabajar sobre copias en `sims/` (dentro de `COPILOTO_WORK`, fuera de OneDrive), nunca sobre el .sim original del usuario.
 
 ## Reglas operativas
 
@@ -35,7 +74,8 @@ operara la GUI. Reglas:
 - Claves de licencia solo en `.env` (ignorado por git). Nunca en código, recetas, logs, `.server.json` ni commits;
   el MCP enmascara la clave (`_redact`) en todo lo que escribe.
 - Check ejecutable de cada pieza: `python mcp_server.py --selftest`, `python panel/chat_panel.py --selftest`,
-  `python pipelines/bomba.py --selftest` (sin licencia ni solver; javac del JDK de STAR-CCM+).
+  `python pipelines/bomba.py --selftest` (sin licencia ni solver; javac del JDK de STAR-CCM+: compila la macro con iterar y post,
+  las recetas generadas y los bloques de `conocimiento/plantillas_casos.md`; prueba el juez de estabilidad con datos de BombaRapida).
 - Python del repo: `.venv\Scripts\python.exe` (3.14, paquete `mcp`). Java: el del JDK de STAR-CCM+, no instalar otro.
 - Memoria del agente: tras cada `run_java` que logre algo nuevo → `recipe_save` (receta `<verbo>-<objeto>.java`, cabecera
   QUE/VERSION/FECHA/ESTADO). Recetas con `// ESTADO: no verificado…` son de memoria de Claude: probar antes de confiar.
@@ -90,9 +130,9 @@ Ante una duda (fronteras, modelos, fluido, seguir o no) preguntar con opciones y
 | 5 rotor | MRF (frozen rotor) con las rpm y el eje del ccm |
 | 6 fronteras | presión total 0 Pa en la entrada; caudal en la SALIDA con parámetro global `Flujo` (`-${Flujo}`); resto paredes |
 | 7 reportes | `pt_in`, `pt_out`, `Q_in`, `Q_out`, `M`, `H`, `P_hid`, `P_eje`, `eta` + Euler (U, Vu, Vr, `UVu`, `H_Euler`, `eta_Euler`, factor de deslizamiento si hay β2) |
-| 8 correr | `iterate(until="stable")`; máximo 2000 |
-| 9 cierre | balance de masa < 0,5 %, y+ en álabes, escenas (presión en álabes, planos con TotalHead y vectores), `RESUMEN.md`, guardar, apagar |
-| 10 curva | 5 caudales entre 0,6 y 1,3 del nominal reusando la malla: basta cambiar `Flujo` |
+| 8 correr | `iterate(until="stable")` o `params={"iterar": true}` del pipeline: H y M < 0,5 % en 100 it, aviso de meseta de residuales, máximo 1000 |
+| 9 cierre | `params={"post": true}` o receta `post-bomba` (una macro): planos auto, PNG de presión en álabes, velocidad relativa en plano medio y y+ en `casos/<caso>/images`, `RESULT`, balance de masa < 0,5 %, validación de Euler; luego `RESUMEN.md`, guardar, apagar |
+| 10 curva | 5 caudales entre 0,6 y 1,3 del nominal reusando malla y solución: basta cambiar `Flujo`; un solo `run_steps` (receta de caso 3 en `plantillas_casos.md`) |
 
 Alternativa de mallado de las plantillas: trimmer en una sola operación (`mallar-trimmer-una-operacion.java`, no probada).
 Turbina (o bomba como turbina): mismo flujo; cambia el signo del momento; η = P_eje/P_hid; Euler con MODO turbina.
@@ -100,6 +140,7 @@ Turbina (o bomba como turbina): mismo flujo; cambia el signo del momento; η = P
 ### Criterios de «no sirve»
 - Desbalance de masa > 1 %: revisar interfaces (¿caras de conexión como pared?) y fugas.
 - Residuales planos altos: presión 0,2 y velocidad 0,5 de under-relaxation, 300 it, reevaluar. Plateau MRF ~1e-2 es normal en frozen rotor.
+- Residual < 1e-4 sin alcanzar con H y M estables: no es fallo; se reporta y se para. Bajarlo pide malla más fina o transitorio.
 - H oscila: malla gruesa en la lengua de la voluta o caso transitorio. Refinar primero.
 - Celdas malas > 0,1 %: mesh repair o más shrink de prismas.
 - Diverge (residuales suben, H o M sin sentido): parar y avisar; no seguir iterando.
@@ -213,5 +254,7 @@ Fechas 2026-10-23 salvo indicación. Las del remoto y la UI web: `conocimiento/C
 
 ## Pendiente de verificar con solver real
 
-`pipelines/bomba.py` (compila con javac, nunca corrió contra el solver), receta de Euler nueva, medida de
-`PARED_CONEXION` (SumReport), `gui_attach` desde el MCP, `run_steps`, `iterate until=stable`.
+`pipelines/bomba.py` (compila con javac, nunca corrió contra el solver) y, dentro de él, `iterar` y `post` (planos, 3 PNG, y+,
+validación de Euler); recetas `iterar-hasta-estable` y `post-bomba`; las tres recetas de `plantillas_casos.md` (la del
+cilindro corrió con pasos fijos; NACA con STL no corrió nunca); receta de Euler nueva, medida de `PARED_CONEXION`
+(SumReport), `gui_attach` desde el MCP, `run_steps`, `iterate until=stable`.

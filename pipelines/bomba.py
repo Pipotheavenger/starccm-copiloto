@@ -4,6 +4,11 @@ Contrato (lo usa mcp_server.pump_case):
   parse_ccm(path) -> dict            lee el XML .cfturbo-ccm
   macro_body(case_dir, cad_dir, ccm, mode="rapida"|"normal", params={}) -> str   cuerpo de execute() (sin la clase)
   euler_check_body(params={}) -> str  solo la validación de Euler (para correr tras iterar)
+  iterate_body(case_dir, params={}) -> str  iterar hasta que H y M se estabilicen (criterio por defecto, ver STOP)
+  post_body(case_dir, params={}) -> str  post-proceso en UNA macro: planos auto, 3 escenas a PNG, y+, resultados, Euler
+
+Criterio de parada por defecto (STOP): H y M varían < 0,5 % en 100 iteraciones, comprobado cada 50, máximo 1000.
+El residual < 1e-4 NO es condición: se reporta (RESIDUAL) y la meseta de residuales sale como AVISO.
 
 Flujo (el verificado de BombaRapida/run.py, en una sola macro): importar STEP (una parte por zona) → regiones por
 parte (nombres de cara) → interfaces en cadena → física SST + Cell Quality Remediation → MRF → fronteras (presión total
@@ -13,11 +18,17 @@ Modos: rapida = base d2/30 y 3 prismas; normal = base d2/60 y 5 prismas.
 
 params opcionales: d2_mm, base_mm, prismas, flujo (kg/s), ptotal (Pa, 0), beta2 (grados), gamma (bool), gravedad
 ("gx,gy,gz"), remediacion (bool, True), euler (bool, True), escena (bool, True).
+Al final de la MISMA macro, opcionales (por defecto apagados: la macro de preparación sigue igual):
+  iterar: True (máx. 1000) o un entero (máx.); además max_iter, tol (0.005), ventana (100), bloque (50), meseta (300)
+  post: True añade planos + escenas PNG en casos/<caso>/images + y+ + RESULT + validación de Euler;
+        post_png (True), img_ancho (1600), img_alto (1000), post_euler (por defecto = euler). Con post no se crea la
+        escena previa de presión (la hace el post, con datos).
 d2 (diámetro de salida del rotor): params["d2_mm"], o se mide en los STL de CFturbo que acompañan al CAD
 (…Impeller…Outflow.stl); si no hay ninguna de las dos, ValueError.
 
 Uso:  python pipelines/bomba.py --selftest
       python pipelines/bomba.py --emit <ccm> <cad_dir> [rapida|normal]     imprime el cuerpo Java
+      python pipelines/bomba.py --write-recetas      regenera conocimiento/recetas/{iterar-hasta-estable,post-bomba}.java
 """
 from __future__ import annotations
 
@@ -36,6 +47,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 RECETA_EULER = HERE.parent / "conocimiento" / "recetas" / "reportes-euler-triangulos.java"
 G = 9.80665
+# criterio de parada por defecto (CLAUDE.md § Velocidad): H y M estables, no residual < 1e-4
+STOP = {"max_iter": 1000, "tol": 0.005, "ventana": 100, "bloque": 50, "meseta": 300}
 
 # imports que el MCP pone a la macro (igual que mcp_server._wrap); el selftest los repite
 IMPORTS = [
@@ -199,6 +212,298 @@ def euler_check_body(params: dict | None = None) -> str:
     j = txt.index("for (Report r : reps)")
     return ('{\nboolean turbina = false; String hrep = "H"; ReportManager rm = sim.getReportManager();\n'
             + txt[i:j] + "}\n")
+
+
+
+# ----------------------------------------------------------------------------- iterar y post-proceso
+# Juez de estabilidad: se prueba de verdad en el selftest (java del JDK, datos de BombaRapida) y el mismo texto va a la macro.
+JUDGE = r"""class PxJudge {
+    // muestras {iteración, v1, v2…}; variación relativa máxima (máx−mín)/|media| en la ventana, NaN si aún no hay `win` iteraciones
+    double var(java.util.List<double[]> h, int win) {
+      double cur = h.get(h.size() - 1)[0];
+      if (h.get(0)[0] > cur - win) return Double.NaN;
+      double worst = 0;
+      for (int j = 1; j < h.get(0).length; j++) {
+        double mn = Double.POSITIVE_INFINITY, mx = Double.NEGATIVE_INFINITY, sum = 0; int c = 0;
+        for (double[] s : h) if (s[0] >= cur - win) { mn = Math.min(mn, s[j]); mx = Math.max(mx, s[j]); sum += s[j]; c++; }
+        worst = Math.max(worst, (mx - mn) / Math.max(Math.abs(sum / c), 1e-30));
+      }
+      return worst;
+    }
+  }"""
+
+ITERAR = r'''// --- iterar hasta que @@NOMBRES@@ se estabilicen (< @@TOLPCT@@ % en @@WIN@@ iteraciones, comprobado cada @@BLK@@; máx. @@MAX@@). El residual < 1e-4 NO es condición: se reporta
+{
+  @@JUDGE@@
+  PxJudge pxJ = new PxJudge();
+  class PxN { double d(String s) { try { return Double.parseDouble(s.trim().replace("\"", "")); } catch (Exception e) { return Double.NaN; } } }
+  PxN pxN = new PxN();
+  int pxMax = @@MAX@@, pxBlk = @@BLK@@, pxWin = @@WIN@@, pxPl = @@PL@@; double pxTol = @@TOL@@;
+  String[] pxNm = @@REPS@@;
+  java.util.ArrayList<double[]> pxHist = new java.util.ArrayList<double[]>();
+  int pxIt0 = sim.getSimulationIterator().getCurrentIteration(), pxCur = pxIt0;
+  String pxWhy = "max"; double pxVar = Double.NaN; long pxT0 = System.currentTimeMillis();
+  while (pxCur - pxIt0 < pxMax) {
+    sim.getSimulationIterator().step(Math.min(pxBlk, pxMax - (pxCur - pxIt0)));
+    pxCur = sim.getSimulationIterator().getCurrentIteration();
+    double[] pxS = new double[pxNm.length + 1]; pxS[0] = pxCur; boolean pxFin = true;
+    for (int pj = 0; pj < pxNm.length; pj++) {
+      pxS[pj + 1] = sim.getReportManager().getReport(pxNm[pj]).getReportMonitorValue();
+      if (Double.isNaN(pxS[pj + 1]) || Double.isInfinite(pxS[pj + 1])) pxFin = false;
+    }
+    StringBuilder pxLn2 = new StringBuilder();
+    for (int pj = 0; pj < pxNm.length; pj++) pxLn2.append("\t").append(pxNm[pj]).append(" ").append(pxS[pj + 1]);
+    sim.println("ITER\t" + pxCur + pxLn2);
+    if (!pxFin) { pxWhy = "diverge"; break; }
+    pxHist.add(pxS);
+    pxVar = pxJ.var(pxHist, pxWin);
+    if (!Double.isNaN(pxVar) && pxVar < pxTol) { pxWhy = "stable"; break; }
+  }
+  double pxRes = Double.NaN, pxOld = Double.NaN;
+  try {
+    String pxCsv = @@CSV@@;
+    new java.io.File(pxCsv).getParentFile().mkdirs();
+    sim.getPlotManager().getPlot("Residuals").export(pxCsv, ",");
+    java.util.List<String> pxLn = java.nio.file.Files.readAllLines(java.nio.file.Paths.get(pxCsv), java.nio.charset.StandardCharsets.UTF_8);
+    boolean pxHasIt = !pxLn.isEmpty() && pxLn.get(0).toLowerCase().contains("iter");
+    for (int pk = 1; pk < pxLn.size(); pk++) {
+      String[] pc = pxLn.get(pk).split(",");
+      double pit = pxHasIt ? pxN.d(pc[0]) : pk, pmx = Double.NaN;
+      for (int pm = 1; pm < pc.length; pm++) { double pv = Math.abs(pxN.d(pc[pm])); if (!Double.isNaN(pv)) pmx = Double.isNaN(pmx) ? pv : Math.max(pmx, pv); }
+      if (Double.isNaN(pmx) || Double.isNaN(pit)) continue;
+      if (pit <= pxCur - pxPl) pxOld = pmx;
+      pxRes = pmx;
+    }
+  } catch (Exception ex) { sim.println("WARN\tno pude leer los residuales: " + ex); }
+  boolean pxPlat = !Double.isNaN(pxOld) && !Double.isNaN(pxRes) && pxRes >= 0.9 * pxOld;
+  sim.println("RESIDUAL\t" + pxRes + "\t(1e-4 solo informativo: " + (pxRes < 1e-4 ? "cumplido" : "no alcanzado; no condiciona") + ")");
+  if (pxPlat) sim.println("AVISO\tmeseta de residuales: el mayor residual no bajó un 10 % en " + pxPl + " iteraciones (normal en frozen rotor, ~1e-2)");
+  if (pxWhy.equals("max")) sim.println("AVISO\t" + String.join(" y ", pxNm) + " no se estabilizaron en " + pxMax + " iteraciones: no dar el resultado como convergido");
+  if (pxWhy.equals("diverge")) sim.println("AVISO\tdiverge: " + String.join(" o ", pxNm) + " no son números; parar y revisar interfaces y fronteras");
+  sim.println("ITER_STOP\t" + pxWhy + "\titeraciones " + (pxCur - pxIt0) + "\titeración " + pxCur + "\tvariación_max_% " + pxVar * 100 + "\tmeseta " + pxPlat + "\t" + (System.currentTimeMillis() - pxT0) / 1000.0 + " s");
+}'''
+
+POST = r'''// --- post-proceso: planos auto, escenas a PNG (presión en álabes, velocidad relativa en plano medio, y+), resultados
+{
+  long pxT0 = System.currentTimeMillis();
+  String pxImg = @@IMG@@; int pxW = @@W@@, pxHt = @@HT@@; boolean pxPng = @@PNG@@;
+  new java.io.File(pxImg).mkdirs();
+  ReportManager pxRm = sim.getReportManager(); FieldFunctionManager pxFfm = sim.getFieldFunctionManager();
+  int pxIt = 0; try { pxIt = sim.getSimulationIterator().getCurrentIteration(); } catch (Exception e) { }
+  boolean pxSol = pxIt >= 1;
+  if (!pxSol) sim.println("AVISO\tpost sin solución (iteración 0): se crean planos y escenas pero no se exportan PNG");
+  class PxR { Report get(String n) { try { return pxRm.getReport(n); } catch (Exception e) { return null; } } }
+  PxR pxr = new PxR();
+  class PxS { Scene find(String base) { for (Scene s : sim.getSceneManager().getScenes()) if (s.getPresentationName().startsWith(base)) return s; return null; } }
+  PxS pxs = new PxS();
+  // rotor, eje y origen: del marco rotatorio (nada supuesto)
+  Region pxRot = null; double[] pxAx = {0, 0, 1}, pxOg = {0, 0, 0};
+  for (Region r : sim.getRegionManager().getRegions()) {
+    try {
+      Object o = r.getValues().get(MotionSpecification.class).getReferenceFrame();
+      if (o instanceof RotatingReferenceFrame) {
+        RotatingReferenceFrame f = (RotatingReferenceFrame) o;
+        DoubleVector a = f.getAxisDirection().getSIVector(), og = f.getAxisOrigin().getSIVector();
+        double n = Math.sqrt(a.get(0) * a.get(0) + a.get(1) * a.get(1) + a.get(2) * a.get(2));
+        pxAx = new double[] {a.get(0) / n, a.get(1) / n, a.get(2) / n}; pxOg = new double[] {og.get(0), og.get(1), og.get(2)}; pxRot = r; break;
+      }
+    } catch (Exception e) { }
+  }
+  // fronteras: álabes+cubo del rotor, solo álabes, salida del rotor, todas las paredes (sin interfaces)
+  java.util.List<Boundary> pxBl = new java.util.ArrayList<Boundary>(), pxBlade = new java.util.ArrayList<Boundary>(), pxOut = new java.util.ArrayList<Boundary>(), pxWalls = new java.util.ArrayList<Boundary>();
+  for (Region r : sim.getRegionManager().getRegions()) for (Boundary b : r.getBoundaryManager().getBoundaries()) {
+    String bn = b.getPresentationName();
+    if (r == pxRot && bn.toLowerCase().matches(".*(outflow|outlet|salida).*")) pxOut.add(b);
+    if (b instanceof DirectBoundaryInterfaceBoundary || bn.contains("[")) continue;
+    if (b.getBoundaryType() instanceof WallBoundary) pxWalls.add(b);
+    if (r == pxRot && bn.contains("Blade")) { pxBlade.add(b); pxBl.add(b); } else if (r == pxRot && bn.equals("Hub")) pxBl.add(b);
+  }
+  if (pxBl.isEmpty()) pxBl.addAll(pxWalls);
+  if (pxBlade.isEmpty()) pxBlade.addAll(pxBl);
+  // plano medio a media salida del rotor (Min/Max de la coordenada axial en sus Outflow) y plano meridional que contiene el eje
+  double pxMid = pxAx[0] * pxOg[0] + pxAx[1] * pxOg[1] + pxAx[2] * pxOg[2];
+  if (!pxOut.isEmpty()) {
+    try {
+      UserFieldFunction uf = pxFfm.createFieldFunction(); uf.setPresentationName("agente_coord_axial"); uf.setFunctionName("agente_coord_axial");
+      uf.setDefinition("dot($$Position, [" + pxAx[0] + ", " + pxAx[1] + ", " + pxAx[2] + "])");
+      MaxReport mx = pxRm.createReport(MaxReport.class); mx.setFieldFunction(uf); mx.getParts().setObjects(pxOut);
+      MinReport mn = pxRm.createReport(MinReport.class); mn.setFieldFunction(uf); mn.getParts().setObjects(pxOut);
+      pxMid = 0.5 * (mn.getReportMonitorValue() + mx.getReportMonitorValue());
+      pxRm.removeObjects(mx, mn); pxFfm.removeObjects(uf);
+    } catch (Exception e) { sim.println("WARN\tplano medio: no pude medir la salida del rotor, uso el origen del eje: " + e); }
+  }
+  double[] pxE = Math.abs(pxAx[0]) < 0.9 ? new double[] {1, 0, 0} : new double[] {0, 1, 0};
+  double[] pxNm = {pxAx[1] * pxE[2] - pxAx[2] * pxE[1], pxAx[2] * pxE[0] - pxAx[0] * pxE[2], pxAx[0] * pxE[1] - pxAx[1] * pxE[0]};
+  double pxT = pxMid - (pxAx[0] * pxOg[0] + pxAx[1] * pxOg[1] + pxAx[2] * pxOg[2]);
+  double[][] pxPl = {{pxAx[0], pxAx[1], pxAx[2], pxOg[0] + pxT * pxAx[0], pxOg[1] + pxT * pxAx[1], pxOg[2] + pxT * pxAx[2]}, {pxNm[0], pxNm[1], pxNm[2], pxOg[0], pxOg[1], pxOg[2]}};
+  String[] pxPn = {"plano_medio", "plano_meridional"};
+  PlaneSection[] pxPlane = new PlaneSection[2];
+  Units pxM = sim.getUnitsManager().getUnits("m");
+  for (int pi = 0; pi < 2; pi++) {
+    try {
+      Part ps = null; try { ps = sim.getPartManager().getPart(pxPn[pi]); } catch (Exception e) { }
+      if (ps instanceof PlaneSection) {  // reusar, pero en la cota de ahora
+        ((PlaneSection) ps).getOriginCoordinate().setCoordinate(pxM, pxM, pxM, new DoubleVector(new double[] {pxPl[pi][3], pxPl[pi][4], pxPl[pi][5]}));
+        ((PlaneSection) ps).getOrientationCoordinate().setCoordinate(pxM, pxM, pxM, new DoubleVector(new double[] {pxPl[pi][0], pxPl[pi][1], pxPl[pi][2]}));
+      } else {
+        PlaneSection pl = (PlaneSection) sim.getPartManager().createImplicitPart(new NeoObjectVector(sim.getRegionManager().getRegions().toArray()),
+            new DoubleVector(new double[] {pxPl[pi][0], pxPl[pi][1], pxPl[pi][2]}), new DoubleVector(new double[] {pxPl[pi][3], pxPl[pi][4], pxPl[pi][5]}), 0, 1, new DoubleVector(new double[] {0.0}));
+        pl.setPresentationName(pxPn[pi]); ps = pl;
+      }
+      pxPlane[pi] = (PlaneSection) ps;
+    } catch (Exception e) { sim.println("WARN\tplano " + pxPn[pi] + ": " + e); }
+  }
+  sim.println("PLANOS\tmedio a " + pxMid + " m del origen del eje; " + pxOut.size() + " fronteras de salida del rotor");
+  // escena 1: presión en álabes y cubo
+  try {
+    Scene sc = pxs.find("presion_alabes");
+    if (sc == null) {
+      sc = sim.getSceneManager().createScene("presion_alabes"); sc.initializeAndWait();
+      ScalarDisplayer d = sc.getDisplayerManager().createScalarDisplayer("p"); d.initialize();
+      d.setRepresentation(sim.getRepresentationManager().getDefaultFvRepresentation());
+      d.getInputParts().setObjects(pxBl);
+      d.getScalarDisplayQuantity().setFieldFunction(pxFfm.getFunction("Pressure"));
+      sc.resetCamera(true);
+    }
+    if (pxSol && pxPng) { sc.printAndWait(resolvePath(pxImg + "/presion_alabes.png"), 1, pxW, pxHt, true, false); sim.println("PNG\t" + pxImg + "/presion_alabes.png"); }
+  } catch (Exception e) { sim.println("WARN\tescena presion_alabes: " + e); }
+  // escena 2: velocidad relativa en el plano medio (color = módulo, flechas encima, paredes tenues)
+  try {
+    FieldFunction vrel = null;
+    for (String fn : new String[] {"RelativeVelocity", "CellRelativeVelocity", "Velocity"}) { if (vrel == null) try { vrel = pxFfm.getFunction(fn); } catch (Exception e) { } }
+    if (pxPlane[0] == null || vrel == null) throw new RuntimeException("falta plano_medio o campo de velocidad relativa");
+    Scene sc = pxs.find("velocidad_relativa");
+    if (sc == null) {
+      sc = sim.getSceneManager().createScene("velocidad_relativa"); sc.initializeAndWait();
+      PartDisplayer pd = sc.getDisplayerManager().createPartDisplayer("paredes", -1, 4); pd.initialize();
+      pd.setRepresentation(sim.getRepresentationManager().getDefaultFvRepresentation()); pd.getInputParts().setObjects(pxWalls); pd.setOpacity(0.12);
+      ScalarDisplayer d = sc.getDisplayerManager().createScalarDisplayer("vrel"); d.initialize();
+      d.setRepresentation(sim.getRepresentationManager().getDefaultFvRepresentation()); d.getInputParts().setObjects(pxPlane[0]);
+      d.getScalarDisplayQuantity().setFieldFunction(((PrimitiveFieldFunction) vrel).getMagnitudeFunction());
+      try {
+        VectorDisplayer vd = sc.getDisplayerManager().createVectorDisplayer("flechas"); vd.initialize();
+        vd.setRepresentation(sim.getRepresentationManager().getDefaultFvRepresentation()); vd.getInputParts().setObjects(pxPlane[0]);
+        vd.getVectorDisplayQuantity().setFieldFunction(vrel);
+        vd.setColorMode(VectorDisplayer.COLOR_USER_DEFINED); vd.setSpacingMode(0);
+        vd.getGlyphSettings().setRelativeToModelLength(6.0); vd.getGlyphSettings().getGeometricSpacing().setOnRatio(6);
+      } catch (Exception e) { sim.println("WARN\tflechas de velocidad relativa: " + e); }
+      sc.resetCamera(true);
+    }
+    if (pxSol && pxPng) { sc.printAndWait(resolvePath(pxImg + "/velocidad_relativa.png"), 1, pxW, pxHt, true, false); sim.println("PNG\t" + pxImg + "/velocidad_relativa.png"); }
+  } catch (Exception e) { sim.println("WARN\tescena velocidad_relativa: " + e); }
+  // escena 3: y+ en todas las paredes; reportes mín/media/máx en álabes
+  try {
+    FieldFunction yp = pxFfm.getFunction("WallYplus");
+    Report r0 = pxr.get("yplus_max_alabes");
+    MaxReport ymx = r0 instanceof MaxReport ? (MaxReport) r0 : pxRm.createReport(MaxReport.class);
+    r0 = pxr.get("yplus_min_alabes");
+    MinReport ymn = r0 instanceof MinReport ? (MinReport) r0 : pxRm.createReport(MinReport.class);
+    r0 = pxr.get("yplus_media_alabes");
+    AreaAverageReport yav = r0 instanceof AreaAverageReport ? (AreaAverageReport) r0 : pxRm.createReport(AreaAverageReport.class);
+    ymx.setPresentationName("yplus_max_alabes"); ymn.setPresentationName("yplus_min_alabes"); yav.setPresentationName("yplus_media_alabes");
+    ymx.setFieldFunction(yp); ymx.getParts().setObjects(pxBlade);
+    ymn.setFieldFunction(yp); ymn.getParts().setObjects(pxBlade);
+    yav.setFieldFunction(yp); yav.getParts().setObjects(pxBlade);
+    Scene sc = pxs.find("yplus");
+    if (sc == null) {
+      sc = sim.getSceneManager().createScene("yplus"); sc.initializeAndWait();
+      ScalarDisplayer d = sc.getDisplayerManager().createScalarDisplayer("y+"); d.initialize();
+      d.setRepresentation(sim.getRepresentationManager().getDefaultFvRepresentation()); d.getInputParts().setObjects(pxWalls);
+      d.getScalarDisplayQuantity().setFieldFunction(yp);
+      sc.resetCamera(true);
+    }
+    if (pxSol) {
+      sim.println("YPLUS\talabes min " + ymn.getReportMonitorValue() + " media " + yav.getReportMonitorValue() + " max " + ymx.getReportMonitorValue());
+      if (pxPng) { sc.printAndWait(resolvePath(pxImg + "/yplus.png"), 1, pxW, pxHt, true, false); sim.println("PNG\t" + pxImg + "/yplus.png"); }
+    }
+  } catch (Exception e) { sim.println("WARN\tescena yplus: " + e); }
+  // resultados en una línea cada uno (y balance de masa): no hace falta otra macro para leerlos
+  if (pxSol) {
+    for (String rn : new String[] {"H", "M", "P_hid", "P_eje", "eta", "Q_in", "Q_out", "H_Euler", "eta_Euler"}) {
+      Report q = pxr.get(rn);
+      if (q != null) { try { sim.println("RESULT\t" + rn + "\t" + q.getReportMonitorValue()); } catch (Exception e) { sim.println("RESULT\t" + rn + "\tn/a"); } }
+    }
+    try {
+      double qi = pxr.get("Q_in").getReportMonitorValue(), qo = pxr.get("Q_out").getReportMonitorValue();
+      double bal = 100 * Math.abs(qi + qo) / Math.max(Math.abs(qi), 1e-30);
+      sim.println("BALANCE_MASA\t" + bal + " %" + (bal > 0.5 ? "\tAVISO: > 0,5 %: revisar interfaces" : ""));
+    } catch (Exception e) { }
+  }
+  sim.println("POST_SECONDS\t" + (System.currentTimeMillis() - pxT0) / 1000.0);
+}'''
+
+
+def _stop(params: dict) -> dict:
+    """Parámetros del criterio de parada (STOP + params). `iterar` entero = máximo de iteraciones."""
+    st = dict(STOP)
+    it = params.get("iterar")
+    if isinstance(it, int) and not isinstance(it, bool) and it > 1:
+        st["max_iter"] = it
+    for k in STOP:
+        if params.get(k) not in (None, ""):
+            st[k] = type(STOP[k])(params[k])
+    return st
+
+
+def iterate_body(case_dir: str, params: dict | None = None) -> str:
+    """Iterar hasta estabilidad de H y M (criterio por defecto): bloques de 50, para si ΔH y ΔM < 0,5 % en 100
+    iteraciones; máx. 1000. Exige los reportes H y M del pipeline (o los de params["reportes"], p. ej. ["dp"] en una tubería). Imprime ITER, RESIDUAL, AVISO (meseta, no estable,
+    diverge) e ITER_STOP <stable|max|diverge>. El residual < 1e-4 se reporta, no condiciona."""
+    params = dict(params or {})
+    st = _stop(params)
+    names = [str(x) for x in (params.get("reportes") or ["H", "M"])]
+    csv = _j((Path(case_dir) / "reports" / "residuals_pipe.csv").as_posix())
+    rep = {"TOLPCT": f"{st['tol'] * 100:g}", "WIN": str(st["ventana"]), "BLK": str(st["bloque"]), "MAX": str(st["max_iter"]),
+           "PL": str(st["meseta"]), "TOL": _num(st["tol"]), "CSV": csv, "JUDGE": JUDGE,
+           "REPS": _arr(names), "NOMBRES": " y ".join(names)}
+    out = ITERAR
+    for k, v in rep.items():
+        out = out.replace(f"@@{k}@@", v)
+    return out + "\n"
+
+
+def post_body(case_dir: str, params: dict | None = None) -> str:
+    """Post-proceso en UNA macro, autónomo (sirve solo, tras iterar): planos «auto» (medio a media salida del rotor y
+    meridional), escenas presion_alabes, velocidad_relativa (plano medio) y yplus exportadas a PNG en
+    <case_dir>/images, reportes de y+ en álabes, RESULT por reporte, BALANCE_MASA y la validación de Euler
+    (post_euler, True). Sin solución crea las escenas pero no exporta PNG. params: post_png, img_ancho, img_alto."""
+    params = dict(params or {})
+    img = _j((Path(case_dir) / "images").as_posix())
+    rep = {"IMG": img, "W": str(int(params.get("img_ancho") or 1600)), "HT": str(int(params.get("img_alto") or 1000)),
+           "PNG": "true" if params.get("post_png", True) else "false"}
+    out = POST
+    for k, v in rep.items():
+        out = out.replace(f"@@{k}@@", v)
+    if params.get("post_euler", True):
+        out += "\n// --- validación de Euler con la solución (AVISO / EULER_MAL / EULER_OK)\n" + euler_check_body(params)
+    return out + "\n"
+
+
+# ----------------------------------------------------------------------------- recetas generadas (para run_steps)
+RECETAS_DIR = HERE.parent / "conocimiento" / "recetas"
+_CABECERA = """// QUE: {que}
+// VERSION: 19.06.009-R8 · FECHA: 2026-10-26 · ESTADO: compila con javac; el juez de estabilidad se probó con datos de
+//      BombaRapida; NO verificado con el solver real
+// PARAMS: {params}
+// GENERADA con `python pipelines/bomba.py --write-recetas` desde pipelines/bomba.py: no editar a mano (el selftest la compara).
+// Pensada para run_steps: agrupa iterar y post con el cambio de caudal en UNA macro.
+"""
+
+
+def recetas() -> dict:
+    """{archivo: texto} de las recetas que expone el pipeline para run_steps (misma lógica que iterar/post de la macro)."""
+    it = iterate_body("@CASE@", {"reportes": ["@REPS@"]})
+    it = it.replace('{"@REPS@"}', "{${reportes}}").replace("pxMax = 1000,", "pxMax = ${max_iter},").replace("@CASE@", "${case_dir}")
+    it = it.replace("iterar hasta que @REPS@", "iterar hasta que los reportes dados").replace("máx. 1000)", "máx. ${max_iter})")
+    po = post_body("@CASE@", {}).replace("@CASE@", "${case_dir}")
+    return {
+        "iterar-hasta-estable.java": _CABECERA.format(
+            que="itera en bloques de 50 hasta que los reportes dados varían < 0,5 % en 100 iteraciones (máx. max_iter); el residual\n//      < 1e-4 se reporta y la meseta sale como AVISO, pero no condiciona. ITER_STOP dice el motivo (stable|max|diverge).\n//      reportes: nombres entre comillas separados por coma, p. ej. \"H\", \"M\" (bomba) o \"dp\" (tubería).",
+            params="case_dir, max_iter, reportes") + it,
+        "post-bomba.java": _CABECERA.format(
+            que="post-proceso de bomba (autónomo): planos auto, escenas presion_alabes / velocidad_relativa / yplus a PNG en\n//      <case_dir>/images, y+ en álabes, RESULT por reporte, BALANCE_MASA y validación de Euler. Tras iterar.",
+            params="case_dir") + po,
+    }
 
 
 # ----------------------------------------------------------------------------- macro
@@ -387,6 +692,8 @@ try {
 @@PIPE:malla@@
 @@EULER@@
 @@ESCENA@@
+@@ITERAR@@
+@@POST@@
 sim.println("PIPE total " + (System.currentTimeMillis() - pipeT0) / 1000.0);
 '''
 
@@ -478,7 +785,15 @@ def macro_body(case_dir: str, cad_dir: str, ccm: dict, mode: str = "rapida", par
         out = out.replace(f"@@{k}@@", v)
     out = out.replace("@@MODELOS_EXTRA@@", "\n".join(extra))
     out = out.replace("@@EULER@@", euler)
-    out = out.replace("@@ESCENA@@", ESCENA if params.get("escena", True) else "")
+    post_on, iter_on = bool(params.get("post")), bool(params.get("iterar"))
+    out = out.replace("@@ESCENA@@", ESCENA if params.get("escena", True) and not post_on else "")  # con post, la escena sale con datos
+    out = out.replace("@@ITERAR@@", (iterate_body(case_dir, params) + "@@PIPE:iterar@@") if iter_on else "")
+    if post_on:
+        pp = dict(params)
+        pp.setdefault("post_euler", bool(params.get("euler", True)))
+        out = out.replace("@@POST@@", post_body(case_dir, pp) + "@@PIPE:post@@")
+    else:
+        out = out.replace("@@POST@@", "")
     out = re.sub(r"@@PIPE:(\w+)@@", lambda m: pipe(m.group(1)), out)
     if "@@" in out:
         raise RuntimeError("quedaron marcas sin sustituir: " + re.findall(r"@@\w+@@", out)[0])
@@ -539,6 +854,45 @@ def compile_java(body: str, tag: str, tmp: Path):
 CCM_REAL = Path(r"C:\Users\sebas\OneDrive\Documentos\cfturbo-agent\versions\BombaRapida_v1\BombaRapida_cfd.cfturbo-ccm")
 
 
+def _java_bin():
+    jc = _javac()
+    if not jc:
+        return None
+    for name in ("java.exe", "java"):
+        j = Path(jc[0]).with_name(name)
+        if j.is_file():
+            return str(j)
+    return None
+
+
+def test_judge(tmp: Path):
+    """Compila y corre PxJudge (el mismo texto de la macro) con series de BombaRapida. None si no hay JDK."""
+    jc, jv = _javac(), _java_bin()
+    if not jc or not jv:
+        return None
+    d = tmp / "judge"
+    d.mkdir(exist_ok=True)
+    (d / "JudgeTest.java").write_text("""import java.util.*;
+public class JudgeTest { public static void main(String[] a) {
+  %s
+  PxJudge j = new PxJudge();
+  // BombaRapida (casos/BombaRapida/RESUMEN.md): H y M cada 50 iteraciones
+  double[][] br = {{50, 15.81, 8.467}, {100, 16.67, 8.460}, {150, 16.73, 8.459}, {200, 16.75, 8.458}, {250, 16.755, 8.4575}};
+  ArrayList<double[]> h = new ArrayList<double[]>();
+  for (double[] s : br) { h.add(s); System.out.println("BR " + (int) s[0] + " " + j.var(h, 100)); }
+  // oscila 2 %% alrededor de 14: nunca estable
+  h = new ArrayList<double[]>();
+  for (int i = 1; i <= 8; i++) { h.add(new double[] {50 * i, 14 + (i %% 2 == 0 ? 0.14 : -0.14), 4.8}); System.out.println("OSC " + 50 * i + " " + j.var(h, 100)); }
+} }
+""" % JUDGE, encoding="utf-8")
+    r = subprocess.run([jc[0], "-nowarn", "-proc:none", "-d", str(d), str(d / "JudgeTest.java")], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=120)
+    if r.returncode:
+        return "javac: " + (r.stderr or r.stdout)[-1500:]
+    r = subprocess.run([jv, "-cp", str(d), "JudgeTest"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    return {ln.split()[0] + " " + ln.split()[1]: float(ln.split()[2]) for ln in r.stdout.splitlines() if ln.split()[:1] in (["BR"], ["OSC"])}
+
+
 def selftest() -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # la consola cp1252 de Windows no imprime «≈»
     bad = 0
@@ -574,6 +928,49 @@ def selftest() -> int:
     check(err in (None, "SKIP"), "javac con gamma, gravedad y beta2" + ("" if err in (None, "SKIP") else "\n" + str(err)))
     err = compile_java(euler_check_body(), "check", tmp)
     check(err in (None, "SKIP"), "javac euler_check_body" + ("" if err in (None, "SKIP") else "\n" + str(err)))
+    # iterar + post dentro de la MISMA macro (criterio por defecto: máx. 1000) y por separado
+    full = macro_body(str(tmp / "caso"), cad, ccm, "rapida", {"iterar": True, "post": True})
+    check("pxMax = 1000," in full and "ITER_STOP" in full and "PIPE iterar" in full and "PIPE post" in full, "macro con iterar+post: máx. 1000 y marcadores")
+    check("/images\"" in full and "/presion_alabes.png\"" in full and "velocidad_relativa.png" in full and "yplus.png" in full and "EULER_OK" in full,
+          "post: 3 PNG en casos/<caso>/images y validación de Euler dentro de la macro")
+    check(full.count('createScene("presion_alabes")') == 1, "con post no se duplica la escena previa de presión")
+    err = compile_java(full, "full", tmp)
+    check(err in (None, "SKIP"), "javac macro rápida con iterar+post" + ("" if err in (None, "SKIP") else "\n" + str(err)))
+    check("pxMax = 300," in macro_body(str(tmp / "c"), cad, ccm, "rapida", {"iterar": 300}), "iterar=300 cambia el máximo")
+    sin = macro_body(str(tmp / "c"), cad, ccm, "rapida", {})
+    check("ITER_STOP" not in sin and "POST_SECONDS" not in sin and 'createScene("presion_alabes")' in sin, "por defecto la macro no itera ni hace post")
+    err = compile_java(post_body(str(tmp / "caso"), {"post_euler": False, "img_ancho": 800}), "post", tmp)
+    check(err in (None, "SKIP"), "javac post_body suelto (sin Euler)" + ("" if err in (None, "SKIP") else "\n" + str(err)))
+    err = compile_java(post_body(str(tmp / "caso")) + iterate_body(str(tmp / "caso"), {"tol": 0.01, "bloque": 25}), "postiter", tmp)
+    check(err in (None, "SKIP"), "javac post_body + iterate_body sueltos" + ("" if err in (None, "SKIP") else "\n" + str(err)))
+    jr = test_judge(tmp)
+    if jr is None:
+        print("SKIP java del JDK no encontrado: juez de estabilidad sin probar")
+    elif isinstance(jr, str):
+        check(False, "juez de estabilidad compila: " + jr)
+    else:
+        check(math.isnan(jr["BR 100"]) and jr["BR 150"] > 0.005 and jr["BR 200"] < 0.005,
+              f"juez: BombaRapida estable en la iteración 200 (var {jr['BR 200'] * 100:.2f} %), no antes")
+        check(all(v > 0.005 for k, v in jr.items() if k.startswith("OSC") and not math.isnan(v)), "juez: serie que oscila 2 % nunca es estable")
+    # recetas generadas: al día con el pipeline y compilables con sus parámetros
+    for fn, tx in recetas().items():
+        f = RECETAS_DIR / fn
+        al_dia = f.is_file() and f.read_text(encoding="utf-8").replace("\r\n", "\n") == tx.replace("\r\n", "\n")
+        check(al_dia, f"receta {fn} al día (si no: python pipelines/bomba.py --write-recetas)")
+        body = tx.replace("${case_dir}", (tmp / "caso").as_posix()).replace("${max_iter}", "300").replace("${reportes}", '"H", "M"')
+        err = compile_java(body, "rec" + fn[:4], tmp)
+        check(err in (None, "SKIP") and "${" not in body, f"javac receta {fn}" + ("" if err in (None, "SKIP") else "\n" + str(err)))
+    # bloques Java de conocimiento/plantillas_casos.md (recetas de caso para run_steps)
+    pl = HERE.parent / "conocimiento" / "plantillas_casos.md"
+    bloques = re.findall(r"```java\n(.*?)```", pl.read_text(encoding="utf-8"), re.S) if pl.is_file() else []
+    check(len(bloques) >= 13, f"plantillas_casos.md: {len(bloques)} bloques Java")
+    for i, b in enumerate(bloques):
+        m = re.match(r"// PARAMS: (.+)", b)
+        for kv in (m.group(1).split(", ") if m else []):
+            k, v = kv.split("=", 1)
+            b = b.replace("${" + k.strip() + "}", v.strip())
+        err = compile_java(b, f"plantilla{i}", tmp)
+        check(err in (None, "SKIP"), f"javac plantilla bloque {i + 1}" + ("" if err in (None, "SKIP") else "\n" + str(err)))
     # la receta suelta compila con los marcadores sustituidos como lo hace el MCP
     txt = RECETA_EULER.read_text(encoding="utf-8")
     for k, v in (("MODO", "bomba"), ("H_REPORT", "H"), ("BETA2", ""), ("ENTRADA_ROTOR", ""), ("SALIDA_ROTOR", ""), ("RHO", "998.2")):
@@ -592,6 +989,11 @@ def selftest() -> int:
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    if "--write-recetas" in sys.argv:
+        for fn, tx in recetas().items():
+            (RECETAS_DIR / fn).write_text(tx, encoding="utf-8")
+            print("escrita", RECETAS_DIR / fn)
+        sys.exit(0)
     if "--emit" in sys.argv:
         a = sys.argv[sys.argv.index("--emit") + 1:]
         c = parse_ccm(a[0])
