@@ -26,6 +26,6 @@ Ph.setPresentationName("P_hid"); Ph.setDefinition("abs(${Q_inReport}) * 9.80665 
 ExpressionReport Pe = sim.getReportManager().createReport(ExpressionReport.class);
 Pe.setPresentationName("P_eje"); Pe.setDefinition("abs(${MReport}) * 2980.0 * 2 * 3.14159265 / 60");
 ExpressionReport eta = sim.getReportManager().createReport(ExpressionReport.class);
-eta.setPresentationName("eta"); eta.setDefinition("${P_hidReport} / ${P_ejeReport}");
+eta.setPresentationName("eta"); eta.setDefinition("(abs(${P_ejeReport}) > 1e-9 ? ${P_hidReport} / ${P_ejeReport} : 0)");
 for (Report r : new Report[] {pin, pout, qi, qo, mom, H, Pe, eta}) r.createMonitor();
 for (Report r : sim.getReportManager().getObjects()) sim.println("REPORT\t" + r.getPresentationName() + "\t" + r.getClass().getSimpleName());

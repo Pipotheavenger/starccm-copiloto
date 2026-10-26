@@ -1778,7 +1778,9 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
         body = mod.macro_body(_jpath(case_dir), _jpath(cad), ccm_d, mode, dict(params or {}))
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"pipeline de bomba: {type(e).__name__}: {e}"}
-    imports = str(getattr(mod, "IMPORTS", "") or "")
+    imp = getattr(mod, "IMPORTS", "") or ""
+    # IMPORTS del pipeline es una lista: unirla con comas (str(lista) daba «import 'star.x.*';», visto con el solver real)
+    imports = ",".join(imp) if isinstance(imp, (list, tuple)) else str(imp)
     info = {"case": case, "mode": mode, "ccm_file": str(ccm_path), "ccm": ccm_d, "macro_chars": len(body)}
     if dry_run:
         return {"ok": True, "dry_run": True, **info, "macro_head": body[:600]}

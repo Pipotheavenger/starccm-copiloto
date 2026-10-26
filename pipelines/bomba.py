@@ -643,7 +643,7 @@ rMom.getParts().setObjects(paredesRotor);
 ExpressionReport rH = repMgr.createReport(ExpressionReport.class); rH.setPresentationName("H"); rH.setDefinition("(${pt_outReport} - ${pt_inReport}) / (@@RHO@@ * 9.80665)");
 ExpressionReport rPh = repMgr.createReport(ExpressionReport.class); rPh.setPresentationName("P_hid"); rPh.setDefinition("abs(${Q_inReport}) * 9.80665 * ${HReport}");
 ExpressionReport rPe = repMgr.createReport(ExpressionReport.class); rPe.setPresentationName("P_eje"); rPe.setDefinition("abs(${MReport}) * @@RPMABS@@ * 2 * 3.14159265 / 60");
-ExpressionReport rEta = repMgr.createReport(ExpressionReport.class); rEta.setPresentationName("eta"); rEta.setDefinition("${P_hidReport} / ${P_ejeReport}");
+ExpressionReport rEta = repMgr.createReport(ExpressionReport.class); rEta.setPresentationName("eta"); rEta.setDefinition("(abs(${P_ejeReport}) > 1e-9 ? ${P_hidReport} / ${P_ejeReport} : 0)");
 for (Report rp : new Report[] {rpIn, rpOut, rqIn, rqOut, rMom, rH, rPh, rPe, rEta}) rp.createMonitor();
 @@PIPE:reportes@@
 

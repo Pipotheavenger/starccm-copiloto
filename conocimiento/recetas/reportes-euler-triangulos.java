@@ -85,12 +85,12 @@ reps.add(rr.mf("Vr1", fVr, bIn)); reps.add(rr.mf("Vr2", fVr, bOut));
 reps.add(rr.mf("UVu1", fUVu, bIn)); reps.add(rr.mf("UVu2", fUVu, bOut));
 reps.add(rr.ex("H_Euler", turbina ? "(${UVu1Report} - ${UVu2Report}) / 9.80665" : "(${UVu2Report} - ${UVu1Report}) / 9.80665"));
 boolean hasH = false; try { rm.getReport(hrep); hasH = true; } catch (Exception e) { }
-if (hasH) reps.add(rr.ex("eta_Euler", turbina ? "${H_EulerReport} / ${" + hrep + "Report}" : "${" + hrep + "Report} / ${H_EulerReport}"));
+if (hasH) reps.add(rr.ex("eta_Euler", turbina ? "(abs(${" + hrep + "Report}) > 1e-9 ? ${H_EulerReport} / ${" + hrep + "Report} : 0)" : "(abs(${H_EulerReport}) > 1e-9 ? ${" + hrep + "Report} / ${H_EulerReport} : 0)"));
 else sim.println("WARN\tno existe el reporte " + hrep + ": sin eta_Euler");
 if (!beta2.isEmpty() && !beta2.equals("BET" + "A2")) {  // Vu2∞ = U2 − Vm2 / tan β2 ; σ = Vu2 / Vu2∞ (Vm2 ≈ Vr2 en salida radial)
   double b2 = Math.toRadians(Double.parseDouble(beta2));
   reps.add(rr.ex("Vu2_inf", "${U2Report} - ${Vr2Report} / " + Math.tan(b2)));
-  reps.add(rr.ex("factor_deslizamiento", "${Vu2Report} / ${Vu2_infReport}"));
+  reps.add(rr.ex("factor_deslizamiento", "(abs(${Vu2_infReport}) > 1e-9 ? ${Vu2Report} / ${Vu2_infReport} : 0)"));
 }
 java.util.List<Monitor> mons = new java.util.ArrayList<Monitor>();
 for (Report r : reps) { Monitor m = null; try { m = sim.getMonitorManager().getMonitor(r.getPresentationName() + " Monitor"); } catch (Exception e) { }
