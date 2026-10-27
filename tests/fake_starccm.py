@@ -18,6 +18,8 @@ Imita lo justo del CLI real:
                                     (se cuelga sin resultado), AGENT_FAKE_DIE (el residente muere). Por entorno
                                     FAKE_RESIDENT_MODE: broken (sale al arrancar) | silent (vive pero no late). FAKE_RESIDENT_DELAY=<s>: tarda esos
                     segundos en dar el primer latido.
+Fase no interrumpible: `AGENT_FAKE_MALLA <s>` en el texto de la macro (un comentario) la hace tardar <s> sin mirar el ABORT (como la
+malla); al acabar, si hay ABORT, no itera e imprime ITER_STOP cancelled (como la macro de bomba tras la malla).
 Entiende además los marcadores de run_steps (STEP_BEGIN/OK/ERROR/END/SKIPPED, `_stop = true;`) y simula iterate:
 `.step(N)` avanza una iteración falsa, el plot Residuals se exporta a CSV y cada Report imprime su valor. La
 curva sale de la escena que dice el archivo $FAKE_SCEN_FILE: stable | plateau | drift (cambiar de escena
@@ -241,6 +243,13 @@ def run_macro(text):
     skip_next = 0
     stop_flag = "_stop = true;" in text
     scen = _scen()
+    mm = re.search(r"AGENT_FAKE_MALLA (\d+(?:\.\d+)?)", text)
+    cancel_line = None
+    if mm:  # fase NO interrumpible (importar/mallar): tarda y no mira el ABORT; al acabar, como la macro de bomba, sale sin iterar si ya hay ABORT
+        time.sleep(float(mm.group(1)))
+        if os.path.exists(os.environ.get("FAKE_ABORT_FILE", "ABORT")):
+            text = re.sub(r"\.step\(\d+\)", "", text)
+            cancel_line = "ITER_STOP\tcancelled\titeraciones 0\titeracion 0\tvariacion_max_pct NaN\tmeseta false\t0 s"  # (tras AGENT_BEGIN: el residente lo recorta)
     m = re.search(r"\.step\((\d+)\)", text)
     skip_begin = False
     ctl = _ctl()
@@ -292,6 +301,8 @@ def run_macro(text):
                 lines.append("\tat Agent.execute(Agent.java:1)")
             continue
         if "AGENT_END" in arg:
+            if cancel_line:
+                lines.append(cancel_line)
             failed = in_catch = suppress = False  # el marcador final siempre sale
         if suppress:
             continue

@@ -493,6 +493,9 @@ def fmt_cli(tool: str, res: dict) -> tuple[str, bool]:
     if res.get("error"):
         return f"{label}: {res['error']}", False
     if tool == "cancel" and "cancelled" in res:
+        if res.get("pendiente") or res["cancelled"] == "pendiente":  # ABORT puesto: la macro parará sola en cuanto la fase lo permita
+            return f"{label}: " + str(res.get("reason") or res.get("mensaje") or res.get("msg") or
+                                      "pendiente: la macro parará al terminar la fase en curso"), True
         if res["cancelled"]:
             return f"{label}: paró en la iteración {res.get('iteracion', '?')}", True
         if res.get("reason"):
@@ -545,12 +548,14 @@ def read_progress(repo: Path | None = None, sdir: Path | None = None) -> dict | 
     if frac is None and it is not None and tot:
         frac = it / tot
     eta = _num(d, "eta", "eficiencia")
+    fin = bool(d.get("terminado")) or fase.lower() in ("terminado", "listo", "fin")
     return {"caso": d.get("caso") or "", "fase": fase, "it": it, "tot": tot, "frac": None if frac is None else max(0.0, min(1.0, frac)),
             "H": _num(d, "H", "h", "altura"), "M": _num(d, "M", "m", "torque"), "eta": eta,
             "cont": _num(d, "continuidad", "cont", "continuity"), "seg": _num(d, "segundos", "s", "transcurrido_s"),
             "resta": _num(d, "falta_s", "restante_s", "faltan_s", "restante", "eta_s"), "age": age,
-            "iterando": fase.lower() in ITER_FASES,
-            "active": bool(fase) and not d.get("terminado") and fase.lower() not in ("terminado", "listo", "fin") and age <= PROG_STALE_S}
+            "iterando": fase.lower() in ITER_FASES, "terminado": fin,
+            "abierto": bool(fase) and not fin and age <= 2 * 3600,  # sin terminar aunque nadie lo actualice (dueño muerto)
+            "active": bool(fase) and not fin and age <= PROG_STALE_S}
 
 
 def fnum(x, dec=1, unit="") -> str:
@@ -645,6 +650,7 @@ class Panel:
         self.prog: dict | None = None
         self.vis: tuple = (False, False, False, False)  # vigilante, horas, idle_warning, progreso
         self.cli_t0: dict[str, float] = {}
+        self.cancel_pending = False  # cancel «pendiente» en vigilancia
         self.auto_cancel = False  # el cancel lo pidió Detener (no el usuario): si no para, avisa del solver cobrando
         self.empty = None
         root.title("Copiloto STAR-CCM+")
@@ -936,7 +942,28 @@ class Panel:
     def explain_no_cancel(self):
         self.say(no_cancel_text(self.prog), "err")
         self.stop_btn = self.chat_button("Apagar solver", lambda: self.twice("nocancel", self.stop_btn, "Apagar solver", self.on_off_now), "apagar")
+        self.put("  ")
+        self.wait_btn = self.chat_button("Parar al terminar la malla", self.on_cancel_wait, "detener")
         self.put("\n")
+
+    def on_cancel_wait(self):
+        """Pide cancelar aunque la fase no sea interrumpible: el MCP pone el ABORT y la macro para antes de iterar."""
+        self.direct("cancel")
+
+    def macro_en_marcha(self) -> bool:
+        """¿Hay una macro en el solver? progreso.json sin terminar (aunque esté viejo: dueño muerto) o .inject.lock vigente."""
+        pr = self.prog
+        return bool((pr and (pr["active"] or pr["abierto"])) or lock_info(self.repo, self.sdir))
+
+    def watch_pending(self):
+        """Cancel «pendiente»: el estado sigue visible hasta que progreso.json diga terminado; avisa al terminar."""
+        if not self.cancel_pending or self.closed:
+            return
+        pr = self.prog
+        if pr is None or pr["terminado"] or (not pr["abierto"] and not lock_info(self.repo, self.sdir)):
+            self.cancel_pending = False
+            self.say("✓ La macro terminó (paró por el cancel pendiente)." if pr and pr["terminado"]
+                     else "La macro ya no figura en curso. Revisa el estado del solver.", "ok")
 
     def on_off(self):
         self.twice("apagar", self.btn["apagar"], "Apagar solver", self.on_off_now)
@@ -947,12 +974,13 @@ class Panel:
             n = len(self.pending)
             self.pending.clear()
             self.refresh_progress(reschedule=False)
-            iterando = self.progress_active() and self.prog["iterando"]  # medido ANTES de matar la CLI
+            en_marcha = self.macro_en_marcha()  # medido ANTES de matar la CLI (y su MCP, dueño del turno)
+            fase = (self.prog or {}).get("fase") or "macro"
             self.runner.stop()
             self.say("Detenido." + (f" Descarté {n} mensaje(s) en cola." if n else ""), "sys")
-            if iterando:  # sin CLI nadie vigila la macro: se cancela para que no siga iterando (y cobrando)
+            if en_marcha:  # sin CLI nadie vigila la macro (en cualquier fase): se cancela para que no siga (y cobrando)
                 self.auto_cancel = True
-                self.say("Había iteraciones en curso: pido cancelarlas.", "sys")
+                self.say(f"Había una macro en marcha (fase «{fase}»): pido cancelarla.", "sys")
                 self.direct("cancel")
             self.root.after(self.stop_delay_ms, self.check_after_stop)
         elif self.progress_active():
@@ -1141,10 +1169,15 @@ class Panel:
             self.cli_t0.pop(ev[1], None)
             txt, ok = fmt_cli(ev[1], ev[2])
             self.say(("✓ " if ok else "✗ ") + txt, "ok" if ok else "err")
-            if ev[1] == "cancel" and self.auto_cancel:
+            pend = ev[1] == "cancel" and (bool(ev[2].get("pendiente")) or ev[2].get("cancelled") == "pendiente")
+            if pend:
+                self.cancel_pending = True
+                self.say("Sigue en curso: avisaré cuando termine. Si no quieres esperar, apaga el solver (pierdes lo no guardado).", "sys")
+            if ev[1] == "cancel" and (self.auto_cancel or pend):
                 self.auto_cancel = False
-                if not ev[2].get("cancelled"):  # sin cancel, la macro puede seguir iterando con el solver cobrando
-                    self.say("La macro puede seguir iterando en el solver y cobrando. Apágalo si no la necesitas.", "err")
+                if pend or not ev[2].get("cancelled"):  # sin cancel (o pendiente), la macro sigue en el solver cobrando
+                    if not pend:
+                        self.say("La macro puede seguir iterando en el solver y cobrando. Apágalo si no la necesitas.", "err")
                     self.stop_btn = self.chat_button("Apagar solver", lambda: self.twice("autocancel", self.stop_btn, "Apagar solver", self.on_off_now), "apagar")
                     self.put("\n")
             if not self.closed:
@@ -1208,7 +1241,9 @@ class Panel:
 
     def refresh_progress(self, reschedule=True):
         pr = self.prog = read_progress(self.repo, self.sdir)
-        if pr and pr["active"]:
+        self.watch_pending()
+        show = bool(pr and (pr["active"] or (self.cancel_pending and pr["abierto"])))
+        if show:
             self.p_title.config(text=f"● {pr['caso'] or 'Cálculo'} · {pr['fase'].capitalize()}")
             self.p_rest.config(text=fresta(pr["resta"]))
             self.bar_frac = pr["frac"]
@@ -1219,8 +1254,8 @@ class Panel:
             self.tile["M"].config(text=fnum(pr["M"], 2, " N·m"))
             self.tile["eta"].config(text=fnum(None if eta is None else (eta * 100 if eta <= 1.5 else eta), 1, " %"))
             self.tile["cont"].config(text=fsci(pr["cont"]))
-        self.relayout((self.vis[0], self.vis[1], self.vis[2], bool(pr and pr["active"])))
-        if pr and pr["active"]:
+        self.relayout((self.vis[0], self.vis[1], self.vis[2], show))
+        if show:
             self.draw_bar()
         if reschedule and not self.closed:
             if "prog" in self.aft:
@@ -1554,7 +1589,7 @@ def selftest():
         p.on_send("sigue")
         check(spin(lambda: p.runner.busy, 5), "CLI en marcha para probar Detener")
         p.on_stop()
-        check(spin(lambda: "✓ Parar iteraciones: paró en la iteración" in txt()[n0:], 10) and ncalls("cancel") == n_c + 1 and "Había iteraciones en curso" in txt()[n0:],
+        check(spin(lambda: "✓ Parar iteraciones: paró en la iteración" in txt()[n0:], 10) and ncalls("cancel") == n_c + 1 and "Había una macro en marcha" in txt()[n0:],
               "Detener con iterar en curso: llama a --cli cancel y muestra el resultado")
         spin(lambda: not p.runner.busy and not p.cli_active, 10)
         check("Hay iteraciones en marcha" not in txt()[n0:], "tras el cancel automático no ofrece otro «Parar iteraciones»")
@@ -1570,18 +1605,78 @@ def selftest():
               "cancel sin efecto: avisa que la macro puede seguir iterando y cobrando")
         os.environ.pop("FAKE_CANCEL_NO")
         spin(lambda: not p.runner.busy, 10)
-        # Detener sin iteración en curso (malla / terminado): no llama a cancel
-        for fase in ({"fase": "mallar", "falta_s": 30}, {"fase": "terminado", "terminado": True}):
+        # Detener con macro en CUALQUIER fase (mallar, importar, iterar): llama a cancel; terminado: no
+        for fase in ({"fase": "mallar", "falta_s": 30}, {"fase": "importar"}):
             pj.write_text(json.dumps({"caso": "BombaX", **fase}))
             p.refresh_progress(reschedule=False)
-            n_c = ncalls("cancel")
+            n_c, n0 = ncalls("cancel"), len(txt())
             p.on_send("x")
             spin(lambda: p.runner.busy, 5)
             p.on_stop()
+            check(spin(lambda: ncalls("cancel") == n_c + 1 and not p.cli_active, 10) and f"fase «{fase['fase']}»" in txt()[n0:],
+                  f"Detener con fase «{fase['fase']}»: llama a cancel y lo dice")
             spin(lambda: not p.runner.busy, 10)
-            time.sleep(0.3)
-            root.update()
-            check(ncalls("cancel") == n_c, f"Detener con fase «{fase['fase']}»: no llama a cancel")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "terminado", "terminado": True}))
+        p.refresh_progress(reschedule=False)
+        n_c = ncalls("cancel")
+        p.on_send("x")
+        spin(lambda: p.runner.busy, 5)
+        p.on_stop()
+        spin(lambda: not p.runner.busy, 10)
+        time.sleep(0.3)
+        root.update()
+        check(ncalls("cancel") == n_c, "Detener con fase «terminado»: no llama a cancel")
+        # progreso.json viejo (dueño muerto, > 45 s) sin terminar: también cancela
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "mallar"}))
+        os.utime(pj, (time.time() - 300, time.time() - 300))
+        p.refresh_progress(reschedule=False)
+        check(not p.progress_active() and p.prog["abierto"], "progreso viejo sin terminar: no «activo» pero sí «abierto»")
+        n_c = ncalls("cancel")
+        p.on_send("x")
+        spin(lambda: p.runner.busy, 5)
+        p.on_stop()
+        check(spin(lambda: ncalls("cancel") == n_c + 1 and not p.cli_active, 10), "Detener con progreso viejo sin terminar: llama a cancel")
+        spin(lambda: not p.runner.busy, 10)
+        # solo .inject.lock vigente (sin progreso.json): también cancela
+        pj.unlink()
+        lockf = tmp_sd / ".inject.lock"
+        lockf.write_text(json.dumps({"pid": os.getpid(), "tool": "run_java", "started": time.time()}))
+        p.refresh_progress(reschedule=False)
+        n_c = ncalls("cancel")
+        p.on_send("x")
+        spin(lambda: p.runner.busy, 5)
+        p.on_stop()
+        check(spin(lambda: ncalls("cancel") == n_c + 1 and not p.cli_active, 10), "Detener con .inject.lock vigente y sin progreso: llama a cancel")
+        spin(lambda: not p.runner.busy, 10)
+        lockf.unlink()
+        # cancel «pendiente»: muestra el texto, mantiene estado y botón de apagar y avisa al terminar
+        os.environ["FAKE_CANCEL_PENDING"] = "1"
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "mallar", "falta_s": 30}))
+        p.refresh_progress(reschedule=False)
+        n_c, n0 = ncalls("cancel"), len(txt())
+        p.on_send("x")
+        spin(lambda: p.runner.busy, 5)
+        p.on_stop()
+        check(spin(lambda: "la malla no se interrumpe, la macro parara" in txt()[n0:] and not p.cli_active, 10) and p.cancel_pending,
+              "cancel pendiente: muestra el texto del MCP y queda en vigilancia")
+        check("avisaré cuando termine" in txt()[n0:] and p.stop_btn.cget("text") == "Apagar solver", "cancel pendiente: ofrece apagar el solver")
+        os.utime(pj, (time.time() - 300, time.time() - 300))  # el dueño murió: archivo viejo, aún sin terminar
+        p.refresh_progress(reschedule=False)
+        check(p.cancel_pending and p.card.winfo_manager() == "pack", "cancel pendiente: el estado sigue visible aunque el archivo sea viejo")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "terminado", "terminado": True}))
+        p.refresh_progress(reschedule=False)
+        check(not p.cancel_pending and "La macro terminó" in txt()[n0:] and p.card.winfo_manager() == "", "cancel pendiente: al decir terminado, avisa y quita la tarjeta")
+        spin(lambda: not p.runner.busy, 10)
+        # «Parar iteraciones» en la malla con la CLI viva: explica y ofrece «Parar al terminar la malla» (llama a cancel)
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "mallar", "falta_s": 30}))
+        p.refresh_progress(reschedule=False)
+        n_c, n0 = ncalls("cancel"), len(txt())
+        p.on_cancel()
+        check("no se puede parar" in txt()[n0:] and ncalls("cancel") == n_c and p.wait_btn.cget("text") == "Parar al terminar la malla", "malla: explica y ofrece «Parar al terminar la malla»")
+        p.wait_btn.invoke()
+        check(spin(lambda: ncalls("cancel") == n_c + 1 and not p.cli_active, 10) and p.cancel_pending, "«Parar al terminar la malla»: llama a cancel y queda pendiente")
+        os.environ.pop("FAKE_CANCEL_PENDING")
+        p.cancel_pending = False
         pj.write_text(json.dumps({"caso": "BombaX", "fase": "terminado", "terminado": True}))
         p.refresh_progress(reschedule=False)
         # claves fuera de pantalla
@@ -1612,6 +1707,7 @@ def selftest():
         "    print(json.dumps({'ok': True, 'msg': 'solver apagado (falso)'}))\n"
         "elif tool == 'gui_attach': print(json.dumps({'ok': True, 'msg': 'GUI conectada (falsa)'}))\n"
         "elif tool == 'cancel' and os.environ.get('FAKE_CANCEL_NO'): print(json.dumps({'ok': True, 'cancelled': False, 'reason': 'no hay iteración en curso'}))\n"
+        "elif tool == 'cancel' and os.environ.get('FAKE_CANCEL_PENDING'): print(json.dumps({'ok': True, 'cancelled': False, 'pendiente': True, 'reason': 'ABORT puesto: la malla no se interrumpe, la macro parara antes de iterar'}))\n"
         "elif tool == 'cancel': print(json.dumps({'ok': True, 'cancelled': True, 'cancelado': True}))\n"
         "elif tool == 'server_status': print(json.dumps({'ok': True, 'solver': False, 'caso': None}))\n"
         "else: print(json.dumps({'error': 'herramienta desconocida'})); sys.exit(2)\n", encoding="utf-8")

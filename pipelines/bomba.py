@@ -252,6 +252,13 @@ JUDGE = r"""class PxJudge {
     }
   }"""
 
+CANCEL0 = r'''// --- cancel(): ABORT / cancel.json se miran antes de importar, entre fases y antes de cada bloque de iteraciones. Importar y mallar
+// no se interrumpen (el Stop File no corta un paso en curso): se para en cuanto terminan, sin post
+final String pcAb = @@ABORT@@, pcCf = @@CANCELF@@;
+class PcCan { boolean c() { return (!pcAb.isEmpty() && new java.io.File(pcAb).exists()) || (!pcCf.isEmpty() && new java.io.File(pcCf).exists()); } }
+PcCan pcCan = new PcCan();
+if (pcCan.c()) { sim.println("ITER_STOP\tcancelled\titeraciones 0\titeracion 0\tvariacion_max_pct NaN\tmeseta false\t0 s"); sim.println("AVISO\tcancelado antes de importar"); break pxPipe; }'''
+
 ITERAR = r'''final boolean[] pxCancelado = {false};  // cancel(): el post-proceso que venga detrás no corre
 // --- iterar hasta que @@NOMBRES@@ se estabilicen (< @@TOLPCT@@ % en @@WIN@@ iteraciones, comprobado cada @@BLK@@; máx. @@MAX@@). El residual < 1e-4 NO es condición: se reporta
 {
@@ -560,6 +567,7 @@ def _num(x) -> str:
 
 TEMPLATE = r'''
 // ===== pipeline bomba @@CASO@@ (modo @@MODO@@): importar, regiones, interfaces, física, MRF, fronteras, reportes, malla, Euler, escena
+pxPipe: {  // cancel(): `break pxPipe;` sale de todo el pipeline (post incluido) sin saltarse el AGENT_END del envoltorio
 long[] pipeT = {System.currentTimeMillis()}; final long pipeT0 = pipeT[0];
 String cadDir = @@CAD@@;
 String[] zNom = @@ZNOM@@, zStp = @@ZSTP@@, zCap = @@ZCAP@@;
@@ -570,7 +578,7 @@ String[][] zGeom = @@ZGEOM@@, zPared = @@ZPARED@@;
 int nz = zNom.length;
 class Nm { String f(String s) { return s.replaceAll("\\s+", "").toLowerCase(); } }
 Nm nm = new Nm();
-
+@@CANCEL0@@
 // --- importar: una parte por STEP, ubicada por diferencia de conjuntos (sin adivinar nombres)
 PartImportManager pim = sim.get(PartImportManager.class);
 SimulationPartManager spm = sim.get(SimulationPartManager.class);
@@ -740,6 +748,7 @@ try {
 @@ITERAR@@
 @@POST@@
 sim.println("PIPE total " + (System.currentTimeMillis() - pipeT0) / 1000.0);
+}
 '''
 
 EULER_WRAP = '''// --- Euler: triángulos de velocidad, H_Euler y eta_Euler (receta reportes-euler-triangulos, fronteras del rotor por nombre)
@@ -808,7 +817,14 @@ def macro_body(case_dir: str, cad_dir: str, ccm: dict, mode: str = "rapida", par
     if params.get("gamma"):
         extra.append("pipePc.enable(GammaTransitionModel.class);")
 
-    pipe = lambda ph: f'sim.println("PIPE {ph} " + (System.currentTimeMillis() - pipeT[0]) / 1000.0); pipeT[0] = System.currentTimeMillis();'
+    cancel_on = bool(params.get("abort_file") or params.get("cancel_file"))
+
+    def pipe(ph):
+        t = f'sim.println("PIPE {ph} " + (System.currentTimeMillis() - pipeT[0]) / 1000.0); pipeT[0] = System.currentTimeMillis();'
+        if cancel_on and ph not in ("iterar", "post", "escena"):  # tras cada fase barata y tras la malla (el bucle de iterar mira el ABORT por su cuenta)
+            t += ('\nif (pcCan.c()) { sim.println("ITER_STOP\\tcancelled\\titeraciones 0\\titeracion 0\\tvariacion_max_pct NaN\\tmeseta false\\t0 s"); '
+                  f'sim.println("AVISO\\tcancelado al terminar la fase {ph}"); break pxPipe; }}')
+        return t
     euler = ""
     if params.get("euler", True):
         euler = _asc(EULER_WRAP).replace("@@TXT@@", _euler_text(ccm, params))
@@ -828,6 +844,8 @@ def macro_body(case_dir: str, cad_dir: str, ccm: dict, mode: str = "rapida", par
     out = _asc(TEMPLATE)
     for k, v in rep.items():
         out = out.replace(f"@@{k}@@", v)
+    out = out.replace("@@CANCEL0@@", _asc(CANCEL0).replace("@@ABORT@@", _j(str(params.get("abort_file") or "")))
+                      .replace("@@CANCELF@@", _j(str(params.get("cancel_file") or ""))) if cancel_on else "")
     out = out.replace("@@MODELOS_EXTRA@@", "\n".join(extra))
     out = out.replace("@@EULER@@", euler)
     post_on, iter_on = bool(params.get("post")), bool(params.get("iterar"))
@@ -984,6 +1002,16 @@ def selftest() -> int:
     err = compile_java(ab, "abort", tmp)
     check('String pxAbort = "C:/w/sims/ABORT",' in ab and "if (!pxCancelado[0]) {" in ab and 'String pxAbort = "", pxCanF = "";' in full
           and err in (None, "SKIP"), "cancel: el bucle mira el ABORT, activa el Stop File y salta el post (javac)" + ("" if err in (None, "SKIP") else "\n" + str(err)))
+    # cancel en CUALQUIER fase: la macro mira ABORT/cancel.json antes de importar, tras cada fase barata, antes de la malla y antes del primer
+    # step() (importar y mallar no se interrumpen: se sale en cuanto terminan), y `break pxPipe` salta el post sin tocar el AGENT_END
+    ca = ab.count("break pxPipe; }")
+    i_rep, i_mal = ab.index('"PIPE reportes '), ab.index('"PIPE malla ')
+    fases_ck = [f for f in ("importar", "regiones", "fisica", "mrf", "fronteras", "reportes", "malla", "euler") if f'cancelado al terminar la fase {f}"' in ab]
+    cks = {"salidas": ca == 9, "fases": len(fases_ck) == 8, "antes_de_importar": "AVISO\\tcancelado antes de importar" in ab and ab.index("pcCan.c()") < ab.index("importCadPart"),
+           "antes_de_malla": "pcCan.c()" in ab[i_rep:i_mal], "antes_del_step": ab.index("pxCan.c()", ab.index("while (pxCur - pxIt0 < pxMax)")) < ab.index("step(Math.min(pxBlk"),
+           "sin_cancel_no_hay_pcCan": "pcCan" not in full, "etiqueta": "pxPipe: {" in ab and ab.rstrip().endswith("}")}
+    check(all(cks.values()), f"cancel en cualquier fase: ABORT antes de importar, tras cada fase barata ({len(fases_ck)}/8), antes de la malla y antes del primer step() ({ca} salidas)"
+          + ("" if all(cks.values()) else f" {cks}"))
     # N1: nada de validación ni AVISO de Euler antes de iterar (iteración 0)
     k = full.index("ITER_STOP")
     check("EULER_VALIDAR" not in full[:k] and "EULER_OK" not in full[:k] and "EULER_OK" in full[k:], "Euler: la validación va después de iterar, no antes")
