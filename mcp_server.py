@@ -210,9 +210,17 @@ def _state() -> dict:
 
 def _write_state(d: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp = STATE_FILE.with_suffix(f".{os.getpid()}.tmp")  # un tmp por proceso: el vigilante y el MCP escriben a la vez (visto: WinError 5)
     tmp.write_text(json.dumps(d, indent=1, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    for i in range(6):  # Windows: replace falla un instante si otro proceso lo está leyendo
+        try:
+            tmp.replace(STATE_FILE)
+            return
+        except PermissionError:
+            if i == 5:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05 * (i + 1))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1486,7 +1494,7 @@ def _tail_log(st: dict, n: int = 200_000) -> str:
 # tabla de monitores del solver (Iteration, Continuity, …, M, H). El panel solo lee ese archivo.
 PROG_TOOLS = ("iterate", "pump_case")
 PROG_EVERY_S = 1.0
-CANCEL_GRACE_S = float(os.environ.get("COPILOTO_CANCEL_GRACE_S", "8"))  # tras cancel: s que la macro tiene para acabar sola
+CANCEL_GRACE_S = float(os.environ.get("COPILOTO_CANCEL_GRACE_S", "60"))  # tras cancel: s que la macro tiene para acabar sola. Último recurso: matar el residente a mitad de step() TUMBÓ el servidor real (2026-10-26); antes llegan ABORT y stop()
 FASES = ["importar", "regiones", "fisica", "mrf", "fronteras", "reportes", "malla", "euler", "iterar", "post"]  # orden de los PIPE
 _FASE_NOMBRE = {"malla": "mallar"}
 _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
@@ -1510,7 +1518,7 @@ def abort_file() -> Path:
 
 def _write_json_atomic(path: Path, d: dict) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     for _ in range(4):  # (Windows: replace falla un instante si el panel lo tiene abierto)
         try:
             tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
@@ -1918,21 +1926,9 @@ def _abort_enable_java() -> str:
             "} } catch (Throwable e) { }\n")
 
 
-_STOP_BODY = 'sim.getSimulationIterator().stop();\nsim.println("STOP enviado");\n'
-
-
-def _stop_by_client(st: dict) -> None:
-    """Respaldo si el ABORT no basta: un cliente batch APARTE (el residente está ocupado con la macro) llama a stop()."""
-    try:
-        MACROS.mkdir(parents=True, exist_ok=True)
-        tag = "stop_" + datetime.now().strftime("%H%M%S_%f")[:-3]
-        src = MACROS / f"Agent_{tag}.java"
-        src.write_text(_wrap(_STOP_BODY, "", tag), encoding="utf-8")
-        cmd = _starccm_cmd() + ["-host", f"localhost:{st['port']}", "-batch", str(src), "-noexit"] + _lic_flags()
-        subprocess.run(cmd, capture_output=True, text=True, cwd=str(MACROS), timeout=90)
-        _log("cancel: stop() enviado por un cliente aparte")
-    except Exception as e:  # noqa: BLE001
-        _log(f"cancel: el cliente de stop() falló: {type(e).__name__}: {e}")
+# Sin respaldo de stop() desde otro cliente: con el solver real (2410, 2026-10-26) un segundo cliente batch que llama a
+# getSimulationIterator().stop() mientras el residente está en step() TUMBA el servidor (dos de dos pruebas: «Connection reset»).
+# El bucle de la macro mira el ABORT/cancel.json entre bloques y para solo.
 
 
 # ----------------------------------------------------------------------------- MCP
@@ -2274,11 +2270,11 @@ def gui_attach(wait_s: int = 0) -> dict:
 
 
 @_tool
-def cancel(wait_s: int = 15) -> dict:
+def cancel(wait_s: int = 45) -> dict:
     """Detiene LIMPIO las iteraciones en curso (iterate o la fase iterar de pump_case): crea el archivo ABORT que vigila el
     criterio «Stop File» de STAR-CCM+ (sims/ABORT) y cancel.json; la tool que itera lo ve, deja de pedir bloques, borra ABORT
-    y devuelve stopped="cancelled" con la solución hasta la última iteración. Si tras ~5 s la iteración sigue avanzando, además
-    manda stop() desde un cliente aparte. NO toma el turno (el turno es de quien itera). Sin iteración en curso no crea ABORT
+    y devuelve stopped="cancelled" con la solución hasta la última iteración. En 2410 el Stop File NO corta un step() en curso: la
+    parada llega al final del bloque (≤ 50 iteraciones). Nunca manda stop() desde otro cliente (tumba el servidor). NO toma el turno (el turno es de quien itera). Sin iteración en curso no crea ABORT
     (pararía la próxima corrida) y no toca nada: {"iteracion_en_curso": false}. Devuelve cancelled (¿paró?), iteracion_en_curso,
     iteracion, metodo y turno. wait_s: máximo que espera a que pare."""
     t0 = time.time()
@@ -2301,20 +2297,14 @@ def cancel(wait_s: int = 15) -> dict:
         _cancel_cleanup()
         return {"ok": False, "cancelled": False, "iteracion_en_curso": True, "error": f"no pude crear {abort_file()}: {e}"}
     _log(f"cancel: ABORT creado ({abort_file()}); iteración {it_at}, dueño pid {owner}")
-    stopped, method, fb = False, "ABORT", None
+    stopped, method = False, "ABORT"
     end = time.time() + max(1.0, float(wait_s))
-    fb_at = time.time() + 5.0
     while time.time() < end:
         time.sleep(0.2)
         pp = read_progreso()
         if lock_holder() is None or pp.get("terminado") or pp.get("pid") != owner:
             stopped = True
             break
-        if fb is None and time.time() >= fb_at and isinstance(pp.get("iteracion"), int) and isinstance(it_at, int) \
-                and pp["iteracion"] > it_at + 1:  # el ABORT no paró nada: la iteración sigue avanzando
-            method = "ABORT+stop()"
-            fb = threading.Thread(target=_stop_by_client, args=(st,), daemon=True)
-            fb.start()
     if lock_holder() is None:  # nadie es dueño: ABORT y cancel.json se limpian aquí (si no, el dueño lo hace al terminar)
         _cancel_cleanup()
     return {"ok": True, "cancelled": stopped, "iteracion_en_curso": True, "iteracion": it_at, "metodo": method, "turno": lock_holder(),
@@ -2835,7 +2825,7 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
         ccm_d = mod.parse_ccm(str(ccm_path))
         case_dir = CASES / _safe(case)
         case_dir.mkdir(parents=True, exist_ok=True)
-        body = mod.macro_body(_jpath(case_dir), _jpath(cad), ccm_d, mode, dict(params or {}))
+        body = mod.macro_body(_jpath(case_dir), _jpath(cad), ccm_d, mode, {"abort_file": _jpath(abort_file()), "cancel_file": _jpath(cancel_file()), **dict(params or {})})
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"pipeline de bomba: {type(e).__name__}: {e}"}
     imports = _pump_imports(mod)
@@ -2869,9 +2859,11 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
         out = {**info, "ok": bool(r["ok"]) and failed is None, "steps": steps, "failed_at": failed, "seconds": r["seconds"],
                "macro": r["macro"], "parsed": _parse_pump(r["stdout"]), "salida_completa": str(salida) if salida else None,
                "stdout": r["stdout"][-3000:], **_err(r)}
-        if r.get("cancelled"):
+        if r.get("cancelled") or "ITER_STOP\tcancelled" in r["stdout"]:  # la macro vio el ABORT y paró sola: sin post, servidor intacto
             out["cancelled"] = True
-        if until in ("stable", "n") and out["ok"] and not _cancel_requested():
+            if "ITER_STOP\tcancelled" in r["stdout"]:
+                _cancel_cleanup()
+        if until in ("stable", "n") and out["ok"] and not out.get("cancelled") and not _cancel_requested():
             it = iterate(n=n, until=until, reports=list(reports), block=block)  # mismo turno (re-entrante)
             out["iterate"] = {k: it.get(k) for k in ("ok", "stopped", "iterations_run", "iteration", "blocks", "seconds",
                                                     "reports", "variation_pct", "error", "exception", "busy") if k in it}
@@ -3236,7 +3228,7 @@ def _selftest() -> int:
             bg["regresion"] = e
 
     def bg_java() -> None:
-        """El Java nuevo (Stop File activo, init, stop() de respaldo) compilado con el javac real de STAR-CCM+."""
+        """El Java nuevo (Stop File activo, init) compilado con el javac real de STAR-CCM+."""
         if not jc_real:
             bg["java"] = "SKIP: no hay javac de STAR-CCM+"
             return
@@ -3245,7 +3237,7 @@ def _selftest() -> int:
             d = tmp / "javanuevo"
             d.mkdir()
             (d / "out").mkdir()
-            for nombre, body in (("init", _abort_enable_java() + _INIT_AUTOSAVE), ("stop", _STOP_BODY),
+            for nombre, body in (("init", _abort_enable_java() + _INIT_AUTOSAVE),
                                  ("iter", _abort_enable_java() + "sim.getSimulationIterator().step(5);")):
                 src = d / f"Agent_{nombre}.java"
                 src.write_text(_wrap(body, "", nombre), encoding="utf-8")
@@ -3961,8 +3953,8 @@ def _selftest() -> int:
         if isinstance(jv, str):
             print(f"  {time.time() - t_all:5.1f}s SKIP {jv}")
         else:
-            check(isinstance(jv, list) and len(jv) == 3 and all(rc == 0 for _, rc, _ in jv),
-                  "Java nuevo (Stop File activo con ruta absoluta, stop() de respaldo, init) compila con el javac de STAR-CCM+"
+            check(isinstance(jv, list) and len(jv) == 2 and all(rc == 0 for _, rc, _ in jv),
+                  "Java nuevo (Stop File activo con ruta absoluta, init) compila con el javac de STAR-CCM+"
                   + ("" if isinstance(jv, list) else f" ({jv!r})") + (f" {[(n, e) for n, rc, e in jv if rc]}" if isinstance(jv, list) else ""))
         secs = time.time() - t_all
         check(secs < 45, f"el selftest tarda {secs:.1f} s (< 45 s)")

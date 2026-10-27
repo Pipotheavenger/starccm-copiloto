@@ -223,6 +223,11 @@ Fechas 2026-10-23 salvo indicación. Las del remoto y la UI web: `conocimiento/C
   archivo exista y deje de crecer (informe PDF = receta `informe-detalle`, reflexión + try/catch).
 
 ### Servidor y operación
+- 2026-10-26 · Cancelar con el solver real (BombaRapida, 3 pruebas): el criterio «Stop File» activo (`STOPFILE` en la salida)
+  no cortó el `step(50)` en curso: siguió de la 101 a la 150. Respaldo `getSimulationIterator().stop()` desde un segundo cliente
+  batch con el residente en `step()`: el servidor murió («Connection reset») las dos veces. Ahora el bucle de la macro mira ABORT
+  y cancel.json entre bloques, para con `ITER_STOP cancelled`, salta el post y el servidor sigue sirviendo (14 s, iterate de 20 ok).
+  Matar el residente queda solo como último recurso a los 60 s.
 - 2026-10-26 · División por cero en un reporte (`eta`, `eta_Euler`, factor de deslizamiento) con la solución en cero: en la
   iteración 1 `H_Euler = 0` y «Non-finite value detected» aborta `StepSimulation` (se perdieron 66 s de malla). Todo
   denominador de un `ExpressionReport` va como `(abs(den) > 1e-9 ? num/den : 0)`.
@@ -271,4 +276,4 @@ recomendada primera y la cifra de coste entre paréntesis. Ejemplo: «1) malla f
 
 ## 9. Pendiente de verificar con solver real
 
-Verificado el 2026-10-26 con solver en BombaRapida_e2e (pump_case con iterar y post: H 16,74 m, eta 88,6 %, H_Euler 18,75 m, eta_Euler 0,892, balance 0,0002 %, estable en 250 it, 3 PNG): `pipelines/bomba.py` completo, `iterar`, `post`, receta de Euler (`reportes-euler-triangulos`) y `bomba-reportes` (con divisiones protegidas). Verificado además: medida de `PARED_CONEXION` corregida (en la corrida 181510 dijo «no medible», 0 AVISO; el balance 1,8e-4 % es lo que protege). Sigue sin verificar: la validación de Euler tras iterar sin aviso espurio (N1, corregida en el generador, sin solver), receta NACA con STL, `gui_attach` desde el MCP en uso largo, la curva de 5 caudales.
+Verificado el 2026-10-26 con solver en BombaRapida_e2e (pump_case con iterar y post: H 16,74 m, eta 88,6 %, H_Euler 18,75 m, eta_Euler 0,892, balance 0,0002 %, estable en 250 it, 3 PNG): `pipelines/bomba.py` completo, `iterar`, `post`, receta de Euler (`reportes-euler-triangulos`) y `bomba-reportes` (con divisiones protegidas). Verificado además: medida de `PARED_CONEXION` corregida (en la corrida 181510 dijo «no medible», 0 AVISO; el balance 1,8e-4 % es lo que protege). Verificado también: Euler tras iterar sin aviso espurio (N1: EULER_OK, AVISO None) y cancelar sin tumbar el servidor. Sigue sin verificar: receta NACA con STL, `gui_attach` desde el MCP en uso largo, la curva de 5 caudales.

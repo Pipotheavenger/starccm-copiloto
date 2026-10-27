@@ -10,7 +10,8 @@ guardando y escribe casos/<caso>/e2e.json con tiempos por fase y resultados. Mie
 --cancel (opcional, NO se lanza solo): en vez de dejar converger, cuando la iteración pasa de 100 llama a cancel() (archivo ABORT),
 comprueba que pump_case vuelve con cancelled, que ABORT y cancel.json desaparecen, que el turno queda libre y que el solver sigue
 sirviendo (iterate de 20 it), y apaga. Guarda el resultado de cancel() y los segundos que tardó en parar en e2e.json (clave "cancel").
-Es la prueba que falta con el solver real: si el criterio «Stop File» no obedece, cancel() lo dice (metodo ABORT+stop())."""
+Con el solver real (2026-10-26) el Stop File no corta un step() en curso: la macro para al final del bloque. Un stop() desde otro
+cliente tumbaba el servidor: ya no se manda."""
 import json, re, sys, threading, time
 from pathlib import Path
 

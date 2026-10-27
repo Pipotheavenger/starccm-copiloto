@@ -6,6 +6,7 @@
 // PARAMS: case_dir, max_iter, reportes
 // GENERADA con `python pipelines/bomba.py --write-recetas` desde pipelines/bomba.py: no editar a mano (el selftest la compara).
 // Pensada para run_steps: agrupa iterar y post con el cambio de caudal en UNA macro.
+final boolean[] pxCancelado = {false};  // cancel(): el post-proceso que venga detrás no corre
 // --- iterar hasta que los reportes dados se estabilicen (< 0.5 % en 100 iteraciones, comprobado cada 50; máx. ${max_iter}). El residual < 1e-4 NO es condición: se reporta
 {
   class PxJudge {
@@ -30,9 +31,20 @@
   java.util.ArrayList<double[]> pxHist = new java.util.ArrayList<double[]>();
   int pxIt0 = sim.getSimulationIterator().getCurrentIteration(), pxCur = pxIt0;
   String pxWhy = "max"; double pxVar = Double.NaN; long pxT0 = System.currentTimeMillis();
+  // cancel() crea este archivo: el criterio «Stop File» corta step() y el bucle no pide más bloques. Se activa aquí porque el
+  // nodo solo existe con la física creada (server_start lo intenta con la sim vacía y no lo encuentra; visto con el solver real)
+  String pxAbort = "", pxCanF = "";  // pxCanF (cancel.json del MCP): por si STAR-CCM+ borra el ABORT al pararse
+  class PxCan { boolean c() { return (!pxAbort.isEmpty() && new java.io.File(pxAbort).exists()) || (!pxCanF.isEmpty() && new java.io.File(pxCanF).exists()); } }
+  PxCan pxCan = new PxCan();
+  if (!pxAbort.isEmpty()) try {
+    for (SolverStoppingCriterion sc : sim.getSolverStoppingCriterionManager().getObjects())
+      if (sc instanceof AbortFileStoppingCriterion) { ((AbortFileStoppingCriterion) sc).setAbortFilePath(pxAbort); ((AbortFileStoppingCriterion) sc).setIsUsed(true); sim.println("STOPFILE\t" + pxAbort); }
+  } catch (Throwable ex) { sim.println("WARN\tno pude activar el Stop File: " + ex); }
   while (pxCur - pxIt0 < pxMax) {
+    if (pxCan.c()) { pxWhy = "cancelled"; break; }
     sim.getSimulationIterator().step(Math.min(pxBlk, pxMax - (pxCur - pxIt0)));
     pxCur = sim.getSimulationIterator().getCurrentIteration();
+    if (pxCan.c()) { pxWhy = "cancelled"; break; }
     double[] pxS = new double[pxNm.length + 1]; pxS[0] = pxCur; boolean pxFin = true;
     for (int pj = 0; pj < pxNm.length; pj++) {
       pxS[pj + 1] = sim.getReportManager().getReport(pxNm[pj]).getReportMonitorValue();
@@ -67,5 +79,6 @@
   if (pxPlat) sim.println("AVISO\tmeseta de residuales: el mayor residual no bajó un 10 % en " + pxPl + " iteraciones (normal en frozen rotor, ~1e-2)");
   if (pxWhy.equals("max")) sim.println("AVISO\t" + String.join(" y ", pxNm) + " no se estabilizaron en " + pxMax + " iteraciones: no dar el resultado como convergido");
   if (pxWhy.equals("diverge")) sim.println("AVISO\tdiverge: " + String.join(" o ", pxNm) + " no son números; parar y revisar interfaces y fronteras");
+  pxCancelado[0] = pxWhy.equals("cancelled");
   sim.println("ITER_STOP\t" + pxWhy + "\titeraciones " + (pxCur - pxIt0) + "\titeración " + pxCur + "\tvariación_max_% " + pxVar * 100 + "\tmeseta " + pxPlat + "\t" + (System.currentTimeMillis() - pxT0) / 1000.0 + " s");
 }

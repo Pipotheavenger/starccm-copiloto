@@ -86,6 +86,7 @@ Sin `.cfturbo-ccm` no hay `pump_case`. `inspect`; superficie sucia → surface w
 - Apagar sin guardar pierde la solución: `save` antes de `server_stop(save=false)`. Los selftests solo usan temporales.
 - Fallo transitorio de MPI tras apagar otro servidor no es de licencia: reintentar tras un rato.
 - `taskkill /T` alcanza procesos desacoplados mientras el padre viva: lanzar con intermediario que muere (`_spawn_detached`). `server_start` reabre un .sim del mismo nombre: caso nuevo por prueba. Imports de `pump_case` como lista → `import 'x';`.
+- Cancelar: el Stop File (ABORT) NO corta un `step()` en curso en 2410; un `stop()` desde un segundo cliente o matar el cliente a mitad de `step()` TUMBA el servidor. Solo `cancel()`: la macro para al final del bloque (≤ 50 it, ~15 s).
 
 ## Casos de referencia (cifras en `conocimiento/INDICE.md`)
 
@@ -94,4 +95,4 @@ Sin `.cfturbo-ccm` no hay `pump_case`. `inspect`; superficie sucia → surface w
 
 ## Pendiente de verificar con solver
 
-Euler tras iterar sin aviso espurio (N1); receta NACA con STL; `gui_attach` en uso largo; curva de 5 caudales; `run_steps` con recetas de caso.
+Receta NACA con STL; `gui_attach` en uso largo; curva de 5 caudales; `run_steps` con recetas de caso.

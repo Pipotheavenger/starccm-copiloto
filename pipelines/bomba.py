@@ -238,7 +238,8 @@ JUDGE = r"""class PxJudge {
     }
   }"""
 
-ITERAR = r'''// --- iterar hasta que @@NOMBRES@@ se estabilicen (< @@TOLPCT@@ % en @@WIN@@ iteraciones, comprobado cada @@BLK@@; máx. @@MAX@@). El residual < 1e-4 NO es condición: se reporta
+ITERAR = r'''final boolean[] pxCancelado = {false};  // cancel(): el post-proceso que venga detrás no corre
+// --- iterar hasta que @@NOMBRES@@ se estabilicen (< @@TOLPCT@@ % en @@WIN@@ iteraciones, comprobado cada @@BLK@@; máx. @@MAX@@). El residual < 1e-4 NO es condición: se reporta
 {
   @@JUDGE@@
   PxJudge pxJ = new PxJudge();
@@ -249,9 +250,20 @@ ITERAR = r'''// --- iterar hasta que @@NOMBRES@@ se estabilicen (< @@TOLPCT@@ % 
   java.util.ArrayList<double[]> pxHist = new java.util.ArrayList<double[]>();
   int pxIt0 = sim.getSimulationIterator().getCurrentIteration(), pxCur = pxIt0;
   String pxWhy = "max"; double pxVar = Double.NaN; long pxT0 = System.currentTimeMillis();
+  // cancel() crea este archivo: el criterio «Stop File» corta step() y el bucle no pide más bloques. Se activa aquí porque el
+  // nodo solo existe con la física creada (server_start lo intenta con la sim vacía y no lo encuentra; visto con el solver real)
+  String pxAbort = @@ABORT@@, pxCanF = @@CANCELF@@;  // pxCanF (cancel.json del MCP): por si STAR-CCM+ borra el ABORT al pararse
+  class PxCan { boolean c() { return (!pxAbort.isEmpty() && new java.io.File(pxAbort).exists()) || (!pxCanF.isEmpty() && new java.io.File(pxCanF).exists()); } }
+  PxCan pxCan = new PxCan();
+  if (!pxAbort.isEmpty()) try {
+    for (SolverStoppingCriterion sc : sim.getSolverStoppingCriterionManager().getObjects())
+      if (sc instanceof AbortFileStoppingCriterion) { ((AbortFileStoppingCriterion) sc).setAbortFilePath(pxAbort); ((AbortFileStoppingCriterion) sc).setIsUsed(true); sim.println("STOPFILE\t" + pxAbort); }
+  } catch (Throwable ex) { sim.println("WARN\tno pude activar el Stop File: " + ex); }
   while (pxCur - pxIt0 < pxMax) {
+    if (pxCan.c()) { pxWhy = "cancelled"; break; }
     sim.getSimulationIterator().step(Math.min(pxBlk, pxMax - (pxCur - pxIt0)));
     pxCur = sim.getSimulationIterator().getCurrentIteration();
+    if (pxCan.c()) { pxWhy = "cancelled"; break; }
     double[] pxS = new double[pxNm.length + 1]; pxS[0] = pxCur; boolean pxFin = true;
     for (int pj = 0; pj < pxNm.length; pj++) {
       pxS[pj + 1] = sim.getReportManager().getReport(pxNm[pj]).getReportMonitorValue();
@@ -286,6 +298,7 @@ ITERAR = r'''// --- iterar hasta que @@NOMBRES@@ se estabilicen (< @@TOLPCT@@ % 
   if (pxPlat) sim.println("AVISO\tmeseta de residuales: el mayor residual no bajó un 10 % en " + pxPl + " iteraciones (normal en frozen rotor, ~1e-2)");
   if (pxWhy.equals("max")) sim.println("AVISO\t" + String.join(" y ", pxNm) + " no se estabilizaron en " + pxMax + " iteraciones: no dar el resultado como convergido");
   if (pxWhy.equals("diverge")) sim.println("AVISO\tdiverge: " + String.join(" o ", pxNm) + " no son números; parar y revisar interfaces y fronteras");
+  pxCancelado[0] = pxWhy.equals("cancelled");
   sim.println("ITER_STOP\t" + pxWhy + "\titeraciones " + (pxCur - pxIt0) + "\titeración " + pxCur + "\tvariación_max_% " + pxVar * 100 + "\tmeseta " + pxPlat + "\t" + (System.currentTimeMillis() - pxT0) / 1000.0 + " s");
 }'''
 
@@ -461,7 +474,8 @@ def iterate_body(case_dir: str, params: dict | None = None) -> str:
     csv = _j((Path(case_dir) / "reports" / "residuals_pipe.csv").as_posix())
     rep = {"TOLPCT": f"{st['tol'] * 100:g}", "WIN": str(st["ventana"]), "BLK": str(st["bloque"]), "MAX": str(st["max_iter"]),
            "PL": str(st["meseta"]), "TOL": _num(st["tol"]), "CSV": csv, "JUDGE": JUDGE,
-           "REPS": _arr(names), "NOMBRES": " y ".join(names)}
+           "REPS": _arr(names), "NOMBRES": " y ".join(names), "ABORT": _j(str(params.get("abort_file") or "")),
+           "CANCELF": _j(str(params.get("cancel_file") or ""))}
     out = ITERAR
     for k, v in rep.items():
         out = out.replace(f"@@{k}@@", v)
@@ -806,7 +820,8 @@ def macro_body(case_dir: str, cad_dir: str, ccm: dict, mode: str = "rapida", par
     if post_on:
         pp = dict(params)
         pp.setdefault("post_euler", bool(params.get("euler", True)))
-        out = out.replace("@@POST@@", post_body(case_dir, pp) + "@@PIPE:post@@")
+        po = post_body(case_dir, pp)
+        out = out.replace("@@POST@@", ("if (!pxCancelado[0]) {\n" + po + "\n}\n" if iter_on else po) + "@@PIPE:post@@")
     else:
         out = out.replace("@@POST@@", "")
     out = re.sub(r"@@PIPE:(\w+)@@", lambda m: pipe(m.group(1)), out)
@@ -946,6 +961,10 @@ def selftest() -> int:
     # iterar + post dentro de la MISMA macro (criterio por defecto: máx. 1000) y por separado
     full = macro_body(str(tmp / "caso"), cad, ccm, "rapida", {"iterar": True, "post": True})
     check("pxMax = 1000," in full and "ITER_STOP" in full and "PIPE iterar" in full and "PIPE post" in full, "macro con iterar+post: máx. 1000 y marcadores")
+    ab = macro_body(str(tmp / "caso"), cad, ccm, "rapida", {"iterar": True, "post": True, "abort_file": "C:/w/sims/ABORT"})
+    err = compile_java(ab, "abort", tmp)
+    check('String pxAbort = "C:/w/sims/ABORT",' in ab and "if (!pxCancelado[0]) {" in ab and 'String pxAbort = "", pxCanF = "";' in full
+          and err in (None, "SKIP"), "cancel: el bucle mira el ABORT, activa el Stop File y salta el post (javac)" + ("" if err in (None, "SKIP") else "\n" + str(err)))
     # N1: nada de validación ni AVISO de Euler antes de iterar (iteración 0)
     k = full.index("ITER_STOP")
     check("EULER_VALIDAR" not in full[:k] and "EULER_OK" not in full[:k] and "EULER_OK" in full[k:], "Euler: la validación va después de iterar, no antes")
