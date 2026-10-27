@@ -22,10 +22,11 @@ cada turno). Lecciones completas: [conocimiento/lecciones.md](conocimiento/lecci
 2. Modo **Rápido** (defecto: sonnet, esfuerzo bajo) o **Preciso** (opus) en el selector del panel; Preciso solo para diagnósticos
    difíciles. Si escribes mientras el agente trabaja, el mensaje queda **en cola** y sale al terminar el paso; cada herramienta
    muestra «▶ … 12 s» con **cronómetro** en vivo y cada turno una línea gris con sus tiempos; **Detener** cierra la CLI
-   (no toca el solver ni el residente), **Apagar** guarda y apaga con confirmación.
+   (no toca el solver ni el residente) y, si había una macro en marcha en CUALQUIER fase, pide `cancel` solo; **Apagar** guarda
+   y apaga con confirmación (sin timeout). Con el solver encendido más de `COPILOTO_AVISO_HORAS` (2) el panel avisa que la licencia cobra por hora.
 3. **Abrir GUI** (botón o tool `gui_attach`): `starccm+ -host localhost:47827`, sin licencia extra. Con GUI conectada nada apaga el solver solo: aparece el aviso de inactividad.
 4. Una bomba de CFturbo: «corre la bomba de `<carpeta con .cfturbo-ccm y STEP>`» → `pump_case` con
-   `params={"iterar": true, "post": true}`: importar, malla, física, iterar hasta estable y PNG en UNA macro (187 s medidos de punta a punta con el servidor: ver «Medido»).
+   `params={"iterar": true, "post": true}`: importar, malla, física, iterar hasta estable y PNG en UNA macro (162 s medidos de punta a punta con el servidor: ver «Medido»).
 
 El solver solo arranca fuera del sandbox de Claude Code. Un solo solver vivo a la vez (licencia de una copia).
 
@@ -34,7 +35,7 @@ El solver solo arranca fuera del sandbox de Claude Code. Un solo solver vivo a l
 | pieza | qué hace |
 |---|---|
 | `mcp_server.py` | 16 tools (lista abajo). Un servidor `starccm+ -server`; las macros entran por un **cliente residente** (un cliente batch `-noexit` que vigila una carpeta; 0,7-1 s por macro frente a 8,6 s) y, si falla, por el cliente batch de siempre. Turnos con `.inject.lock` |
-| `mcp_server.py --cli <tool> [json]` | acción directa SIN modelo (la usa el panel): `gui_attach`, `gui_status`, `server_stop`, `server_status`, `cancel`. Escribe el JSON por stdout y espera el turno `COPILOTO_CLI_LOCK_WAIT_S` (3 s). Salida 0 = respondió, 1 = lanzó, 2 = uso incorrecto |
+| `mcp_server.py --cli <tool> [json]` | acción directa SIN modelo (la usa el panel): `gui_attach`, `gui_status`, `server_stop`, `server_status`, `cancel`, `vigilante_relanzar`. Escribe el JSON por stdout y espera el turno `COPILOTO_CLI_LOCK_WAIT_S` (3 s). Salida 0 = respondió, 1 = lanzó, 2 = uso incorrecto |
 | progreso en vivo | mientras corren `iterate` o `pump_case`, un hilo escribe `progreso.json` en `COPILOTO_WORK` (~1 s): fase, iteración, H, M, continuidad, transcurrido y falta. El panel lo muestra en una tarjeta; al acabar queda `fase: terminado` |
 | vigilante de inactividad | proceso propio por puerto (`mcp_server.py --vigilante <puerto>`), lanzado desacoplado (fuera del árbol de la CLI: Detener no lo toca); mira macros en disco y GUI, escribe `gui`/`idle_min`/`idle_warning` en `.server.json` (en `COPILOTO_WORK`; `panel_estado.json` dice dónde) y, sin GUI, guarda y apaga a los `STARCCM_IDLE_MIN` (30) |
 | `panel/chat_panel.py` | chat flotante (tkinter); lanza `claude -p … --resume` con las tools `mcp__starccm__*` |
@@ -49,19 +50,31 @@ El solver solo arranca fuera del sandbox de Claude Code. Un solo solver vivo a l
 | operar | `inspect`, `run_java`, `run_steps`, `iterate`, `pump_case`, `cancel`, `export_scene`, `save` |
 | conocimiento | `recipe_search`, `recipe_save`, `docs_search` |
 
-`cancel()` para las iteraciones en curso (`iterate` o la fase iterar de `pump_case`): crea el archivo `ABORT` («Stop File») y
-`cancel.json`. En 2410 el Stop File **no corta un `step()` en curso**: la macro para al final del bloque (≤ 50 iteraciones).
-Nunca se manda `stop()` desde otro cliente ni se mata el residente a mitad de `step()`: tumba el servidor. Fuera de la fase
-iterar no hace nada (malla e importar no se interrumpen).
+`cancel(wait_s=45, forzar=False)` para la corrida en curso (`iterate` o CUALQUIER fase de `pump_case`): crea `ABORT` («Stop File»)
+y `cancel.json`. En 2410 el Stop File **no corta un `step()` en curso**: la macro mira ABORT/`cancel.json` antes de importar,
+entre fases, antes de la malla y entre bloques de iteración.
+
+| fase al cancelar | qué pasa |
+|---|---|
+| iterar | para al final del bloque (≤ 50 it); sale con `stopped=cancelled`, sin post y con resultados parciales (H, M, eta) |
+| importar, mallar | no se interrumpen: `cancel` queda `pendiente` (`parara_en_s`), la fase termina y la macro sale SIN iterar ni post |
+| post | no se interrumpe; ya casi termina (usar `server_stop`) |
+| dueño muerto (Detener mató la CLI y su MCP) | macro huérfana: se cancela igual, en cualquier fase; `cancel` espera el fin y limpia ABORT/`cancel.json` (si vence `wait_s`, el vigilante) |
+
+Nunca se manda `stop()` desde otro cliente: tumba el servidor. El residente solo se mata con `forzar=True` y si la macro lleva
+más de max(`COPILOTO_CANCEL_GRACE_S` = 120 s, 3 bloques según el ritmo) SIN salida; mientras avance se espera, y con macro
+huérfana nunca se mata. Sin corrida en curso no crea ABORT.
 
 ## Medido (solver real, 4 procesos, BombaRapida, 2026-10-26)
 
 | prueba | resultado |
 |---|---|
-| ronda 4 de punta a punta (`e2e 184823`) | **187 s** = `server_start` 36 s + `pump_case` 147 s + `server_stop` 4 s |
-| `pump_case` (147 s) | malla 41 s, iterar 88 s, post 2 s, resto ~8 s |
-| cancelación a mitad de iterar (`e2e 191110`) | `cancel` devuelve en 14 s con el servidor vivo; `pump_case` vuelve `cancelled` a los 21 s |
-| resultados | H 16,74 m, eta 88,6 %, `EULER_OK`, balance de masa 1,8e-4 % |
+| completa de punta a punta (`casos/BombaRapida_e2e_193651`) | **162 s** = `server_start` 36,5 + `pump_case` 119,4 + `server_stop` 6,6 |
+| `pump_case` (119,4 s) | importar 5,5, malla 26,1, iterar 77,8 (250 it), post 2,0, resto ~8 |
+| cancel con dueño vivo, it. 101 (`BombaRapida_e2e_203656`) | `cancel` 14,5 s; `pump_case` vuelve `cancelled` a los 21,5 s con resultados parciales (H 16,74 m, eta 88,6 %); servidor vivo, `iterate` de 20 it posterior OK |
+| panel real, «Detener» en iterar (`BombaRapida_panel_204007`) | cancel 14,2 s (macro huérfana), apagado 7,4 s |
+| panel real, «Detener» en malla (`BombaRapida_panel_204318`) | cancel 25,7 s: la malla termina y la macro sale SIN iterar; apagado 4,7 s |
+| resultados | H 16,74 m, eta 88,6 %, H_Euler 18,75 m, `EULER_OK`, balance de masa 1,8e-4 % |
 
 ## Variables de entorno
 
@@ -84,7 +97,9 @@ completa en [.env.example](.env.example). Nunca claves reales en el repo.
 | `COPILOTO_WORK` | `%LOCALAPPDATA%\starccm-copiloto` | carpeta de trabajo pesada |
 | `COPILOTO_VIGILANTE_S` | 30 | segundos entre comprobaciones del vigilante |
 | `COPILOTO_VIG_GONE_S` | 3 | segundos con el servidor muerto antes de que el vigilante termine |
-| `COPILOTO_CANCEL_GRACE_S` | 60 | segundos que la macro tiene para parar sola tras `cancel` |
+| `COPILOTO_CANCEL_GRACE_S` | 120 | segundos mínimos SIN salida de la macro tras `cancel` antes de darla por colgada (con `forzar=True` se mata el residente; nunca menos de 3 bloques de 50 it según el ritmo) |
+| `STARCCM_MAX_HORAS` | 0 (sin tope) | tope DURO de horas con el solver encendido: el vigilante guarda y apaga aunque haya GUI |
+| `COPILOTO_AVISO_HORAS` | 2 | solo el panel: horas con el solver vivo a partir de las cuales avisa (≤ 0 lo desactiva) |
 | `COPILOTO_CLI_LOCK_WAIT_S` | 3 | espera del turno en `--cli` |
 | `COPILOTO_DETACHED` | 0 | 1 = `DETACHED_PROCESS` (solo diagnóstico) |
 | `COPILOTO_AGENT_LOG` | `<COPILOTO_WORK>\agent.log` | registro de eventos del agente |
@@ -96,10 +111,11 @@ completa en [.env.example](.env.example). Nunca claves reales en el repo.
 
 | comando | qué comprueba | coste |
 |---|---|---|
-| `.venv\Scripts\python mcp_server.py --selftest` | las tools contra `tests/fake_starccm.py` (solo temporales) | sin licencia, ~30 s |
-| `.venv\Scripts\python panel\chat_panel.py --selftest` | el panel contra `tests/fake_claude.py`, sin pantalla | sin licencia, ~9 s |
+| `.venv\Scripts\python mcp_server.py --selftest` (delega en `tests/selftest_mcp.py`) | las tools contra `tests/fake_starccm.py` (solo temporales); falla si pasa de 45 s | sin licencia, ~37 s |
+| `.venv\Scripts\python panel\chat_panel.py --selftest` | el panel contra `tests/fake_claude.py`, sin pantalla | sin licencia, ~10-20 s |
 | `.venv\Scripts\python pipelines\bomba.py --selftest` | lee un `.cfturbo-ccm` real, compila con el `javac` de STAR-CCM+ el Java generado, prueba el juez de estabilidad | sin licencia, ~70 s |
-| `.venv\Scripts\python tests\real_e2e.py [carpeta_cad] [caso] [--cancel]` | **prueba real**: server_start, `pump_case` (iterar + post), server_stop; escribe `casos/<caso>/e2e.json` con tiempos por fase y resultados. `--cancel` (nunca se lanza solo): pasada la it. 100 llama a `cancel()` y comprueba que el servidor sigue vivo | **gasta licencia PoD**, ~3-5 min; lanzar desde una terminal normal (fuera del sandbox) y sin otro solver vivo |
+| `.venv\Scripts\python tests\real_e2e.py [carpeta_cad] [caso] [--cancel]` | **prueba real**: server_start, `pump_case` (iterar + post), server_stop; escribe `casos/<caso>/e2e.json` con tiempos por fase y resultados. `--cancel` (nunca se lanza solo): pasada la it. 100 llama a `cancel()` y comprueba resultados parciales, ABORT/`cancel.json` borrados y servidor vivo (`iterate` de 20 it) | **gasta licencia PoD**, ~3-5 min; lanzar desde una terminal normal (fuera del sandbox) y sin otro solver vivo |
+| `.venv\Scripts\python tests\real_panel_e2e.py [carpeta_cad] [--fase-detener N] [--detener-en-malla] [--sin-apagar] [--visible]` | **prueba real del panel**: la clase real `Panel` en Tk, `claude -p` → MCP → `pump_case`; pulsa «Detener» en la it. 100 (o la N; `--detener-en-malla` en la fase mallar), espera el cancel, apaga con el botón real; escribe `casos/<caso>/panel_e2e.json`. `--sin-apagar` deja el solver vivo, `--visible` muestra la ventana | **gasta licencia PoD y turnos de `claude`**, ~2-3 min; fuera del sandbox, sin otro solver vivo |
 
 ## Carpetas
 

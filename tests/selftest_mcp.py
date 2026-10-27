@@ -1140,6 +1140,12 @@ def _selftest() -> int:
                 pass
         os.environ.pop("FAKE_RESIDENT_MODE", None)
         shutil.rmtree(tmp, ignore_errors=True)
+    # la documentación cuenta y nombra las tools: que no se quede atrás del código
+    src = Path(m.__file__).read_text(encoding="utf-8")
+    tools = re.findall(r"^@_tool\s*\ndef (\w+)", src, re.M)
+    readme = (Path(m.__file__).parent / "README.md").read_text(encoding="utf-8")
+    falta = [t for t in tools if f"`{t}`" not in readme]
+    check(f"## Tools ({len(tools)})" in readme and not falta, f"README lista las {len(tools)} tools del código" + (f" (faltan {falta})" if falta else ""))
     print(f"selftest: {len(fails)} fallos" if fails else "selftest: todo en verde")
     return 1 if fails else 0
 

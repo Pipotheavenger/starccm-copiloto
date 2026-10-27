@@ -6,7 +6,7 @@ Claude es el ingeniero que opera STAR-CCM+; STAR-CCM+ es el solver. Claude nunca
 
 ## Velocidad (leer primero)
 
-Medido: corrida improvisada 45 min frente a **3 min 14 s** con el guion fijo (BombaRapida, prueba real 2026-10-26). El 65 % de
+Medido: corrida improvisada 45 min frente a **162 s** (2 min 42 s) con el guion fijo (BombaRapida, prueba real 2026-10-26). El 65 % de
 los 45 min fue la IA pensando entre macros.
 
 1. **Pipeline primero**: bomba de CFturbo → `pump_case(case, cad_dir, params={"iterar": true, "post": true})`: importar → resultados, PNG y Euler en UNA macro.
@@ -35,7 +35,7 @@ El usuario mira la **GUI real** conectada al MISMO servidor y te habla desde el 
 
 - Español, corto, números en tablas. Lo mínimo que funcione. Atajos marcados `# ponytail:` con su límite.
 - Claves de licencia solo en `.env` (ignorado por git); nunca en código, recetas, logs, `.server.json` ni commits; no mostrar `.env`.
-- Checks (sin licencia ni solver): `.venv\Scripts\python mcp_server.py --selftest`, `panel\chat_panel.py --selftest`, `pipelines\bomba.py --selftest`. Prueba real (gasta licencia, ~5 min, fuera del sandbox): `tests\real_e2e.py`.
+- Checks (sin licencia ni solver): `.venv\Scripts\python mcp_server.py --selftest` (delega en `tests/selftest_mcp.py`), `panel\chat_panel.py --selftest`, `pipelines\bomba.py --selftest`. Pruebas reales (gastan licencia, ~3-5 min, fuera del sandbox, sin otro solver): `tests\real_e2e.py [--cancel]` y `tests\real_panel_e2e.py [--detener-en-malla]`.
 - Python del repo: `.venv\Scripts\python.exe`. Java: el JDK de STAR-CCM+.
 - Tras un `run_java` que logre algo nuevo → `recipe_save` (cabecera QUE/VERSION/FECHA/ESTADO). Error que costó > 2 intentos → una línea en `conocimiento/lecciones.md`. Al cerrar un caso → `casos/<caso>/RESUMEN.md`.
 - Si algo falla dos veces con la misma causa, parar y decir qué se sabe.
@@ -86,11 +86,12 @@ Sin `.cfturbo-ccm` no hay `pump_case`. `inspect`; superficie sucia → surface w
 - Apagar sin guardar pierde la solución: `save` antes de `server_stop(save=false)`. Los selftests solo usan temporales.
 - Fallo transitorio de MPI tras apagar otro servidor no es de licencia: reintentar tras un rato.
 - `taskkill /T` alcanza procesos desacoplados mientras el padre viva: lanzar con intermediario que muere (`_spawn_detached`). `server_start` reabre un .sim del mismo nombre: caso nuevo por prueba. Imports de `pump_case` como lista → `import 'x';`.
-- Cancelar: el Stop File (ABORT) NO corta un `step()` en curso en 2410; un `stop()` desde un segundo cliente o matar el cliente a mitad de `step()` TUMBA el servidor. Solo `cancel()`: la macro para al final del bloque (≤ 50 it, ~15 s).
+- Cancelar: el Stop File (ABORT) NO corta un `step()` en curso en 2410; un `stop()` desde un segundo cliente o matar el residente a mitad de `step()` TUMBA el servidor. Solo `cancel()`: la macro mira ABORT entre fases y bloques; en iterar para al final del bloque (≤ 50 it, ~15 s); en importar/mallar queda `pendiente`, para al acabar la fase sin iterar ni post. Funciona con el dueño muerto (Detener) y en cualquier fase; el residente solo se mata con `forzar=True` tras el plazo sin salida.
+- `STARCCM_MAX_HORAS` (0 = sin tope) apaga aunque haya GUI; el panel avisa a las `COPILOTO_AVISO_HORAS` (2) h. `--cli vigilante_relanzar` revive el vigilante.
 
 ## Casos de referencia (cifras en `conocimiento/INDICE.md`)
 
-`BombaRapida` (d2 137 mm, 50 m³/h, 2900 rpm): prueba real 3 min 14 s, H 16,74 m, η 88,6 %, H_Euler 18,75 m. `cursocfturbo` (D2 270 mm):
+`BombaRapida` (d2 137 mm, 50 m³/h, 2900 rpm): prueba real 162 s, H 16,74 m, η 88,6 %, H_Euler 18,75 m. `cursocfturbo` (D2 270 mm):
 370 k celdas, H 78,8 m, η 89,4 %. `BombaPruebaNR`: H 14,02 m, η 76,5 %. `cilindro`: fontanería, 11 k celdas.
 
 ## Pendiente de verificar con solver
