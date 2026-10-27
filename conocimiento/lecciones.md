@@ -223,6 +223,9 @@ Fechas 2026-10-23 salvo indicación. Las del remoto y la UI web: `conocimiento/C
   archivo exista y deje de crecer (informe PDF = receta `informe-detalle`, reflexión + try/catch).
 
 ### Servidor y operación
+- 2026-10-26 · Ronda 6 con solver real: cancel con dueño vivo para en 14,5 s con RESULT parciales (H 16,74 m, η 88,6 %);
+  «Detener» del panel real (clase `Panel`) en `iterar` para en 14,2 s; en `mallar` el cancel queda pendiente, la malla
+  termina y la macro sale sin iterar ni post (25,7 s). En los tres el servidor sigue vivo y apaga en 5-7 s.
 - 2026-10-26 · Camino del panel probado con solver real (`tests/real_panel_e2e.py`): `claude -p` → MCP → pump_case; «Detener» a
   la iteración 100 mata la CLI y su MCP (dueño del turno); `--cli cancel` ve el dueño muerto, pone ABORT y la macro para en 13 s
   con el servidor vivo; apagado 6,6 s. Corrida completa: 162 s de punta a punta.

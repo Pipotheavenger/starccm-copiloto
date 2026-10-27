@@ -1715,7 +1715,7 @@ def selftest():
         "elif tool == 'gui_attach': print(json.dumps({'ok': True, 'msg': 'GUI conectada (falsa)'}))\n"
         "elif tool == 'cancel' and os.environ.get('FAKE_CANCEL_NO'): print(json.dumps({'ok': True, 'cancelled': False, 'reason': 'no hay iteración en curso'}))\n"
         "elif tool == 'cancel' and os.environ.get('FAKE_CANCEL_PENDING'): print(json.dumps({'ok': True, 'cancelled': False, 'pendiente': True, 'reason': 'ABORT puesto: la malla no se interrumpe, la macro parara antes de iterar'}))\n"
-        "elif tool == 'cancel': print(json.dumps({'ok': True, 'cancelled': True, 'cancelado': True}))\n"
+        "elif tool == 'cancel': print(json.dumps({'ok': True, 'cancelled': True, 'cancelado': True, 'fase': 'iterar', 'iteracion': 20}))\n"
         "elif tool == 'server_status': print(json.dumps({'ok': True, 'solver': False, 'caso': None}))\n"
         "else: print(json.dumps({'error': 'herramienta desconocida'})); sys.exit(2)\n", encoding="utf-8")
     os.environ["PANEL_MCP_SERVER"] = str(fake_mcp)
