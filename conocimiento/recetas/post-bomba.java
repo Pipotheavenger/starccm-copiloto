@@ -5,7 +5,7 @@
 // PARAMS: case_dir
 // GENERADA con `python pipelines/bomba.py --write-recetas` desde pipelines/bomba.py: no editar a mano (el selftest la compara).
 // Pensada para run_steps: agrupa iterar y post con el cambio de caudal en UNA macro.
-// --- post-proceso: planos auto, escenas a PNG (presión en álabes, velocidad relativa en plano medio, y+), resultados
+// --- post-proceso: planos auto, escenas a PNG (presion en alabes, velocidad relativa en plano medio, y+), resultados
 {
   long pxT0 = System.currentTimeMillis();
   String pxImg = "${case_dir}/images"; int pxW = 1600, pxHt = 1000; boolean pxPng = true;
@@ -13,7 +13,7 @@
   ReportManager pxRm = sim.getReportManager(); FieldFunctionManager pxFfm = sim.getFieldFunctionManager();
   int pxIt = 0; try { pxIt = sim.getSimulationIterator().getCurrentIteration(); } catch (Exception e) { }
   boolean pxSol = pxIt >= 1;
-  if (!pxSol) sim.println("AVISO\tpost sin solución (iteración 0): se crean planos y escenas pero no se exportan PNG");
+  if (!pxSol) sim.println("AVISO\tpost sin solucion (iteracion 0): se crean planos y escenas pero no se exportan PNG");
   class PxR { Report get(String n) { try { return pxRm.getReport(n); } catch (Exception e) { return null; } } }
   PxR pxr = new PxR();
   class PxS { Scene find(String base) { for (Scene s : sim.getSceneManager().getScenes()) if (s.getPresentationName().startsWith(base)) return s; return null; } }
@@ -31,7 +31,7 @@
       }
     } catch (Exception e) { }
   }
-  // fronteras: álabes+cubo del rotor, solo álabes, salida del rotor, todas las paredes (sin interfaces)
+  // fronteras: alabes+cubo del rotor, solo alabes, salida del rotor, todas las paredes (sin interfaces)
   java.util.List<Boundary> pxBl = new java.util.ArrayList<Boundary>(), pxBlade = new java.util.ArrayList<Boundary>(), pxOut = new java.util.ArrayList<Boundary>(), pxWalls = new java.util.ArrayList<Boundary>();
   for (Region r : sim.getRegionManager().getRegions()) for (Boundary b : r.getBoundaryManager().getBoundaries()) {
     String bn = b.getPresentationName();
@@ -76,7 +76,7 @@
     } catch (Exception e) { sim.println("WARN\tplano " + pxPn[pi] + ": " + e); }
   }
   sim.println("PLANOS\tmedio a " + pxMid + " m del origen del eje; " + pxOut.size() + " fronteras de salida del rotor");
-  // escena 1: presión en álabes y cubo
+  // escena 1: presion en alabes y cubo
   try {
     Scene sc = pxs.find("presion_alabes");
     if (sc == null) {
@@ -89,7 +89,7 @@
     }
     if (pxSol && pxPng) { sc.printAndWait(resolvePath(pxImg + "/presion_alabes.png"), 1, pxW, pxHt, true, false); sim.println("PNG\t" + pxImg + "/presion_alabes.png"); }
   } catch (Exception e) { sim.println("WARN\tescena presion_alabes: " + e); }
-  // escena 2: velocidad relativa en el plano medio (color = módulo, flechas encima, paredes tenues)
+  // escena 2: velocidad relativa en el plano medio (color = modulo, flechas encima, paredes tenues)
   try {
     FieldFunction vrel = null;
     for (String fn : new String[] {"RelativeVelocity", "CellRelativeVelocity", "Velocity"}) { if (vrel == null) try { vrel = pxFfm.getFunction(fn); } catch (Exception e) { } }
@@ -113,7 +113,7 @@
     }
     if (pxSol && pxPng) { sc.printAndWait(resolvePath(pxImg + "/velocidad_relativa.png"), 1, pxW, pxHt, true, false); sim.println("PNG\t" + pxImg + "/velocidad_relativa.png"); }
   } catch (Exception e) { sim.println("WARN\tescena velocidad_relativa: " + e); }
-  // escena 3: y+ en todas las paredes; reportes mín/media/máx en álabes
+  // escena 3: y+ en todas las paredes; reportes min/media/max en alabes
   try {
     FieldFunction yp = pxFfm.getFunction("WallYplus");
     Report r0 = pxr.get("yplus_max_alabes");
@@ -139,7 +139,7 @@
       if (pxPng) { sc.printAndWait(resolvePath(pxImg + "/yplus.png"), 1, pxW, pxHt, true, false); sim.println("PNG\t" + pxImg + "/yplus.png"); }
     }
   } catch (Exception e) { sim.println("WARN\tescena yplus: " + e); }
-  // resultados en una línea cada uno (y balance de masa): no hace falta otra macro para leerlos
+  // resultados en una linea cada uno (y balance de masa): no hace falta otra macro para leerlos
   if (pxSol) {
     for (String rn : new String[] {"H", "M", "P_hid", "P_eje", "eta", "Q_in", "Q_out", "H_Euler", "eta_Euler"}) {
       Report q = pxr.get(rn);
@@ -153,12 +153,12 @@
   }
   sim.println("POST_SECONDS\t" + (System.currentTimeMillis() - pxT0) / 1000.0);
 }
-// --- validación de Euler con la solución (AVISO / EULER_MAL / EULER_OK)
+// --- validacion de Euler con la solucion (AVISO / EULER_MAL / EULER_OK)
 {
 boolean turbina = false; String hrep = "H"; ReportManager rm = sim.getReportManager();
-// ---- VALIDACION (necesita solución; bomba.py la reutiliza sola con euler_check_body)
+// ---- VALIDACION (necesita solucion; bomba.py la reutiliza sola con euler_check_body)
 int itEu = 0; try { itEu = sim.getSimulationIterator().getCurrentIteration(); } catch (Exception e) { }
-if (itEu < 1) sim.println("EULER_VALIDAR\tsin solución (iteración 0): repetir tras iterar");
+if (itEu < 1) sim.println("EULER_VALIDAR\tsin solucion (iteracion 0): repetir tras iterar");
 else {
   double vUVu1 = Double.NaN, vUVu2 = Double.NaN, vHe = Double.NaN, vH = Double.NaN, vU1 = Double.NaN, vU2 = Double.NaN;
   try { vUVu1 = rm.getReport("UVu1").getReportMonitorValue(); vUVu2 = rm.getReport("UVu2").getReportMonitorValue();
@@ -168,7 +168,7 @@ else {
   if (Double.isNaN(vUVu1) || Double.isNaN(vUVu2) || Math.abs(vUVu2 - vUVu1) <= 1e-6 * Math.max(Math.abs(vUVu1), Math.abs(vUVu2)) + 1e-12) {
     sim.println("AVISO\tEuler: UVu2 (" + vUVu2 + ") = UVu1 (" + vUVu1 + "): el reporte de salida lee la entrada o no hay trabajo"); malo = true; }
   if (!Double.isNaN(vU1) && !Double.isNaN(vU2) && (turbina ? vU2 >= vU1 : vU2 <= vU1)) {
-    sim.println("AVISO\tEuler: U2 (" + vU2 + ") frente a U1 (" + vU1 + ") no cuadra con entrada→salida del rotor"); malo = true; }
+    sim.println("AVISO\tEuler: U2 (" + vU2 + ") frente a U1 (" + vU1 + ") no cuadra con entrada->salida del rotor"); malo = true; }
   if (!Double.isNaN(vH) && !Double.isNaN(vHe) && (turbina ? vHe >= vH : vHe <= vH)) {
     sim.println("AVISO\tEuler: H_Euler (" + vHe + ") " + (turbina ? "no es menor" : "no es mayor") + " que H (" + vH + ")"); malo = true; }
   sim.println(malo ? "EULER_MAL\trevisar fronteras del rotor" : "EULER_OK\tH_Euler " + vHe + " m, H " + vH + " m");

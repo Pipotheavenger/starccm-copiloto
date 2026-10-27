@@ -25,7 +25,7 @@ reinicia las iteraciones).
 Iteración lenta y cancelable: FAKE_STEP_DELAY=<s> hace que cada iteración de `.step(N)` tarde esos segundos, imprima en vivo la
 tabla de monitores (Iteration, Continuity, X-momentum, M (N-m), H) y se detenga si existe el archivo FAKE_ABORT_FILE (por defecto
 «ABORT» en el directorio de trabajo del servidor: el criterio «Stop File» de STAR-CCM+). FAKE_IGNORE_ABORT=1 lo ignora (para probar
-la macro que no obedece). Con el servidor ya lanzado se controlan por el JSON de $FAKE_CTL_FILE: {"delay": s, "ignore_abort": bool}. El servidor emite esa salida por el socket a medida que sale y el residente la reimprime en vivo.
+la macro que no obedece). Con el servidor ya lanzado se controlan por el JSON de $FAKE_CTL_FILE: {"delay": s, "ignore_abort": bool, "hang": bool}. Con hang la macro se queda muda (como una colgada) hasta que vuelve a false. El servidor emite esa salida por el socket a medida que sale y el residente la reimprime en vivo.
 Se ejecuta con `python -I tests/fake_starccm.py ...` (ver STARCCM_EXE en mcp_server.py).
 """
 import math
@@ -207,7 +207,7 @@ def _scen():
 
 
 def _ctl():
-    """Control en caliente (el servidor ya está lanzado): JSON {"delay": s, "ignore_abort": bool} en $FAKE_CTL_FILE."""
+    """Control en caliente (el servidor ya está lanzado): JSON {"delay": s, "ignore_abort": bool, "hang": bool} en $FAKE_CTL_FILE."""
     p = os.environ.get("FAKE_CTL_FILE")
     if p and os.path.isfile(p):
         try:
@@ -254,6 +254,8 @@ def run_macro(text):
         ignore = bool(ctl.get("ignore_abort")) or os.environ.get("FAKE_IGNORE_ABORT") == "1"
         it0 = _IT[0]
         for i in range(int(m.group(1))):
+            while _ctl().get("hang"):  # macro colgada: no emite nada hasta que el test lo suelte
+                time.sleep(0.05)
             if not ignore and os.path.exists(abort):
                 break
             time.sleep(delay)

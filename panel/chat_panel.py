@@ -400,7 +400,7 @@ def read_status(repo: Path | None = None, sdir: Path | None = None) -> dict:
     st = _json(sf)
     alive = bool(st.get("pid")) and pid_alive(st["pid"])
     out = {"solver": alive, "caso": None, "idle_min": None, "idle_warning": None, "gui": False, "busy": None,
-           "vigil_age": None, "vigil_down": False}
+           "vigil_age": None, "vigil_down": False, "horas": None}
     parts = []
     if alive:
         out["caso"] = Path(st["sim"]).stem if st.get("sim") else "(sin .sim)"
@@ -414,6 +414,8 @@ def read_status(repo: Path | None = None, sdir: Path | None = None) -> dict:
                 pass
         parts.append(f"Solver vivo · {out['caso']}" + (f" · {out['idle_min']} min inactivo" if out["idle_min"] is not None else ""))
         out["idle_warning"] = warning_text(st.get("idle_warning"), out["idle_min"])
+        age_s = iso_age(st["started"]) if st.get("started") else None
+        out["horas"] = None if age_s is None else max(age_s, 0) / 3600
         out["vigil_age"] = iso_age(st["idle_checked"]) if st.get("idle_checked") else None
         out["vigil_down"] = out["vigil_age"] is not None and out["vigil_age"] > VIGIL_MAX_S  # el vigilante no late: cobra sin control
     else:
@@ -452,8 +454,9 @@ def cli_cmd(tool: str, args: dict | None = None, repo: Path | None = None) -> li
     return cmd
 
 
-def run_cli(tool: str, args: dict | None = None, repo: Path | None = None, timeout: float = 120) -> dict:
-    """`mcp_server.py --cli <herramienta> [json]` -> dict (JSON por stdout). Nunca lanza: los fallos vuelven como {'error': ...}."""
+def run_cli(tool: str, args: dict | None = None, repo: Path | None = None, timeout: float | None = 120) -> dict:
+    """`mcp_server.py --cli <herramienta> [json]` -> dict (JSON por stdout). Nunca lanza: los fallos vuelven como {'error': ...}.
+    `timeout=None`: sin límite (server_stop: matarlo a medias deja el solver cobrando)."""
     try:
         p = subprocess.run(cli_cmd(tool, args, repo), cwd=repo or REPO, capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=timeout, stdin=subprocess.DEVNULL,
@@ -476,11 +479,24 @@ def run_cli(tool: str, args: dict | None = None, repo: Path | None = None, timeo
     return res
 
 
+SECRET_RE = re.compile(r"(-podkey\s+|\b(?:podkey|license[_-]?key|licencia|clave|password|passwd|token|api[_-]?key|secret)\w*\s*[=:]\s*)\S+", re.I)
+
+
+def redact(text: str) -> str:
+    """Nada de claves en pantalla: `-podkey X` y `clave=X` salen como «***» (red de seguridad; el MCP ya redacta)."""
+    return SECRET_RE.sub(lambda m: m.group(1) + "***", text)
+
+
 def fmt_cli(tool: str, res: dict) -> tuple[str, bool]:
     """(texto para el chat, ok)."""
     label = LABEL_CLI.get(tool, tool)
     if res.get("error"):
         return f"{label}: {res['error']}", False
+    if tool == "cancel" and "cancelled" in res:
+        if res["cancelled"]:
+            return f"{label}: paró en la iteración {res.get('iteracion', '?')}", True
+        if res.get("reason"):
+            return f"{label}: {res['reason']}", res.get("ok", True) is not False
     for k in ("msg", "mensaje", "message", "resumen", "summary", "status", "estado"):
         if isinstance(res.get(k), str) and res[k]:
             return f"{label}: {res[k]}", res.get("ok", True) is not False
@@ -507,6 +523,7 @@ def _num(d: dict, *keys):
 
 
 PROG_STALE_S = 45
+ITER_FASES = ("iterar", "iterando")  # la única fase que `cancel` puede parar (mallar e importar no)
 
 
 def read_progress(repo: Path | None = None, sdir: Path | None = None) -> dict | None:
@@ -531,8 +548,9 @@ def read_progress(repo: Path | None = None, sdir: Path | None = None) -> dict | 
     return {"caso": d.get("caso") or "", "fase": fase, "it": it, "tot": tot, "frac": None if frac is None else max(0.0, min(1.0, frac)),
             "H": _num(d, "H", "h", "altura"), "M": _num(d, "M", "m", "torque"), "eta": eta,
             "cont": _num(d, "continuidad", "cont", "continuity"), "seg": _num(d, "segundos", "s", "transcurrido_s"),
-            "resta": _num(d, "restante_s", "faltan_s", "restante", "eta_s"), "age": age,
-            "active": bool(fase) and fase.lower() not in ("terminado", "listo", "fin") and age <= PROG_STALE_S}
+            "resta": _num(d, "falta_s", "restante_s", "faltan_s", "restante", "eta_s"), "age": age,
+            "iterando": fase.lower() in ITER_FASES,
+            "active": bool(fase) and not d.get("terminado") and fase.lower() not in ("terminado", "listo", "fin") and age <= PROG_STALE_S}
 
 
 def fnum(x, dec=1, unit="") -> str:
@@ -549,6 +567,27 @@ def fresta(s) -> str:
     if s is None:
         return ""
     return f"faltan ~{max(int(round(s / 60)), 1)} min" if s >= 60 else f"faltan ~{int(round(s))} s"
+
+
+def no_cancel_text(pr: dict) -> str:
+    """Una línea: por qué «Parar iteraciones» no sirve en esta fase y cuánto falta."""
+    falta = pr.get("resta")
+    cuando = f"termina sola; {fresta(falta)}" if falta else "termina sola (sin tiempo estimado)"
+    return (f"La fase «{pr['fase']}» no se puede parar: {cuando}. Apagar el solver la corta, pero pierdes lo hecho "
+            "desde el último guardado.")
+
+
+def aviso_horas() -> float:
+    """Horas con el solver vivo a partir de las cuales el panel avisa (COPILOTO_AVISO_HORAS, 2 por defecto; ≤ 0 lo desactiva)."""
+    try:
+        return float(os.environ.get("COPILOTO_AVISO_HORAS", "2").replace(",", "."))
+    except ValueError:
+        return 2.0
+
+
+def horas_text(h: float, gui: bool) -> str:
+    return (f"⏱ Solver encendido hace {fnum(h, 1)} h: la licencia cobra por hora"
+            + (" y con la GUI abierta no se apaga solo." if gui else "."))
 
 
 def dpi_aware() -> bool:
@@ -589,7 +628,7 @@ class Panel:
         self.sc = max(root.winfo_fpixels("1i") / 96, 1.0)
         self.closed = self.closing = False
         self.aft: dict[str, str] = {}
-        self.close_timeout, self.dlg = 60.0, None
+        self.close_timeout, self.dlg, self.close_wait = 60.0, None, False
         self.q = runner_q or queue.Queue()
         self.runner = Runner(self.q, repo or REPO, sdir)
         self.sid = load_sid()
@@ -604,7 +643,9 @@ class Panel:
         self.cli_active: set[str] = set()
         self.lost = False
         self.prog: dict | None = None
-        self.vis: tuple = (False, False, False)
+        self.vis: tuple = (False, False, False, False)  # vigilante, horas, idle_warning, progreso
+        self.cli_t0: dict[str, float] = {}
+        self.auto_cancel = False  # el cancel lo pidió Detener (no el usuario): si no para, avisa del solver cobrando
         self.empty = None
         root.title("Copiloto STAR-CCM+")
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -653,6 +694,12 @@ class Panel:
         self.vig_lbl.pack(side="left", fill="x", expand=True)
         self.vig_btn = self.button(self.vig, "Apagar", lambda: self.twice("vig", self.vig_btn, "Apagar", self.on_off_now), "peligro", small=True)
         self.vig_btn.pack(side="right", padx=P(6), pady=P(4))
+        self.hrs = tk.Frame(self.mid, bg=C["amber_bg"])
+        self.hrs_lbl = tk.Label(self.hrs, text="", anchor="w", justify="left", bg=C["amber_bg"], fg=C["amber"], font=(FONT[0], 10, "bold"),
+                                wraplength=P(300), padx=P(8), pady=P(5))
+        self.hrs_lbl.pack(side="left", fill="x", expand=True)
+        self.hrs_btn = self.button(self.hrs, "Apagar", lambda: self.twice("horas", self.hrs_btn, "Apagar", self.on_off_now), "apagar", small=True)
+        self.hrs_btn.pack(side="right", padx=P(6), pady=P(4))
         self.warn = tk.Label(self.mid, text="", anchor="w", justify="left", bg=C["amber_bg"], fg=C["amber"], font=(FONT[0], 10, "bold"),
                              wraplength=P(380), padx=P(8), pady=P(5))  # banda ámbar: idle_warning
         self.card = tk.Frame(self.mid, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
@@ -752,6 +799,7 @@ class Panel:
             w = max(self.root.winfo_width() - self.px(40), 100)
             self.warn.config(wraplength=w)
             self.vig_lbl.config(wraplength=max(w - self.px(90), 100))
+            self.hrs_lbl.config(wraplength=max(w - self.px(90), 100))
 
     # --- estado vacío con sugerencias
     def show_empty(self):
@@ -781,7 +829,7 @@ class Panel:
     def put(self, text, *tags):
         self.hide_empty()
         self.hist.config(state="normal")
-        self.hist.insert("end", text, tags)
+        self.hist.insert("end", redact(text), tags)
         self.hist.config(state="disabled")
         self.hist.see("end")
 
@@ -833,6 +881,7 @@ class Panel:
 
     def start(self, msg):
         self.turn_t0, self.tool_s, self.n_tools = time.time(), 0.0, 0
+        self.auto_cancel = False
         self.runner.send(msg, self.sid, modo=self.modo.get())
 
     def flush_queue(self):
@@ -858,11 +907,14 @@ class Panel:
     # --- acciones directas: mcp_server.py --cli en un hilo, resultado en el chat, sin turno de modelo
     def direct(self, tool, args=None):
         if tool in self.cli_active:
+            if tool == "server_stop":
+                self.say("Ya está apagando el solver: espera, guardar el .sim puede tardar minutos.", "sys")
             return
         self.cli_active.add(tool)
-        self.say(f"▸ {LABEL_CLI.get(tool, tool)}…", "sys")
+        self.cli_t0[tool] = time.time()
+        self.say(f"▸ {LABEL_CLI.get(tool, tool)}…" + (" (puede tardar minutos; no se interrumpe)" if tool == "server_stop" else ""), "sys")
         repo = self.repo or REPO
-        tmo = 180 if tool == "server_stop" else 90
+        tmo = None if tool == "server_stop" else 90  # matar el apagado a medias deja .server.json y el solver cobrando
 
         def work():
             self.q.put(("cli", tool, run_cli(tool, args, repo, tmo)))
@@ -875,7 +927,16 @@ class Panel:
         self.direct("server_stop")
 
     def on_cancel(self):
+        self.refresh_progress(reschedule=False)
+        if self.progress_active() and not self.prog["iterando"]:  # malla/importación: el solver no las interrumpe
+            self.explain_no_cancel()
+            return
         self.direct("cancel")
+
+    def explain_no_cancel(self):
+        self.say(no_cancel_text(self.prog), "err")
+        self.stop_btn = self.chat_button("Apagar solver", lambda: self.twice("nocancel", self.stop_btn, "Apagar solver", self.on_off_now), "apagar")
+        self.put("\n")
 
     def on_off(self):
         self.twice("apagar", self.btn["apagar"], "Apagar solver", self.on_off_now)
@@ -885,8 +946,14 @@ class Panel:
         if self.runner.busy:
             n = len(self.pending)
             self.pending.clear()
+            self.refresh_progress(reschedule=False)
+            iterando = self.progress_active() and self.prog["iterando"]  # medido ANTES de matar la CLI
             self.runner.stop()
             self.say("Detenido." + (f" Descarté {n} mensaje(s) en cola." if n else ""), "sys")
+            if iterando:  # sin CLI nadie vigila la macro: se cancela para que no siga iterando (y cobrando)
+                self.auto_cancel = True
+                self.say("Había iteraciones en curso: pido cancelarlas.", "sys")
+                self.direct("cancel")
             self.root.after(self.stop_delay_ms, self.check_after_stop)
         elif self.progress_active():
             self.check_after_stop()
@@ -910,7 +977,11 @@ class Panel:
             return
         if w:
             self.say(w, "err")
-        if act:
+        if act and self.auto_cancel:
+            pass  # el cancel ya está pedido: su resultado sale en el chat
+        elif act and not self.prog["iterando"]:
+            self.explain_no_cancel()
+        elif act:
             self.say("Hay iteraciones en marcha en el solver" + (f" ({self.prog['caso']})" if self.prog["caso"] else "") +
                      ": «Parar iteraciones» las cancela sin apagar nada.", "sys" if w else "err")
             self.cancel_btn = self.chat_button("Parar iteraciones", self.on_cancel, "detener")
@@ -999,7 +1070,7 @@ class Panel:
         if a == "no":
             self.finish()
             return
-        self.closing, self.close_t0 = True, time.time()
+        self.closing, self.close_t0, self.close_wait = True, time.time(), False
         self.say("Apagando el solver antes de salir… (máx. %d s)" % self.close_timeout, "sys")
         self.on_off_now()  # directo: sin pasar por el modelo
         self.root.after(300, self.close_poll)
@@ -1009,6 +1080,11 @@ class Panel:
             return
         if not self.cli_active and not self.status_now()["solver"]:
             self.finish()
+        elif time.time() - self.close_t0 > self.close_timeout and "server_stop" in self.cli_active:
+            if not self.close_wait:  # el apagado sigue en curso: no se da por perdido ni se interrumpe
+                self.close_wait = True
+                self.say("Sigue guardando y apagando el solver (puede tardar minutos). Espero; no cierro todavía.", "sys")
+            self.root.after(300, self.close_poll)
         elif time.time() - self.close_t0 > self.close_timeout:
             self.closing = False
             self.say("El solver no se apagó a tiempo: sigue vivo. No cerré el panel; usa «Apagar solver» o ciérralo con «No».", "err")
@@ -1062,8 +1138,15 @@ class Panel:
             self.lost = True
         elif k == "cli":
             self.cli_active.discard(ev[1])
+            self.cli_t0.pop(ev[1], None)
             txt, ok = fmt_cli(ev[1], ev[2])
             self.say(("✓ " if ok else "✗ ") + txt, "ok" if ok else "err")
+            if ev[1] == "cancel" and self.auto_cancel:
+                self.auto_cancel = False
+                if not ev[2].get("cancelled"):  # sin cancel, la macro puede seguir iterando con el solver cobrando
+                    self.say("La macro puede seguir iterando en el solver y cobrando. Apágalo si no la necesitas.", "err")
+                    self.stop_btn = self.chat_button("Apagar solver", lambda: self.twice("autocancel", self.stop_btn, "Apagar solver", self.on_off_now), "apagar")
+                    self.put("\n")
             if not self.closed:
                 self.refresh()
         elif k == "done":
@@ -1090,7 +1173,10 @@ class Panel:
         self.aft["pump"] = self.root.after(100, self.pump)
 
     def tick(self):
-        if self.tools:
+        if "server_stop" in self.cli_active:  # el apagado guarda el .sim: que se vea que sigue vivo
+            t0 = self.cli_t0.get("server_stop", time.time())
+            self.live.config(text=f"▶ Guardando y apagando el solver … {fmt_s(time.time() - t0)} (no lo interrumpas)", fg=C["amber"])
+        elif self.tools:
             label, t0 = max(self.tools.values(), key=lambda v: v[1])
             self.live.config(text=f"▶ {label} … {fmt_s(time.time() - t0)}", fg=C["blue"])
         elif self.runner.busy:
@@ -1114,9 +1200,9 @@ class Panel:
         if show == self.vis:
             return
         self.vis = show
-        for w in (self.vig, self.warn, self.card):
+        for w in (self.vig, self.hrs, self.warn, self.card):
             w.pack_forget()
-        for on, w in zip(show, (self.vig, self.warn, self.card)):
+        for on, w in zip(show, (self.vig, self.hrs, self.warn, self.card)):
             if on:
                 w.pack(fill="x", pady=(self.px(6), 0))
 
@@ -1133,7 +1219,7 @@ class Panel:
             self.tile["M"].config(text=fnum(pr["M"], 2, " N·m"))
             self.tile["eta"].config(text=fnum(None if eta is None else (eta * 100 if eta <= 1.5 else eta), 1, " %"))
             self.tile["cont"].config(text=fsci(pr["cont"]))
-        self.relayout((self.vis[0], self.vis[1], bool(pr and pr["active"])))
+        self.relayout((self.vis[0], self.vis[1], self.vis[2], bool(pr and pr["active"])))
         if pr and pr["active"]:
             self.draw_bar()
         if reschedule and not self.closed:
@@ -1155,7 +1241,11 @@ class Panel:
                         else "Sin solver: se arranca cuando haga falta")
         if s["idle_warning"]:
             self.warn.config(text="⚠ " + s["idle_warning"])
-        self.relayout((bool(s["vigil_down"]), bool(s["idle_warning"]), self.vis[2]))
+        lim = aviso_horas()
+        hrs = bool(s["solver"] and s["horas"] is not None and lim > 0 and s["horas"] >= lim)
+        if hrs:
+            self.hrs_lbl.config(text=horas_text(s["horas"], s["gui"]))
+        self.relayout((bool(s["vigil_down"]), hrs, bool(s["idle_warning"]), self.vis[3]))
         if "refresh" in self.aft:
             self.root.after_cancel(self.aft["refresh"])
         self.aft["refresh"] = self.root.after(3000, self.refresh)
@@ -1364,6 +1454,149 @@ def selftest():
         os.environ["PANEL_CLAUDE_BIN"] = str(REPO / "tests" / "fake_claude.py")
         os.environ["FAKE_PAUSE"] = "0.4"
 
+    def run_r5_checks(p, root, spin, trepo, tmp_sd, sj):
+        """Ronda 5: apagado sin timeout, malla no cancelable, aviso por horas, cancel tras Detener, nada de claves en pantalla."""
+        from datetime import datetime, timedelta
+        base = {"pid": os.getpid(), "sim": "C:/x/Nueva.sim", "gui": True}
+        pj, log = tmp_sd / "progreso.json", Path(os.environ["FAKE_CLI_LOG"])
+        ncalls = lambda tool: [ln.split()[0] for ln in log.read_text().splitlines()].count(tool)
+        txt = lambda: p.hist.get("1.0", "end-1c")
+        spin(lambda: not p.cli_active, 10)
+        # 9. server_stop nunca muere por timeout; se ve que sigue apagando
+        seen: dict = {}
+        real = globals()["run_cli"]
+        globals()["run_cli"] = lambda tool, args=None, repo=None, timeout=120: seen.update({tool: timeout}) or {"ok": True, "msg": "x"}
+        p.direct("server_stop")
+        p.direct("cancel")
+        spin(lambda: not p.cli_active, 5)
+        globals()["run_cli"] = real
+        check(seen.get("server_stop", 1) is None and seen.get("cancel") == 90, f"server_stop sin timeout (None) y el resto 90 s: {seen}")
+        os.environ["FAKE_STOP_SLEEP"] = "2.5"
+        p.direct("server_stop")
+        check(spin(lambda: "no lo interrumpas" in p.live.cget("text") and "Guardando y apagando" in p.live.cget("text"), 5),
+              "apagando: la barra muestra «Guardando y apagando… (no lo interrumpas)» con el tiempo")
+        n0 = len(txt())
+        p.direct("server_stop")
+        check("Ya está apagando" in txt()[n0:], "segundo clic en Apagar mientras apaga: avisa, no lanza otro")
+        check(spin(lambda: "✓ Apagar solver: solver apagado (falso)" in txt()[n0:] and not p.cli_active, 10), "el apagado largo termina y se informa (no se mató a medias)")
+        os.environ.pop("FAKE_STOP_SLEEP")
+        # cierre: el apagado sigue en curso pasado el máximo -> el panel espera, no lo da por perdido
+        os.environ["FAKE_STOP_SLEEP"] = "2.0"
+        sj.write_text(json.dumps(base))
+        p.close_timeout = 0.5
+        p.closing = False
+        p.dlg = None
+        p.on_close()
+        p.dlg_btn["si"].invoke()
+        check(spin(lambda: "Sigue guardando y apagando" in txt(), 6) and not p.closed, "cerrar: pasado el máximo con server_stop en curso espera (no dice «no se apagó»)")
+        spin(lambda: not p.cli_active, 10)
+        spin(lambda: not p.closing, 10)
+        os.environ.pop("FAKE_STOP_SLEEP")
+        p.close_timeout = 60.0
+        p.closing = False
+        sj.write_text(json.dumps(base))
+        # 11. malla / importación no se cancelan: explica con fase y tiempo, ofrece apagar
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "mallar", "falta_s": 40, "terminado": False}))
+        p.refresh_progress(reschedule=False)
+        pr = read_progress(trepo, tmp_sd)
+        check(pr["resta"] == 40 and pr["iterando"] is False and pr["active"] and p.p_rest.cget("text") == "faltan ~40 s", "progreso.json real: falta_s alimenta «faltan ~40 s»")
+        n_c, n0 = ncalls("cancel"), len(txt())
+        p.on_cancel()
+        t = txt()[n0:]
+        check("«mallar»" in t and "no se puede parar" in t and "faltan ~40 s" in t and ncalls("cancel") == n_c and not p.cli_active,
+              "«Parar iteraciones» en la malla: explica fase y tiempo restante y NO llama a cancel")
+        n_s = ncalls("server_stop")
+        p.stop_btn.invoke()
+        check(p.stop_btn.cget("text").startswith("¿Seguro?") and ncalls("server_stop") == n_s and not p.cli_active,
+              "la malla ofrece «Apagar solver» con confirmación dentro del panel")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "importar"}))
+        p.refresh_progress(reschedule=False)
+        p.on_stop()  # sin CLI en marcha: Detener también lo explica
+        check(txt().count("no se puede parar") == 2 and "«importar»" in txt() and "sin tiempo estimado" in txt(), "importación: explica sin tiempo estimado")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "iterar", "terminado": True}))
+        check(read_progress(trepo, tmp_sd)["active"] is False, "fase iterar con terminado=true: no hay iteración en curso")
+        p.refresh_progress(reschedule=False)
+        # 12. aviso por horas con la GUI abierta
+        os.environ.pop("COPILOTO_AVISO_HORAS", None)
+        hace = lambda h: (datetime.now() - timedelta(hours=h)).isoformat(timespec="seconds")
+        sj.write_text(json.dumps({**base, "started": hace(1.0)}))
+        p.refresh()
+        check(aviso_horas() == 2.0 and p.hrs.winfo_manager() == "", "1 h de solver con límite 2 h: sin aviso")
+        sj.write_text(json.dumps({**base, "started": hace(3.2)}))
+        p.refresh()
+        check(p.hrs.winfo_manager() == "pack" and "3,2 h" in p.hrs_lbl.cget("text") and "GUI abierta" in p.hrs_lbl.cget("text") and "cobra por hora" in p.hrs_lbl.cget("text"),
+              "3,2 h con GUI abierta: banda «Solver encendido hace 3,2 h… con la GUI abierta no se apaga solo»")
+        n_s = ncalls("server_stop")
+        p.hrs_btn.invoke()
+        check(p.hrs_btn.cget("text").startswith("¿Seguro?") and ncalls("server_stop") == n_s and not p.cli_active, "botón Apagar de la banda: confirma dentro del panel (sin diálogo)")
+        p.hrs_btn.invoke()
+        check(spin(lambda: ncalls("server_stop") == n_s + 1 and not p.cli_active, 10), "segundo clic: server_stop directo")
+        os.environ["COPILOTO_AVISO_HORAS"] = "0,5"
+        sj.write_text(json.dumps({**base, "started": hace(0.8)}))
+        p.refresh()
+        check(aviso_horas() == 0.5 and p.hrs.winfo_manager() == "pack", "COPILOTO_AVISO_HORAS=0,5 y 0,8 h: aviso")
+        os.environ["COPILOTO_AVISO_HORAS"] = "0"
+        p.refresh()
+        check(p.hrs.winfo_manager() == "", "COPILOTO_AVISO_HORAS=0 lo desactiva")
+        os.environ["COPILOTO_AVISO_HORAS"] = "mucho"
+        check(aviso_horas() == 2.0, "valor inválido: vuelve a 2 h")
+        os.environ.pop("COPILOTO_AVISO_HORAS")
+        sj.write_text(json.dumps({**base, "pid": 999999, "started": hace(9)}))
+        p.refresh()
+        check(p.hrs.winfo_manager() == "", "solver muerto: sin aviso de horas")
+        sj.write_text(json.dumps(base))
+        p.refresh()
+        # Detener (mata la CLI) con iteración en curso -> --cli cancel y resultado en el chat
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "iterar", "iteracion": 20, "iteraciones": 250, "terminado": False}))
+        p.refresh_progress(reschedule=False)
+        n_c, n0 = ncalls("cancel"), len(txt())
+        p.stop_delay_ms = 10
+        p.on_send("sigue")
+        check(spin(lambda: p.runner.busy, 5), "CLI en marcha para probar Detener")
+        p.on_stop()
+        check(spin(lambda: "✓ Parar iteraciones: paró en la iteración" in txt()[n0:], 10) and ncalls("cancel") == n_c + 1 and "Había iteraciones en curso" in txt()[n0:],
+              "Detener con iterar en curso: llama a --cli cancel y muestra el resultado")
+        spin(lambda: not p.runner.busy and not p.cli_active, 10)
+        check("Hay iteraciones en marcha" not in txt()[n0:], "tras el cancel automático no ofrece otro «Parar iteraciones»")
+        # cancel que no para (macro huérfana): avisa del solver cobrando y ofrece apagar
+        os.environ["FAKE_CANCEL_NO"] = "1"
+        n_c, n0 = ncalls("cancel"), len(txt())
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "iterar", "iteracion": 21, "iteraciones": 250}))
+        p.refresh_progress(reschedule=False)
+        p.on_send("otra vez")
+        spin(lambda: p.runner.busy, 5)
+        p.on_stop()
+        check(spin(lambda: "puede seguir iterando" in txt()[n0:] and not p.cli_active, 10) and ncalls("cancel") == n_c + 1,
+              "cancel sin efecto: avisa que la macro puede seguir iterando y cobrando")
+        os.environ.pop("FAKE_CANCEL_NO")
+        spin(lambda: not p.runner.busy, 10)
+        # Detener sin iteración en curso (malla / terminado): no llama a cancel
+        for fase in ({"fase": "mallar", "falta_s": 30}, {"fase": "terminado", "terminado": True}):
+            pj.write_text(json.dumps({"caso": "BombaX", **fase}))
+            p.refresh_progress(reschedule=False)
+            n_c = ncalls("cancel")
+            p.on_send("x")
+            spin(lambda: p.runner.busy, 5)
+            p.on_stop()
+            spin(lambda: not p.runner.busy, 10)
+            time.sleep(0.3)
+            root.update()
+            check(ncalls("cancel") == n_c, f"Detener con fase «{fase['fase']}»: no llama a cancel")
+        pj.write_text(json.dumps({"caso": "BombaX", "fase": "terminado", "terminado": True}))
+        p.refresh_progress(reschedule=False)
+        # claves fuera de pantalla
+        p.say("Arranque: mcp -podkey ABC123SECRETO -np 4", "sys")
+        p.say("licencia: XYZ987 y password=hunter2", "sys")
+        t = txt()
+        check("ABC123SECRETO" not in t and "XYZ987" not in t and "hunter2" not in t and "-podkey ***" in t,
+              "el panel redacta -podkey y claves=valor en lo que muestra")
+        check("***" in redact("API_KEY: sk-abc") and redact("H 16,7 m, eta 88 %") == "H 16,7 m, eta 88 %", "redact no toca texto normal")
+        sj.write_text(json.dumps(base))
+        p.refresh()
+        p.hist.config(state="normal")  # los checks siguientes buscan frases que aquí ya salieron
+        p.hist.delete("1.0", "end")
+        p.hist.config(state="disabled")
+
     t0 = time.time()
     tmp = Path(tempfile.mkdtemp(prefix="panel-selftest-"))
     ESTADO = tmp / ".estado.json"
@@ -1374,11 +1607,12 @@ def selftest():
         "a = sys.argv; i = a.index('--cli'); tool = a[i + 1]; args = json.loads(a[i + 2]) if len(a) > i + 2 else {}\n"
         "open(os.environ['FAKE_CLI_LOG'], 'a').write(tool + ' ' + json.dumps(args) + '\\n')\n"
         "if tool == 'server_stop':\n"
-        "    time.sleep(0.4); p = os.environ.get('FAKE_STOP_REMOVE')\n"
+        "    time.sleep(float(os.environ.get('FAKE_STOP_SLEEP', '0.4'))); p = os.environ.get('FAKE_STOP_REMOVE')\n"
         "    if p and os.path.exists(p): os.unlink(p)\n"
         "    print(json.dumps({'ok': True, 'msg': 'solver apagado (falso)'}))\n"
         "elif tool == 'gui_attach': print(json.dumps({'ok': True, 'msg': 'GUI conectada (falsa)'}))\n"
-        "elif tool == 'cancel': print(json.dumps({'ok': True, 'cancelado': True}))\n"
+        "elif tool == 'cancel' and os.environ.get('FAKE_CANCEL_NO'): print(json.dumps({'ok': True, 'cancelled': False, 'reason': 'no hay iteración en curso'}))\n"
+        "elif tool == 'cancel': print(json.dumps({'ok': True, 'cancelled': True, 'cancelado': True}))\n"
         "elif tool == 'server_status': print(json.dumps({'ok': True, 'solver': False, 'caso': None}))\n"
         "else: print(json.dumps({'error': 'herramienta desconocida'})); sys.exit(2)\n", encoding="utf-8")
     os.environ["PANEL_MCP_SERVER"] = str(fake_mcp)
@@ -1565,6 +1799,7 @@ def selftest():
         p.refresh()
         check(p.warn.winfo_manager() == "" and "GUI conectada" in p.chip["gui"].cget("text"), "ventana: sin aviso la banda se oculta; GUI conectada")
         run_new_checks(p, root, spin, trepo, tmp, tmp_sd, sj)
+        run_r5_checks(p, root, spin, trepo, tmp_sd, sj)
         # Detener: avisa si el solver sigue vivo con una macro en curso
         check(stop_warning(trepo, tmp_sd) is None, "tras Detener sin macro en curso: sin aviso")
         lock = tmp_sd / ".inject.lock"

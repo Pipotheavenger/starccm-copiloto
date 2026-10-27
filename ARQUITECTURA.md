@@ -30,9 +30,8 @@ panel/chat_panel.py (tkinter, siempre encima) │                          │ c
 
 ### 1. `mcp_server.py` (un archivo, FastMCP; base: `conocimiento/mcp_server_anterior.py`)
 
-Herramientas (15): `server_start`, `server_stop`, `server_status`, `gui_attach`, `gui_status`, `inspect`, `run_java`,
-`run_steps`, `iterate`, `pump_case`, `export_scene`, `save`, `recipe_search`, `recipe_save`, `docs_search`. Heredadas: `server_start`, `server_stop`, `server_status`, `run_java`, `inspect`, `iterate`,
-`export_scene`, `save`, `recipe_search`, `recipe_save`, `docs_search`. Cambios obligatorios:
+Herramientas (16): `server_start`, `server_stop`, `server_status`, `gui_attach`, `gui_status`, `cancel`, `inspect`, `run_java`,
+`run_steps`, `iterate`, `pump_case`, `export_scene`, `save`, `recipe_search`, `recipe_save`, `docs_search`. Cambios obligatorios:
 
 1. **Turnos entre procesos**: candado de archivo `.inject.lock` (pid, herramienta, inicio). Toda inyección lo toma; si
    otro proceso vivo lo tiene, espera hasta `timeout` y si no, devuelve `{"ok": false, "busy": "…"}`. Candado
@@ -53,7 +52,12 @@ Herramientas (15): `server_start`, `server_stop`, `server_status`, `gui_attach`,
    STEP de CFturbo + `.cfturbo-ccm` (rpm, caudal, eje, nombres), regiones, interfaces, malla rápida o normal, física,
    MRF, fronteras (presión total entrada + caudal en salida), reportes (H, M, η, Euler correcto). Referencia medida:
    BombaRapida de importar a resultados en 3 min 45 s (`conocimiento/casos/BombaRapida`).
-7. Seguridad: la clave PoD solo en `.env`; `_redact` en todo log/salida. Trabajar sobre copias en `sims/`.
+7. **Cancelar** (`cancel`): crea el archivo `ABORT` («Stop File», en `sims/`) y `cancel.json`; `iterate` y la fase iterar de
+   `pump_case` lo ven y paran. **Hecho real (2026-10-26): en 2410 el Stop File no corta un `step()` en curso**; la macro para al
+   final del bloque (≤ 50 iteraciones). Nunca se manda `stop()` desde otro cliente ni se mata el residente a mitad de `step()`:
+   tumba el servidor. Plazo `COPILOTO_CANCEL_GRACE_S` (60 s): si la macro no acabó sola, quien itera la abandona y mata el residente (limitación conocida: con mallas grandes un bloque de 50 it puede pasar de 60 s y eso sí tumba el servidor). No toma el turno
+   (es de quien itera). Fuera de la fase iterar no hace nada (malla e importar no se interrumpen: se espera o `server_stop`).
+8. Seguridad: la clave PoD solo en `.env`; `_redact` en todo log/salida. Trabajar sobre copias en `sims/`.
 
 ### 2. `panel/chat_panel.py` (tkinter, solo biblioteca estándar)
 
@@ -103,16 +107,35 @@ retirado y de la UI web antigua quedan solo en `conocimiento/CLAUDE_agente_anter
   termina cuando el servidor lleva `COPILOTO_VIG_GONE_S` (3 s) muerto. Sin GUI guarda y apaga a los `STARCCM_IDLE_MIN` (30; PoD
   cobra por hora); con GUI solo avisa. `STARCCM_VIGILANTE=0` lo desactiva. Residuales: si el vigilante muere, nadie avisa (el
   panel debe mirar `idle_checked`); el estado de la GUI llega con hasta 30 s de retraso.
-- **Ronda 4 (en curso, A4/B4; no documentado como hecho hasta verlo en el código)**: `mcp_server.py --cli` (tools sin LLM, p. ej.
-  apagar el solver directo), `progreso.json` con iteración/H/M en vivo durante `iterar`, cancelación con un archivo `ABORT`
-  que el bucle de iterar revisa cada bloque de 50, y en el panel una tarjeta de progreso y acciones directas (apagar, abrir
-  GUI) que no gastan un turno del modelo.
+- **Ronda 4 (terminada, verificada con solver real el 2026-10-26)**:
+  - `mcp_server.py --cli <tool> [json]`: acción directa sin modelo (`gui_attach`, `gui_status`, `server_stop`, `server_status`,
+    `cancel`). JSON por stdout; espera el turno `COPILOTO_CLI_LOCK_WAIT_S` (3 s); salida 0/1/2. No importa `mcp` (arranca rápido).
+    El panel apaga el solver por aquí, sin gastar un turno del modelo.
+  - `progreso.json` (en `COPILOTO_WORK`): lo escribe un hilo del proceso dueño del turno cada ~1 s durante `iterate` y
+    `pump_case`, leyendo el `.out` de la macro: fase, iteración, H, M, continuidad, transcurrido, falta y `pid` del dueño. Al terminar
+    deja `fase: terminado` con el resultado. El panel lo lee en una tarjeta de progreso.
+  - `cancel` con `ABORT`: ver el punto 7 de las herramientas. Medido: `cancel` devuelve en 14 s con el servidor vivo y reutilizable.
+  - Panel: tarjeta de progreso, botón «Parar iteraciones» y acciones directas (apagar, abrir GUI) vía `--cli`.
 - **Panel**: modo Rápido (sonnet, esfuerzo bajo) / Preciso (opus), cola de mensajes mientras el agente trabaja, cronómetro por
   herramienta, línea de tiempos por turno, Abrir GUI, Detener (la CLI y su árbol, nunca el solver, el residente, el vigilante ni
   la GUI: `protected_pids`), Apagar con confirmación. Al cerrar con el solver vivo pregunta «¿Apagar el solver antes de salir?».
   Prohíbe a la CLI leer `.env` (`--disallowedTools` Read/Grep/Glob) y crea `.mcp.json` si falta (`ensure_mcp_config`).
 
 ## Medido
+
+Ronda 4 (la vigente; `casos/BombaRapida_e2e_184823/e2e.json`, `tests/real_e2e.py`, sin otra carga, 2026-10-26):
+
+| fase | segundos |
+|---|---|
+| `server_start` | 36 |
+| `pump_case` (malla 41, iterar 88, post 2, resto ~8) | 147 |
+| `server_stop` | 4 |
+| **total de punta a punta** | **187** |
+
+Resultados: H 16,74 m, eta 88,6 %, H_Euler 18,75 m, `EULER_OK`, balance de masa 1,8e-4 %, 3 PNG. Cancelación (`e2e 191110`,
+`real_e2e.py --cancel`, `cancel` en la it. 103): `cancel` devuelve en 14 s con el servidor vivo, `pump_case` vuelve `cancelled` a los 21 s
+(la macro paró en la it. 150, fin de bloque) y un `iterate` posterior de 20 it funciona. Las dos corridas siguientes son anteriores
+a esa medida y se conservan como historia.
 
 Prueba real de punta a punta (`tests/real_e2e.py`, BombaRapida_v1 de CFturbo, modo rápido, `iterar` + `post`, 4 procesos,
 2026-10-26; `casos/BombaRapida_e2e_174159/e2e.json`):
@@ -154,9 +177,9 @@ Mallado: CELLS 175 316. Parada `stable` en 250 iteraciones (variación máx. 0,0
 (parte del rango cae en 5–30: mirar con cuidado η y par). Balance de masa 1,8e-4 %; 6 líneas `PARED_CONEXION` «no medible»,
 0 `AVISO` de interfaz. H_Euler 18,75 m, η_Euler 0,892. **Los tiempos están contaminados**: corrieron tres selftests en paralelo
 (CPU de 4 procesos), así que el total de `pump_case` (192 s) y de la corrida (239 s) no son comparables con los 143 s / 194 s de la
-primera; repetir `tests/real_e2e.py` sin nada más corriendo. Esa corrida mostró además el aviso Euler espurio («radio medio…
+primera; ya repetido sin carga: 187 s (arriba). Esa corrida mostró además el aviso Euler espurio («radio medio…
 0.0», `EULER_VALIDAR sin solución`) y la ausencia de `EULER_OK`: corregido después en `pipelines/bomba.py` (la validación va tras
-iterar y `euler_check_body` ya no sale vacío); pendiente de verlo con solver.
+iterar y `euler_check_body` ya no sale vacío); verificado con solver el 2026-10-26: `EULER_OK`.
 
 ## Reglas de diseño
 

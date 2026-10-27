@@ -43,7 +43,8 @@ Env (se leen también de .env en la raíz del repo y de ~/.starccm-agent.env, fo
                    el cliente batch de siempre.
   COPILOTO_WORK    carpeta de trabajo pesada FUERA de OneDrive (default %LOCALAPPDATA%\\starccm-copiloto): sims/,
                    macros/, residente/ (inbox, out, latido, log del residente), tiempos.csv y agent.log.
-  COPILOTO_CANCEL_GRACE_S  s que iterate/pump_case esperan, tras un cancel, a que la macro termine sola antes de abandonarla (8).
+  COPILOTO_CANCEL_GRACE_S  s mínimos SIN avance de la macro, tras un cancel, para darla por colgada y abandonarla (120; nunca menos de
+                   3 bloques de 50 it según ritmo_it_s). Mientras avance se espera el fin del bloque: matar el residente a mitad de step() tumba el servidor.
 
 Carpetas: en COPILOTO_WORK sims/ (.sim de trabajo, nunca el original del usuario), macros/ (cada macro inyectada,
 con su salida .out), residente/, logs del solver (sims/*.server.log), tiempos.csv. En la raíz del repo: casos/<caso>/
@@ -247,10 +248,39 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _pid_is_ours(pid: int) -> bool:
-    """Evita matar un proceso ajeno si Windows reasignó el PID guardado (el PID es el del .bat/starccm+)."""
+def _proc_ctime(pid: int) -> float | None:
+    """Hora de creación (epoch s) del proceso `pid`, o None si no existe o no se puede leer. Windows: GetProcessTimes por ctypes
+    (microsegundos, sin lanzar procesos); otros SO: None (ahí el PID reasignado no se comprueba por hora)."""
+    if os.name != "nt" or not pid:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+        if not k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)):
+            return None
+        return ((c.dwHighDateTime << 32 | c.dwLowDateTime) - 116444736000000000) / 1e7
+    finally:
+        k32.CloseHandle(h)
+
+
+def _pid_is_ours(pid: int, t_create: float | None = None) -> bool:
+    """Evita matar un proceso ajeno si Windows reasignó el PID guardado (el PID es el del .bat/starccm+). Con `t_create` (hora de
+    creación guardada al lanzarlo en .server.json) manda ella: otra hora = otro proceso. Sin ella, se mira el nombre del exe."""
     if os.name != "nt":
         return True
+    if t_create:
+        now = _proc_ctime(pid)
+        if now is not None:
+            return abs(now - float(t_create)) < 2.0
     out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=30).stdout
     m = re.match(r'"([^"]+)"', out.strip())
     return bool(m) and re.search(r"cmd|star|java|python|mpi|ccm|hydra|smpd", m.group(1), re.I) is not None
@@ -324,7 +354,7 @@ def _spawn_detached(cmd: list[str], log: Path | str | None = None, cwd: Path | s
 def _write_panel_estado() -> None:
     """panel_estado.json (en el repo) dice al panel dónde están .server.json e .inject.lock. Solo se reescribe si cambia."""
     d = {"estado_dir": str(estado_dir()), "state_file": str(STATE_FILE), "lock_file": str(LOCK_FILE),
-         "work": str(WORK), "residente_dir": str(RES_DIR)}
+         "work": str(WORK), "residente_dir": str(RES_DIR), "vigilante_file": str(_vig_file(PORT))}  # latido (t) del vigilante
     try:
         if json.loads(PANEL_ESTADO.read_text(encoding="utf-8")) == d:
             return
@@ -529,6 +559,8 @@ def macro_running() -> bool:
         if age > STALE_MACRO_H * 3600 or _macro_finished(o):
             continue
         pf = o.with_suffix(".pid")
+        if pf.is_file() and (RES_DIR / "out" / (o.stem + ".java.res")).is_file():
+            continue  # la macro del residente ya terminó (el dueño pudo morir sin cerrar el .out: cancel con dueño muerto)
         if pf.is_file():
             try:
                 if _pid_alive(int(pf.read_text().strip())):
@@ -591,6 +623,7 @@ def _idle_stop() -> str:
     st = _state()
     if not (st.get("pid") and alive(st)):
         return "sin_servidor"
+    _cancel_stale_cleanup()
     idle = idle_disk_seconds()
     mins = int(idle // 60)
     over = idle > IDLE_MIN * 60
@@ -676,16 +709,26 @@ def _vigilante_main(port: int) -> int:
     if _vigilante_pid(port):
         return 0  # ya hay uno
     f = _vig_file(port)
+    parar = threading.Event()
 
     def beat() -> None:
         f.parent.mkdir(parents=True, exist_ok=True)
-        tmp = f.with_suffix(".tmp")
+        tmp = f.with_suffix(f".{threading.get_ident()}.tmp")  # un tmp por hilo: el latido y el chequeo escriben a la vez
         tmp.write_text(json.dumps({"pid": me, "port": port, "t": time.time(), "every_s": VIGILANTE_S}), encoding="utf-8")
         os.replace(tmp, f)
 
+    def latido() -> None:  # hilo aparte: un _idle_stop → server_stop largo (guardar un .sim grande) no puede hacerlo pasar por muerto
+        while not parar.wait(min(5.0, VIGILANTE_S)):
+            try:
+                beat()
+            except OSError:
+                pass
+
     beat()
+    threading.Thread(target=latido, daemon=True).start()
     _log(f"vigilante {me} vigila el puerto {port} (cada {VIGILANTE_S:g} s, apaga a los {IDLE_MIN:g} min sin GUI)")
     last, gone_since = 0.0, None
+    hold = float(os.environ.get("COPILOTO_TEST_VIG_BLOCK_S") or 0)  # gancho de pruebas: el primer chequeo tarda tanto (un server_stop largo)
     try:
         while True:
             st = _state()
@@ -700,15 +743,30 @@ def _vigilante_main(port: int) -> int:
                 last = time.time()
                 try:
                     beat()
+                    if hold:
+                        time.sleep(hold)
+                        hold = 0.0
                     _idle_stop()
                 except Exception as e:  # noqa: BLE001
                     _log(f"vigilante: {type(e).__name__}: {e}")
             time.sleep(min(1.0, VIGILANTE_S))
     finally:
+        parar.set()
+        time.sleep(0.05)
         if _vig_info(port).get("pid") == me:
             f.unlink(missing_ok=True)
     _log(f"vigilante {me} termina: el servidor del puerto {port} ya no está")
     return 0
+
+
+def vigilante_relanzar() -> dict:
+    """Relanza el vigilante del servidor vivo si está muerto (el panel lo llama por `--cli vigilante_relanzar`). No hace nada si ya
+    hay uno vivo o no hay servidor. Devuelve vigilante (pid), nuevo y vigilante_vivo."""
+    st = _state()
+    if not (st.get("pid") and alive(st)):
+        return {"ok": True, "vigilante": None, "vigilante_vivo": False, "reason": "no hay servidor vivo"}
+    r = _vigilante_ensure(int(st["port"]))
+    return {"ok": bool(r.get("vigilante")), **r, "vigilante_vivo": bool(_vigilante_pid(int(st["port"])) or r.get("nuevo"))}
 
 
 def start_watchdog() -> None:
@@ -1059,6 +1117,11 @@ def _inject_locked(body: str, imports: str, timeout: float, expect_death: bool) 
     t0 = time.time()
     if not _cancel_requested():
         _clear_abort()  # un ABORT que quedó de otra corrida pararía esta al instante
+        if getattr(_ctx, "t_start", None) is not None:  # (y su cancel.json: la macro de iterar también lo mira)
+            try:
+                cancel_file().unlink(missing_ok=True)
+            except OSError:
+                pass
     _prog.watch(src.with_suffix(".out"))
     why = None
     if RES_ON:
@@ -1152,6 +1215,15 @@ def _res_info() -> dict:
         return d if isinstance(d, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _cancel_stall_s() -> float:
+    """s sin avance de la macro, tras un cancel, antes de abandonarla: max(CANCEL_GRACE_S, CANCEL_BLOCK_X × tiempo de un bloque de 50 it)."""
+    try:
+        rate = _prog._rate()
+    except Exception:  # noqa: BLE001
+        rate = None
+    return max(CANCEL_GRACE_S, CANCEL_BLOCK_X * 50.0 / rate if rate and rate > 0 else 0.0)
 
 
 def _hb_age() -> float:
@@ -1321,7 +1393,7 @@ def _inject_resident(st: dict, src: Path, tag: str, t0: float, timeout: float,
     tmpf.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     os.replace(tmpf, RES_DIR / "inbox" / name)  # el residente solo ve *.java: nunca una macro a medias
     acc, res, killed, died, last_chk, last_pid = "", None, False, False, 0.0, 0.0
-    t_cancel, cancelled = None, False
+    t_cancel, cancelled, last_grow, stall = None, False, time.time(), 0.0
     deadline = time.time() + timeout  # tras comprobar el residente: lanzarlo no gasta el tiempo de la macro
     try:
         while True:
@@ -1344,6 +1416,8 @@ def _inject_resident(st: dict, src: Path, tag: str, t0: float, timeout: float,
                 last_chk = now
                 pos, new = _copy_live(log, pos, out_file)
                 acc += new
+                if new:
+                    last_grow = now  # la macro avanza (ITER por bloque): no está colgada
                 _touch_lock()
                 if expect_death and not alive(st):  # (cada 0,4 s)
                     break  # sim.kill(): el servidor se fue, no habrá resultado
@@ -1351,12 +1425,14 @@ def _inject_resident(st: dict, src: Path, tag: str, t0: float, timeout: float,
                     _prog.mark_cancel()
                     if t_cancel is None:
                         t_cancel = now
-                    elif now - t_cancel > CANCEL_GRACE_S and getattr(_ctx, "cancel_kill", True):
+                    elif getattr(_ctx, "cancel_kill", True) and now - max(t_cancel, last_grow) > _cancel_stall_s():
+                        # ponytail: solo con la macro sin sacar nada > max(CANCEL_GRACE_S, 3 bloques); matar a mitad de step() tumba el servidor
+                        stall = now - max(t_cancel, last_grow)
                         killed = cancelled = True
                         break
             time.sleep(RES_POLL)
         if killed or died:
-            reason = ("cancelado por el usuario: iteración detenida (ABORT) y macro abandonada" if cancelled else
+            reason = (f"cancelado por el usuario: macro COLGADA (sin avance {stall:.1f} s tras el ABORT) y abandonada; se perdió el bloque en curso" if cancelled else
                       f"timeout {timeout}s" if killed else "el residente murió o dejó de dar latido") + \
                      "; residente matado (el servidor sigue vivo) y relanzado"
             _res_kill(reason)
@@ -1397,6 +1473,7 @@ def _inject_resident(st: dict, src: Path, tag: str, t0: float, timeout: float,
         r["resident_died"] = True
     if cancelled:
         r["cancelled"] = True
+        r["abandoned"] = True  # solo si la macro quedó colgada tras el cancel (nunca por tardar un bloque)
     if err and not killed and not died and _between(acc, tag) is None and not r.get("exception"):
         # error de compilación (o de ejecución antes de AGENT_BEGIN): lo devuelve el propio residente
         r["exception"] = "el cliente residente no pudo compilar/ejecutar la macro: " + err.strip().splitlines()[0][:300]
@@ -1494,7 +1571,8 @@ def _tail_log(st: dict, n: int = 200_000) -> str:
 # tabla de monitores del solver (Iteration, Continuity, …, M, H). El panel solo lee ese archivo.
 PROG_TOOLS = ("iterate", "pump_case")
 PROG_EVERY_S = 1.0
-CANCEL_GRACE_S = float(os.environ.get("COPILOTO_CANCEL_GRACE_S", "60"))  # tras cancel: s que la macro tiene para acabar sola. Último recurso: matar el residente a mitad de step() TUMBÓ el servidor real (2026-10-26); antes llegan ABORT y stop()
+CANCEL_GRACE_S = float(os.environ.get("COPILOTO_CANCEL_GRACE_S", "120"))  # tras cancel: mínimo de s SIN avance (salida de la macro) para darla por colgada. Matar el residente a mitad de step() TUMBA el servidor (2026-10-26): por defecto se espera el fin del bloque
+CANCEL_BLOCK_X = 3.0  # ...y nunca menos de CANCEL_BLOCK_X × lo que tarda un bloque de 50 it según ritmo_it_s (0 lo desactiva: selftest)
 FASES = ["importar", "regiones", "fisica", "mrf", "fronteras", "reportes", "malla", "euler", "iterar", "post"]  # orden de los PIPE
 _FASE_NOMBRE = {"malla": "mallar"}
 _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
@@ -1916,6 +1994,18 @@ def _cancel_cleanup() -> None:
         pass
 
 
+def _cancel_stale_cleanup() -> bool:
+    """Red de seguridad (la corre el vigilante): un cancel.json/ABORT de más de 15 s sin macro en marcha ni dueño del turno es un resto
+    (cancel con dueño muerto cuyo wait_s venció); si se queda, pararía al instante la próxima macro de iterar."""
+    d = _read_json(cancel_file())
+    if (d or abort_file().exists()) and not macro_running() and lock_holder() is None:
+        if time.time() - float((d or {}).get("t") or 0) > 15 and (not d or time.time() - cancel_file().stat().st_mtime > 15):
+            _cancel_cleanup()
+            _log("vigilante: borro un ABORT/cancel.json que quedó de un cancel")
+            return True
+    return False
+
+
 def _abort_enable_java() -> str:
     """Java que deja activo el criterio «Stop File» con la ruta absoluta de abort_file() (el nodo existe solo con un modelo de
     tiempo/estacionario). Mudo y a prueba de fallos: si no existe, vale el ABORT por defecto del directorio de trabajo."""
@@ -2079,7 +2169,7 @@ def server_start(sim_path: str = "", name: str = "") -> dict:
             vig = _vigilante_ensure(int(st["port"])).get("vigilante")  # un solver vivo de antes también queda vigilado
             return {"reused": True, **st, "vigilante": vig}
         if st.get("pid"):
-            if _pid_alive(st["pid"]) and _pid_is_ours(st["pid"]):
+            if _pid_alive(st["pid"]) and _pid_is_ours(st["pid"], st.get("t_create")):
                 # proceso vivo con el puerto cerrado: otro proceso (panel o chat) lo está arrancando, o está colgado
                 try:
                     age = (datetime.now() - datetime.fromisoformat(st["started"])).total_seconds()
@@ -2117,7 +2207,7 @@ def server_start(sim_path: str = "", name: str = "") -> dict:
         t0 = time.time()
         sp = _spawn_detached(cmd, log=log, cwd=SIMS)  # fuera del árbol de la CLI: «Detener» del panel no lo alcanza
         spid = sp["pid"]
-        st = {"pid": spid, "port": PORT, "host": "localhost", "sim": str(sim) if sim else None,
+        st = {"pid": spid, "t_create": _proc_ctime(spid), "port": PORT, "host": "localhost", "sim": str(sim) if sim else None,
               "log": str(log), "started": datetime.now().isoformat(timespec="seconds"), "np": NP,
               "cmd": _redact(" ".join(cmd))}
         _write_state(st)
@@ -2210,7 +2300,7 @@ def server_stop(save: bool = True) -> dict:
             result["residente"] = "detenido"
         tm["residente"] = round(time.time() - t_r, 2)
         if _pid_alive(st["pid"]):
-            if _pid_is_ours(st["pid"]):
+            if _pid_is_ours(st["pid"], st.get("t_create")):
                 _kill_tree(st["pid"])
                 result["forced"] = True
             else:  # PID reasignado a otro proceso: no se toca, solo se limpia el estado
@@ -2229,6 +2319,12 @@ def server_status() -> dict:
     st = _state()
     a = alive(st)
     out = {"alive": a, "idle_min": round(idle_seconds() / 60, 1), "turno": lock_holder(), **st}
+    if a and VIGILANTE_ON:  # vigilante_muerto: el panel puede relanzarlo con `--cli vigilante_relanzar`
+        vp = _vigilante_pid(int(st.get("port") or PORT))
+        out["vigilante_vivo"] = bool(vp)
+        out["vigilante_muerto"] = not vp
+        if vp:
+            out["vigilante"] = vp
     if a:
         g = _gui()
         out["gui"] = g["connected"]
@@ -2274,7 +2370,7 @@ def cancel(wait_s: int = 45) -> dict:
     """Detiene LIMPIO las iteraciones en curso (iterate o la fase iterar de pump_case): crea el archivo ABORT que vigila el
     criterio «Stop File» de STAR-CCM+ (sims/ABORT) y cancel.json; la tool que itera lo ve, deja de pedir bloques, borra ABORT
     y devuelve stopped="cancelled" con la solución hasta la última iteración. En 2410 el Stop File NO corta un step() en curso: la
-    parada llega al final del bloque (≤ 50 iteraciones). Nunca manda stop() desde otro cliente (tumba el servidor). NO toma el turno (el turno es de quien itera). Sin iteración en curso no crea ABORT
+    parada llega al final del bloque (≤ 50 iteraciones). Nunca manda stop() desde otro cliente (tumba el servidor) y no mata el residente mientras la macro avance (solo si lleva > max(120 s, 3 bloques) sin salida: macro_abandonada). Dueño muerto (Detener) con la macro aún iterando: cancela igual (duenio_muerto), espera el fin de la macro y limpia ABORT/cancel.json él. NO toma el turno (el turno es de quien itera). Sin iteración en curso no crea ABORT
     (pararía la próxima corrida) y no toca nada: {"iteracion_en_curso": false}. Devuelve cancelled (¿paró?), iteracion_en_curso,
     iteracion, metodo y turno. wait_s: máximo que espera a que pare."""
     t0 = time.time()
@@ -2283,33 +2379,52 @@ def cancel(wait_s: int = 45) -> dict:
         return {"ok": True, "cancelled": False, "iteracion_en_curso": False, "reason": "no hay servidor vivo"}
     p = read_progreso()
     vivo = _progreso_vivo(p)
+    owner = p.get("pid")
+    # dueño muerto (el panel mató la CLI con «Detener») pero la macro sigue iterando en el residente: nadie actualiza progreso.json
+    # (t viejo) y nadie borrará ABORT/cancel.json; se cancela igual y esta llamada espera el fin de la macro y limpia ella.
+    huerfana = (not vivo and bool(p) and p.get("fase") == "iterar" and not p.get("terminado") and bool(owner)
+                and not _pid_alive(int(owner)) and macro_running())
     holder = lock_holder()
-    if not vivo or p.get("fase") != "iterar":
+    if not (vivo or huerfana) or p.get("fase") != "iterar":
         fase = p.get("fase") if vivo else None
         return {"ok": True, "cancelled": False, "iteracion_en_curso": False, "fase": fase, "turno": holder,
                 "reason": "no hay iteración en curso" + (f" (la macro está en la fase «{fase}»: no se interrumpe; usa server_stop)" if fase else "")}
-    owner, it_at = p.get("pid"), p.get("iteracion")
-    _write_json_atomic(cancel_file(), {"t": time.time(), "by": os.getpid(), "kill": True, "iteracion": it_at, "tool": p.get("tool")})
+    it_at = p.get("iteracion")
+    _write_json_atomic(cancel_file(), {"t": time.time(), "by": os.getpid(), "kill": not huerfana, "iteracion": it_at, "tool": p.get("tool"),
+                                       **({"huerfana": True} if huerfana else {})})
     try:
         abort_file().parent.mkdir(parents=True, exist_ok=True)
         abort_file().write_text("cancelado " + datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
     except OSError as e:
         _cancel_cleanup()
         return {"ok": False, "cancelled": False, "iteracion_en_curso": True, "error": f"no pude crear {abort_file()}: {e}"}
-    _log(f"cancel: ABORT creado ({abort_file()}); iteración {it_at}, dueño pid {owner}")
+    _log(f"cancel: ABORT creado ({abort_file()}); iteración {it_at}, dueño pid {owner}{' MUERTO (macro huérfana)' if huerfana else ''}")
+    if huerfana:  # que el panel vea que se está cancelando aunque nadie más escriba progreso.json
+        _write_json_atomic(progreso_file(), {**p, "cancelando": True, "t": round(time.time(), 2), "actualizado": _iso(time.time())})
     stopped, method = False, "ABORT"
     end = time.time() + max(1.0, float(wait_s))
     while time.time() < end:
         time.sleep(0.2)
+        if huerfana:
+            if not macro_running():
+                stopped = True
+                break
+            continue
         pp = read_progreso()
         if lock_holder() is None or pp.get("terminado") or pp.get("pid") != owner:
             stopped = True
             break
-    if lock_holder() is None:  # nadie es dueño: ABORT y cancel.json se limpian aquí (si no, el dueño lo hace al terminar)
+    if huerfana and stopped:  # la macro paró al fin del bloque: el cierre (borrar ABORT/cancel.json, marcar terminado) lo hace quien cancela
+        _write_json_atomic(progreso_file(), {**read_progreso(), "terminado": True, "cancelando": False, "falta_s": 0.0, "fase": "terminado",
+                                             "resultado": {"cancelled": True, "stopped": "cancelled", "huerfana": True}, "t": round(time.time(), 2)})
+    if (huerfana and stopped) or (not huerfana and lock_holder() is None):  # nadie es dueño: ABORT y cancel.json se limpian aquí (si no, el dueño lo hace al terminar)
         _cancel_cleanup()
     return {"ok": True, "cancelled": stopped, "iteracion_en_curso": True, "iteracion": it_at, "metodo": method, "turno": lock_holder(),
             "segundos": round(time.time() - t0, 1), "abort_pendiente": abort_file().exists(),
-            **({} if stopped else {"reason": "ABORT enviado; la iteración aún no terminó (quien itera lo borra al acabar)"})}
+            **({"duenio_muerto": True} if huerfana else {}),
+            **({} if stopped else {"reason": "ABORT enviado; la iteración aún no terminó (la macro para al final del bloque, ≤ 50 it; "
+                                             + ("el dueño había muerto: vuelve a llamar a cancel o espera, el vigilante limpia ABORT al final)" if huerfana
+                                                else "quien itera lo borra al acabar)")})}
 
 
 def _jpath(p: str | os.PathLike) -> str:
@@ -2582,7 +2697,7 @@ for (Report rep : sim.getReportManager().getObjects()) {{
 }}
 """
     r = _inject(body, timeout=timeout_s, tool="iterate")
-    out = {"ok": r["ok"], "seconds": r["seconds"], "stdout": r["stdout"], **_err(r)}
+    out = {"ok": r["ok"], "seconds": r["seconds"], "stdout": r["stdout"], **_err(r), **({"abandoned": True} if r.get("abandoned") else {})}
     m = re.search(r"ITERATION (\d+)", r["stdout"])
     if m:
         out["iteration"] = int(m.group(1))
@@ -2685,7 +2800,8 @@ def iterate(n: int = 0, until: str = "stable", reports: list[str] = ["H", "M"], 
             if not last["ok"] or "iteration" not in last:
                 if _cancel_requested():  # la macro se abandonó por el cancel (no es un fallo)
                     return {"ok": True, "stopped": "cancelled", "cancelled": True, "iterations_run": done, "iteration": _prog.it,
-                            "blocks": blocks, "seconds": round(time.time() - t0, 1), "reports": {}}
+                            "blocks": blocks, "seconds": round(time.time() - t0, 1), "reports": {},
+                            **({"macro_abandonada": last.get("exception")} if last.get("abandoned") else {})}
                 return {"ok": False, "stopped": "error", "iterations_run": done, "blocks": blocks,
                         "stdout": last["stdout"][-1500:], **_err(last)}
             it = last["iteration"]
@@ -2811,7 +2927,10 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
     Va por el cliente residente en UNA macro. until="stable" (o "n"): tras la macro, si salió bien, itera hasta n con
     el criterio de iterate (bloques de `block`, reportes `reports`) en el mismo turno, sin crear un cliente por bloque.
     Devuelve `parsed` (RESULT, PIPE, BALANCE_MASA, AVISO, EULER, CELLS, MESH_SECONDS, ITER_STOP, YPLUS, PNG ya leídos de la
-    salida), la cola de stdout y `salida_completa` = casos/<caso>/salida_pump.txt con toda la salida."""
+    salida), la cola de stdout y `salida_completa` = casos/<caso>/salida_pump.txt con toda la salida.
+    Cancelado (cancel()): `ok` False y `cancelled` True, `stopped` "cancelled", `resultados` = los RESULT de la solución PARCIAL (H, M, eta,
+    H_Euler… hasta la última iteración; también en `parsed`) y sin post ni iterate; quien lea `ok` no cree que acabó. Si la macro quedó
+    colgada y hubo que abandonarla viene `macro_abandonada` y no hay resultados."""
     if mode not in ("rapida", "normal"):
         return {"ok": False, "error": f"mode debe ser 'rapida' o 'normal', no '{mode}'"}
     cad = Path(cad_dir)
@@ -2860,7 +2979,9 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
                "macro": r["macro"], "parsed": _parse_pump(r["stdout"]), "salida_completa": str(salida) if salida else None,
                "stdout": r["stdout"][-3000:], **_err(r)}
         if r.get("cancelled") or "ITER_STOP\tcancelled" in r["stdout"]:  # la macro vio el ABORT y paró sola: sin post, servidor intacto
-            out["cancelled"] = True
+            out.update(ok=False, cancelled=True, stopped="cancelled", resultados=dict(out["parsed"].get("RESULT") or {}))
+            if r.get("abandoned"):
+                out["macro_abandonada"] = r.get("exception")
             if "ITER_STOP\tcancelled" in r["stdout"]:
                 _cancel_cleanup()
         if until in ("stable", "n") and out["ok"] and not out.get("cancelled") and not _cancel_requested():
@@ -2868,6 +2989,10 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
             out["iterate"] = {k: it.get(k) for k in ("ok", "stopped", "iterations_run", "iteration", "blocks", "seconds",
                                                     "reports", "variation_pct", "error", "exception", "busy") if k in it}
             out["ok"] = bool(it.get("ok"))
+            if it.get("cancelled"):  # cancelado en el iterate encadenado: mismo contrato que arriba, con los reportes parciales
+                out.update(ok=False, cancelled=True, stopped="cancelled", resultados=dict(it.get("reports") or {}))
+                if it.get("macro_abandonada"):
+                    out["macro_abandonada"] = it["macro_abandonada"]
         elif until and until not in ("stable", "n"):
             out["warnings"] = [f"until={until!r} no es «stable» ni «n»: no se iteró"]
         return out
@@ -3104,7 +3229,12 @@ def macro_body(case_dir, cad_dir, ccm, mode, params):
     fail = 'sim.println("AGENT_FAKE_FAIL");' if params.get("fallar") else ""
     return ('sim.println("STEP_BEGIN 0");\\nsim.println("importado %s %s");\\nsim.println("STEP_END 0");\\n'
             'sim.println("STEP_BEGIN 1");\\n%s\\nsim.println("regiones listas");\\nsim.println("STEP_END 1");'
-            % (ccm["rpm"], mode, fail)) + EXTRA
+            % (ccm["rpm"], mode, fail)) + (CANCELADO if params.get("cancelado") else EXTRA)
+CANCELADO = r"""
+sim.println("RESULT\\tH\\t15.9");
+sim.println("RESULT\\tM\\t8.3");
+sim.println("ITER_STOP\\tcancelled\\titeraciones 50\\titeracion 150\\tvariacion_max_pct 1.2\\tmeseta false\\t3.0 s");
+"""
 '''
 
 
@@ -3112,7 +3242,7 @@ def _selftest() -> int:
     global EXE, PORT, SIMS, MACROS, CASES, RECIPES, STATE_FILE, LOCK_FILE, AGENT_LOG, IDLE_MIN, LOCK_WAIT
     global PIPELINE_BOMBA, GUI_TTL, POLL_S, _inject_local, _gui_cache, _list_procs, _iter_hist, _iter_pid
     global WORK, RES_DIR, TIEMPOS, RES_ON, RES_HB_STALE, RES_START_WAIT, _res_off_until, _javac, _run_javac, _precompile
-    global PANEL_ESTADO, VIGILANTE_ON, VIGILANTE_S, PROG_EVERY_S, CANCEL_GRACE_S
+    global PANEL_ESTADO, VIGILANTE_ON, VIGILANTE_S, PROG_EVERY_S, CANCEL_GRACE_S, CANCEL_BLOCK_X
     import tempfile
     t_all = time.time()
     agent_log_real = AGENT_LOG
@@ -3291,6 +3421,17 @@ def _selftest() -> int:
         check(r["via"] == "residente" and _res_waits == 1 and (RES_DIR / "heartbeat").is_file()
               and "INIT autosave off" in (_state().get("init") or ""),
               f"la primera inyección espera el latido del residente y corre antes la macro de init ({_state().get('init')!r})")
+        # PID reasignado: la hora de creación guardada al lanzar manda sobre el nombre del exe (un python ajeno se mataba con /T /F)
+        me_ct = _proc_ctime(os.getpid())
+        t_pid = time.perf_counter()
+        for _ in range(200):
+            _pid_is_ours(os.getpid(), me_ct)
+        ms_pid = (time.perf_counter() - t_pid) * 5  # ms por llamada
+        check(os.name != "nt" or (me_ct and 0 <= time.time() - me_ct < 7 * 86400 and _pid_is_ours(os.getpid(), me_ct)
+                                  and not _pid_is_ours(os.getpid(), me_ct - 5000) and _pid_is_ours(os.getpid()) and ms_pid < 5),
+              f"_pid_is_ours compara la hora de creación guardada: el mismo proceso sí, un PID 'reasignado' no ({ms_pid:.3f} ms por sondeo)")
+        check(os.name != "nt" or (isinstance(st.get("t_create"), float) and _pid_is_ours(st["pid"], st["t_create"]) and _state().get("t_create") == st["t_create"]),
+              f".server.json guarda t_create (hora de creación del lanzador) y _pid_is_ours lo acepta ({st.get('t_create')})")
         check(not LOCK_FILE.exists(), "el turno se libera al terminar la tool")
         r = run_java('sim.println("AGENT_FAKE_FAIL");\nsim.println("no llega");')
         check(not r["ok"] and r["exception"] and "fallo simulado" in r["exception"], "run_java captura excepción")
@@ -3580,12 +3721,24 @@ def _selftest() -> int:
         procs_f.write_text(json.dumps([{"pid": 77, "name": "starccm+.exe", "cmd": f'"C:\\x\\starccm+.exe" -host localhost:{PORT}'}]),
                            encoding="utf-8")
         venv_env = {"COPILOTO_WORK": str(WORK), "COPILOTO_AGENT_LOG": str(AGENT_LOG), "COPILOTO_VIGILANTE_S": "0.25",
-                    "COPILOTO_VIG_GONE_S": "1", "STARCCM_TEST_PROCS": str(procs_f), "STARCCM_IDLE_MIN": "0.012"}
+                    "COPILOTO_VIG_GONE_S": "1", "STARCCM_TEST_PROCS": str(procs_f), "STARCCM_IDLE_MIN": "0.012",
+                    "COPILOTO_TEST_VIG_BLOCK_S": "2.0"}  # el primer chequeo del vigilante dura 2 s (como un server_stop largo)
         saved_env = {k: os.environ.get(k) for k in venv_env}
         os.environ.update(venv_env)
         VIGILANTE_ON, VIGILANTE_S = True, 0.25
         try:
-            v = _vigilante_ensure(PORT)
+            ss0 = server_status()
+            v = vigilante_relanzar()  # lo que hace el panel con `--cli vigilante_relanzar` cuando server_status dice vigilante_muerto
+            ve0 = _vig_info(PORT)
+            time.sleep(1.0)  # el primer chequeo del vigilante está bloqueado (2 s): el latido sigue por su hilo
+            ve1 = _vig_info(PORT)
+            ic_b = _state().get("idle_checked")
+            ss1 = server_status()
+            check(ss0.get("vigilante_muerto") is True and ss0.get("vigilante_vivo") is False and ss1.get("vigilante_vivo") is True
+                  and ss1.get("vigilante_muerto") is False and ss1.get("vigilante") == v["vigilante"],
+                  f"server_status dice vigilante_muerto sin vigilante y vigilante_vivo tras vigilante_relanzar ({ss0.get('vigilante_muerto')}, {ss1.get('vigilante_vivo')})")
+            check(ve0.get("pid") and ve1.get("t", 0) - ve0.get("t", 0) >= 0.7 and ic_b is None and _vigilante_pid(PORT),
+                  f"vigilante: el latido NO depende de terminar cada vuelta (hilo aparte): sigue latiendo con el chequeo bloqueado ({ve1.get('t', 0) - ve0.get('t', 0):.1f} s)")
             end = time.time() + 15
             while time.time() < end and not _state().get("idle_warning"):
                 time.sleep(0.2)
@@ -3734,6 +3887,11 @@ def _selftest() -> int:
         check(pg.get("terminado") and pg.get("tool") == "pump_case" and pg.get("caso") == "BombaFalsa"
               and (pg.get("resultado") or {}).get("iterate", {}).get("stopped") == "stable" and (pg.get("resultado") or {}).get("RESULT", {}).get("H") == 16.5,
               f"progreso.json de pump_case con iterate: terminado, caso y resultado ({ (pg.get('resultado') or {}).get('iterate') })")
+        r = pump_case("BombaFalsa", str(cad), params={"cancelado": True}, until="stable", n=600)
+        check(r["ok"] is False and r.get("cancelled") is True and r.get("stopped") == "cancelled" and "iterate" not in r
+              and r.get("resultados") == {"H": 15.9, "M": 8.3} and r["parsed"]["RESULT"] == {"H": 15.9, "M": 8.3}
+              and "cancelled" in r["parsed"].get("ITER_STOP", "") and not r.get("macro_abandonada") and not abort_file().exists(),
+              f"pump_case cancelado: ok False, cancelled True y los RESULT parciales (sin iterate ni post) ({r.get('resultados')}; ok {r['ok']})")
         r = pump_case("OtroCaso", str(cad))
         check(r["ok"] is False and "otro .sim" in r.get("error", ""), "pump_case se niega si hay otro .sim cargado")
 
@@ -3825,26 +3983,98 @@ def _selftest() -> int:
         r = iterate(n=20, until="n")
         check(r["ok"] and r["stopped"] == "max" and r["iterations_run"] == 20, "tras un cancel la siguiente corrida itera con normalidad (sin ABORT viejo)")
         abort_file().write_text("viejo", encoding="utf-8")  # un ABORT que quedó de otra corrida no la para
+        _write_json_atomic(cancel_file(), {"t": time.time() - 100})  # ni su cancel.json (la macro de iterar también lo mira)
         r = iterate(n=20, until="n")
-        check(r["ok"] and r["stopped"] == "max" and r["iterations_run"] == 20 and not abort_file().exists(), "un ABORT viejo se borra al empezar una corrida")
+        check(r["ok"] and r["stopped"] == "max" and r["iterations_run"] == 20 and not abort_file().exists() and not cancel_file().exists(),
+              "un ABORT y un cancel.json viejos se borran al empezar una corrida")
 
-        # una macro que NO obedece el ABORT: pasado CANCEL_GRACE_S se abandona (residente relanzado, servidor vivo)
-        ctl.write_text(json.dumps({"delay": 0.03, "ignore_abort": True}))
+        # una macro que NO obedece el ABORT pero AVANZA: no se abandona ni se mata el residente (matar a mitad de step() tumba el
+        # servidor real); se espera el fin del bloque. Con la gracia a 0,8 s el comportamiento viejo la habría matado a los 0,8 s
+        ctl.write_text(json.dumps({"delay": 0.02, "ignore_abort": True}))
         n_launch = _res_launches
-        CANCEL_GRACE_S = 0.8
+        CANCEL_GRACE_S, CANCEL_BLOCK_X = 0.5, 0.0
         base_it = read_progreso().get("iteracion") or 0
-        th_g, box_g = lanzar(n=80, until="n")
+        th_g, box_g = lanzar(n=50, until="n")
         esperar_iteracion(base_it + 5)
         t_g = time.time()
         rg_ = cancel(wait_s=10)
         th_g.join(timeout=20)
         ri_g = box_g.get("r", {})
-        check(rg_["cancelled"] is True and ri_g.get("stopped") == "cancelled" and ri_g.get("ok") is True and alive() and _res_launches == n_launch + 1
-              and not abort_file().exists() and not cancel_file().exists(),
-              f"cancel de una macro que ignora el ABORT: se abandona tras la gracia ({time.time() - t_g:.1f} s), residente relanzado, servidor vivo ({rg_}; {ri_g}; lanzamientos {_res_launches - n_launch})")
+        check(rg_["cancelled"] is True and ri_g.get("stopped") == "cancelled" and ri_g.get("ok") is True and (ri_g.get("iterations_run") or 0) >= 40
+              and not ri_g.get("macro_abandonada") and alive() and _res_launches == n_launch and not abort_file().exists() and not cancel_file().exists(),
+              f"cancel de una macro que ignora el ABORT pero avanza: se espera el fin del bloque, NO se mata el residente ({time.time() - t_g:.1f} s; {rg_.get('cancelled')}; {ri_g.get('iterations_run')} it; lanzamientos {_res_launches - n_launch})")
+        # macro COLGADA (sin sacar nada tras el cancel durante CANCEL_GRACE_S): única que se abandona, y el resultado lo dice
+        ctl.write_text(json.dumps({"delay": 0.02, "ignore_abort": True}))
+        n_launch = _res_launches
+        CANCEL_GRACE_S = 0.3
+        base_it = read_progreso().get("iteracion") or 0
+        th_h, box_h = lanzar(n=60, until="n")
+        esperar_iteracion(base_it + 3)
+        ctl.write_text(json.dumps({"delay": 0.02, "ignore_abort": True, "hang": True}))  # la macro se queda muda
+        time.sleep(0.2)
+        t_h = time.time()
+        rh_ = cancel(wait_s=10)
+        th_h.join(timeout=20)
+        ctl.write_text(json.dumps({"delay": 0.02, "ignore_abort": True}))  # suelta lo que quede del servidor falso (<= 1,2 s)
+        ri_h = box_h.get("r", {})
+        check(rh_["cancelled"] is True and ri_h.get("stopped") == "cancelled" and ri_h.get("ok") is True and "COLGADA" in (ri_h.get("macro_abandonada") or "")
+              and alive() and _res_launches == n_launch + 1 and not abort_file().exists() and not cancel_file().exists(),
+              f"cancel de una macro colgada: se abandona tras la gracia y el resultado lo dice ({time.time() - t_h:.1f} s; {ri_h.get('macro_abandonada')}; lanzamientos {_res_launches - n_launch})")
         ctl.write_text(json.dumps({"delay": 0}))
         r = run_java('sim.println("tras el cancel duro");')
-        check(r["ok"] and r["stdout"] == "tras el cancel duro", "tras el cancel duro el solver sigue sirviendo por el residente nuevo")
+        check(r["ok"] and r["stdout"] == "tras el cancel duro", "tras abandonar la macro colgada el solver sigue sirviendo por el residente nuevo")
+        # la gracia: max(CANCEL_GRACE_S, 3 bloques de 50 it según ritmo_it_s)
+        CANCEL_GRACE_S, CANCEL_BLOCK_X, rate0 = 120.0, 3.0, _prog._rate
+        try:
+            _prog._rate = lambda: 0.1  # 0,1 it/s: un bloque de 50 it tarda 500 s
+            lento = _cancel_stall_s()
+            _prog._rate = lambda: 10.0
+            rapido = _cancel_stall_s()
+            _prog._rate = lambda: None
+            sin_ritmo = _cancel_stall_s()
+        finally:
+            _prog._rate = rate0
+        check(lento == 1500.0 and rapido == 120.0 and sin_ritmo == 120.0,
+              f"gracia del cancel = max(120 s, 3 bloques de 50 it según ritmo_it_s) ({lento}, {rapido}, {sin_ritmo})")
+        CANCEL_GRACE_S, CANCEL_BLOCK_X = 1.5, 3.0
+
+        # cancel con el DUEÑO MUERTO (el panel mató la CLI con «Detener»): la macro sigue iterando en el residente, nadie escribe
+        # progreso.json ni borrará ABORT/cancel.json; cancel() cancela igual, espera el fin de la macro y limpia él
+        ctl.write_text(json.dumps({"delay": 0.02}))
+        muerto = subprocess.Popen([sys.executable, "-c", "pass"])
+        muerto.wait()
+        body_o = _abort_enable_java() + 'sim.getSimulationIterator().step(3000);\nsim.println("ITERATION " + sim.getSimulationIterator().getCurrentIteration());\n'
+        box_o: dict = {}
+        th_o = threading.Thread(target=lambda: box_o.update(r=_inject(body_o, timeout=60, tool="iterate")), daemon=True)
+        th_o.start()
+        t_end = time.time() + 10
+        while time.time() < t_end and not macro_running():
+            time.sleep(0.05)
+        _write_json_atomic(progreso_file(), {"schema": 1, "tool": "pump_case", "fase": "iterar", "iteracion": 100, "terminado": False,
+                                             "pid": muerto.pid, "t": round(time.time(), 2)})
+        sin_dueno = not _progreso_vivo()
+        t_o = time.time()
+        ro_ = cancel(wait_s=10)
+        th_o.join(timeout=15)
+        pgo = read_progreso()
+        check(sin_dueno and ro_["ok"] and ro_["cancelled"] is True and ro_.get("duenio_muerto") is True and ro_["iteracion_en_curso"]
+              and not th_o.is_alive() and (box_o.get("r") or {}).get("ok") is True and not abort_file().exists() and not cancel_file().exists()
+              and pgo.get("terminado") is True and (pgo.get("resultado") or {}).get("huerfana") is True and alive() and not macro_running(),
+              f"cancel con el dueño muerto y la macro iterando: escribe ABORT, espera el fin, limpia ABORT/cancel.json y deja progreso terminado ({time.time() - t_o:.1f} s; {ro_})")
+        ctl.write_text(json.dumps({"delay": 0}))
+        _write_json_atomic(progreso_file(), {"schema": 1, "tool": "pump_case", "fase": "iterar", "terminado": False, "pid": muerto.pid, "t": round(time.time(), 2)})
+        rn_ = cancel()
+        check(rn_["ok"] and rn_["cancelled"] is False and rn_["iteracion_en_curso"] is False and not abort_file().exists() and not cancel_file().exists(),
+              "cancel con dueño muerto pero SIN macro en marcha: no crea ABORT (pararía la próxima corrida)")
+        # red de seguridad del vigilante: un ABORT/cancel.json viejo sin macro ni dueño se borra; uno reciente no
+        _write_json_atomic(cancel_file(), {"t": time.time() - 60})
+        os.utime(cancel_file(), (time.time() - 60, time.time() - 60))
+        abort_file().write_text("viejo", encoding="utf-8")
+        viejo_ok = _cancel_stale_cleanup()
+        _write_json_atomic(cancel_file(), {"t": time.time()})
+        fresco = _cancel_stale_cleanup()
+        check(viejo_ok is True and fresco is False and cancel_file().exists() and not abort_file().exists(), "vigilante: borra un cancel.json/ABORT huérfano de más de 15 s y respeta uno reciente")
+        _cancel_cleanup()
 
         # --cli: acciones directas sin modelo (otro proceso, sin importar mcp)
         cli_env = {**os.environ, "COPILOTO_WORK": str(WORK), "COPILOTO_AGENT_LOG": str(AGENT_LOG), "STARCCM_EXE": str(fake),
@@ -3977,7 +4207,7 @@ def _selftest() -> int:
     return 1 if fails else 0
 
 
-CLI_TOOLS = ("gui_attach", "gui_status", "server_stop", "server_status", "cancel")
+CLI_TOOLS = ("gui_attach", "gui_status", "server_stop", "server_status", "cancel", "vigilante_relanzar")
 
 
 def _cli(argv: list[str]) -> int:

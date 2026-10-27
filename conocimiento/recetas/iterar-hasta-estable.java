@@ -6,11 +6,11 @@
 // PARAMS: case_dir, max_iter, reportes
 // GENERADA con `python pipelines/bomba.py --write-recetas` desde pipelines/bomba.py: no editar a mano (el selftest la compara).
 // Pensada para run_steps: agrupa iterar y post con el cambio de caudal en UNA macro.
-final boolean[] pxCancelado = {false};  // cancel(): el post-proceso que venga detrás no corre
-// --- iterar hasta que los reportes dados se estabilicen (< 0.5 % en 100 iteraciones, comprobado cada 50; máx. ${max_iter}). El residual < 1e-4 NO es condición: se reporta
+final boolean[] pxCancelado = {false};  // cancel(): el post-proceso que venga detras no corre
+// --- iterar hasta que los reportes dados se estabilicen (< 0.5 % en 100 iteraciones, comprobado cada 50; max. ${max_iter}). El residual < 1e-4 NO es condicion: se reporta
 {
   class PxJudge {
-    // muestras {iteración, v1, v2…}; variación relativa máxima (máx−mín)/|media| en la ventana, NaN si aún no hay `win` iteraciones
+    // muestras {iteracion, v1, v2...}; variacion relativa maxima (max-min)/|media| en la ventana, NaN si aun no hay `win` iteraciones
     double var(java.util.List<double[]> h, int win) {
       double cur = h.get(h.size() - 1)[0];
       if (h.get(0)[0] > cur - win) return Double.NaN;
@@ -31,8 +31,8 @@ final boolean[] pxCancelado = {false};  // cancel(): el post-proceso que venga d
   java.util.ArrayList<double[]> pxHist = new java.util.ArrayList<double[]>();
   int pxIt0 = sim.getSimulationIterator().getCurrentIteration(), pxCur = pxIt0;
   String pxWhy = "max"; double pxVar = Double.NaN; long pxT0 = System.currentTimeMillis();
-  // cancel() crea este archivo: el criterio «Stop File» corta step() y el bucle no pide más bloques. Se activa aquí porque el
-  // nodo solo existe con la física creada (server_start lo intenta con la sim vacía y no lo encuentra; visto con el solver real)
+  // cancel() crea este archivo: el criterio "Stop File" corta step() y el bucle no pide mas bloques. Se activa aqui porque el
+  // nodo solo existe con la fisica creada (server_start lo intenta con la sim vacia y no lo encuentra; visto con el solver real)
   String pxAbort = "", pxCanF = "";  // pxCanF (cancel.json del MCP): por si STAR-CCM+ borra el ABORT al pararse
   class PxCan { boolean c() { return (!pxAbort.isEmpty() && new java.io.File(pxAbort).exists()) || (!pxCanF.isEmpty() && new java.io.File(pxCanF).exists()); } }
   PxCan pxCan = new PxCan();
@@ -76,9 +76,14 @@ final boolean[] pxCancelado = {false};  // cancel(): el post-proceso que venga d
   } catch (Exception ex) { sim.println("WARN\tno pude leer los residuales: " + ex); }
   boolean pxPlat = !Double.isNaN(pxOld) && !Double.isNaN(pxRes) && pxRes >= 0.9 * pxOld;
   sim.println("RESIDUAL\t" + pxRes + "\t(1e-4 solo informativo: " + (pxRes < 1e-4 ? "cumplido" : "no alcanzado; no condiciona") + ")");
-  if (pxPlat) sim.println("AVISO\tmeseta de residuales: el mayor residual no bajó un 10 % en " + pxPl + " iteraciones (normal en frozen rotor, ~1e-2)");
+  if (pxPlat) sim.println("AVISO\tmeseta de residuales: el mayor residual no bajo un 10 % en " + pxPl + " iteraciones (normal en frozen rotor, ~1e-2)");
   if (pxWhy.equals("max")) sim.println("AVISO\t" + String.join(" y ", pxNm) + " no se estabilizaron en " + pxMax + " iteraciones: no dar el resultado como convergido");
-  if (pxWhy.equals("diverge")) sim.println("AVISO\tdiverge: " + String.join(" o ", pxNm) + " no son números; parar y revisar interfaces y fronteras");
+  if (pxWhy.equals("diverge")) sim.println("AVISO\tdiverge: " + String.join(" o ", pxNm) + " no son numeros; parar y revisar interfaces y fronteras");
   pxCancelado[0] = pxWhy.equals("cancelled");
-  sim.println("ITER_STOP\t" + pxWhy + "\titeraciones " + (pxCur - pxIt0) + "\titeración " + pxCur + "\tvariación_max_% " + pxVar * 100 + "\tmeseta " + pxPlat + "\t" + (System.currentTimeMillis() - pxT0) / 1000.0 + " s");
+  if (pxCancelado[0] && pxCur >= 1) {  // cancel(): la solucion parcial (hasta la ultima iteracion) sale como RESULT, sin escenas: pump_case no devuelve `parsed` vacio
+    java.util.LinkedHashSet<String> pxRn = new java.util.LinkedHashSet<String>(java.util.Arrays.asList("H", "M", "P_hid", "P_eje", "eta", "Q_in", "Q_out", "H_Euler", "eta_Euler"));
+    pxRn.addAll(java.util.Arrays.asList(pxNm));
+    for (String pxK : pxRn) { try { sim.println("RESULT\t" + pxK + "\t" + sim.getReportManager().getReport(pxK).getReportMonitorValue()); } catch (Exception pxE) { } }
+  }
+  sim.println("ITER_STOP\t" + pxWhy + "\titeraciones " + (pxCur - pxIt0) + "\titeracion " + pxCur + "\tvariacion_max_pct " + pxVar * 100 + "\tmeseta " + pxPlat + "\t" + (System.currentTimeMillis() - pxT0) / 1000.0 + " s");
 }

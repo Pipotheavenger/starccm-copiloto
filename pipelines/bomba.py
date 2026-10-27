@@ -41,10 +41,24 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def _asc(t: str) -> str:
+    """Texto de las PLANTILLAS Java en ASCII puro (sin tildes, ñ ni símbolos). Lo que imprime sim.println sale por la consola cp1252 y
+    una tilde llega como mojibake («iteraciÃ³n», visto con el solver real 2026-10-26); una clave con tilde rompe cualquier regex.
+    Solo se aplica a las plantillas, nunca a rutas ni nombres del usuario."""
+    for a, b in (("«", '"'), ("»", '"'), ("≥", ">="), ("≤", "<="), ("≠", "!="), ("≈", "~"), ("→", "->"), ("Δ", "d"), ("–", "-"), ("—", "-"), ("−", "-"),
+                 ("·", "."), ("×", "x"), ("º", "o"), ("°", " deg"), ("¿", ""), ("¡", "")):
+        t = t.replace(a, b)
+    t = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
+    return t.encode("ascii", "replace").decode("ascii")
+
+
 RECETA_EULER = HERE.parent / "conocimiento" / "recetas" / "reportes-euler-triangulos.java"
 G = 9.80665
 # criterio de parada por defecto (CLAUDE.md § Velocidad): H y M estables, no residual < 1e-4
@@ -191,7 +205,7 @@ def estimate_d2_mm(cad_dir: str, ccm: dict) -> float | None:
 
 # ----------------------------------------------------------------------------- recetas de Euler
 def _euler_text(ccm: dict, params: dict) -> str:
-    txt = RECETA_EULER.read_text(encoding="utf-8")
+    txt = _asc(RECETA_EULER.read_text(encoding="utf-8"))
     lines = [ln for ln in txt.splitlines() if not ln.startswith("//")]
     txt = "\n".join(lines)
     a = 'boolean turbina = "MODO".trim().equalsIgnoreCase("turbina");'
@@ -213,7 +227,7 @@ def _euler_text(ccm: dict, params: dict) -> str:
 
 def euler_check_body(params: dict | None = None) -> str:
     """Solo la validación de Euler (UVu2 ≠ UVu1, H_Euler > H): correr tras iterar con los reportes ya creados."""
-    txt = RECETA_EULER.read_text(encoding="utf-8")
+    txt = _asc(RECETA_EULER.read_text(encoding="utf-8"))
     i = txt.index("// ---- VALIDACION")
     j = txt.index("for (Report r : reps) { String v;")  # la última: la primera (monitores) queda antes de VALIDACION
     return ('{\nboolean turbina = false; String hrep = "H"; ReportManager rm = sim.getReportManager();\n'
@@ -299,7 +313,12 @@ ITERAR = r'''final boolean[] pxCancelado = {false};  // cancel(): el post-proces
   if (pxWhy.equals("max")) sim.println("AVISO\t" + String.join(" y ", pxNm) + " no se estabilizaron en " + pxMax + " iteraciones: no dar el resultado como convergido");
   if (pxWhy.equals("diverge")) sim.println("AVISO\tdiverge: " + String.join(" o ", pxNm) + " no son números; parar y revisar interfaces y fronteras");
   pxCancelado[0] = pxWhy.equals("cancelled");
-  sim.println("ITER_STOP\t" + pxWhy + "\titeraciones " + (pxCur - pxIt0) + "\titeración " + pxCur + "\tvariación_max_% " + pxVar * 100 + "\tmeseta " + pxPlat + "\t" + (System.currentTimeMillis() - pxT0) / 1000.0 + " s");
+  if (pxCancelado[0] && pxCur >= 1) {  // cancel(): la solucion parcial (hasta la ultima iteracion) sale como RESULT, sin escenas: pump_case no devuelve `parsed` vacio
+    java.util.LinkedHashSet<String> pxRn = new java.util.LinkedHashSet<String>(java.util.Arrays.asList("H", "M", "P_hid", "P_eje", "eta", "Q_in", "Q_out", "H_Euler", "eta_Euler"));
+    pxRn.addAll(java.util.Arrays.asList(pxNm));
+    for (String pxK : pxRn) { try { sim.println("RESULT\t" + pxK + "\t" + sim.getReportManager().getReport(pxK).getReportMonitorValue()); } catch (Exception pxE) { } }
+  }
+  sim.println("ITER_STOP\t" + pxWhy + "\titeraciones " + (pxCur - pxIt0) + "\titeracion " + pxCur + "\tvariacion_max_pct " + pxVar * 100 + "\tmeseta " + pxPlat + "\t" + (System.currentTimeMillis() - pxT0) / 1000.0 + " s");
 }'''
 
 POST = r'''// --- post-proceso: planos auto, escenas a PNG (presión en álabes, velocidad relativa en plano medio, y+), resultados
@@ -473,10 +492,10 @@ def iterate_body(case_dir: str, params: dict | None = None) -> str:
     names = [str(x) for x in (params.get("reportes") or ["H", "M"])]
     csv = _j((Path(case_dir) / "reports" / "residuals_pipe.csv").as_posix())
     rep = {"TOLPCT": f"{st['tol'] * 100:g}", "WIN": str(st["ventana"]), "BLK": str(st["bloque"]), "MAX": str(st["max_iter"]),
-           "PL": str(st["meseta"]), "TOL": _num(st["tol"]), "CSV": csv, "JUDGE": JUDGE,
+           "PL": str(st["meseta"]), "TOL": _num(st["tol"]), "CSV": csv, "JUDGE": _asc(JUDGE),
            "REPS": _arr(names), "NOMBRES": " y ".join(names), "ABORT": _j(str(params.get("abort_file") or "")),
            "CANCELF": _j(str(params.get("cancel_file") or ""))}
-    out = ITERAR
+    out = _asc(ITERAR)
     for k, v in rep.items():
         out = out.replace(f"@@{k}@@", v)
     return out + "\n"
@@ -491,11 +510,11 @@ def post_body(case_dir: str, params: dict | None = None) -> str:
     img = _j((Path(case_dir) / "images").as_posix())
     rep = {"IMG": img, "W": str(int(params.get("img_ancho") or 1600)), "HT": str(int(params.get("img_alto") or 1000)),
            "PNG": "true" if params.get("post_png", True) else "false"}
-    out = POST
+    out = _asc(POST)
     for k, v in rep.items():
         out = out.replace(f"@@{k}@@", v)
     if params.get("post_euler", True):
-        out += "\n// --- validación de Euler con la solución (AVISO / EULER_MAL / EULER_OK)\n" + euler_check_body(params)
+        out += "\n// --- validacion de Euler con la solucion (AVISO / EULER_MAL / EULER_OK)\n" + euler_check_body(params)
     return out + "\n"
 
 
@@ -514,7 +533,7 @@ def recetas() -> dict:
     """{archivo: texto} de las recetas que expone el pipeline para run_steps (misma lógica que iterar/post de la macro)."""
     it = iterate_body("@CASE@", {"reportes": ["@REPS@"]})
     it = it.replace('{"@REPS@"}', "{${reportes}}").replace("pxMax = 1000,", "pxMax = ${max_iter},").replace("@CASE@", "${case_dir}")
-    it = it.replace("iterar hasta que @REPS@", "iterar hasta que los reportes dados").replace("máx. 1000)", "máx. ${max_iter})")
+    it = it.replace("iterar hasta que @REPS@", "iterar hasta que los reportes dados").replace("max. 1000)", "max. ${max_iter})")
     po = post_body("@CASE@", {}).replace("@CASE@", "${case_dir}")
     return {
         "iterar-hasta-estable.java": _CABECERA.format(
@@ -792,7 +811,7 @@ def macro_body(case_dir: str, cad_dir: str, ccm: dict, mode: str = "rapida", par
     pipe = lambda ph: f'sim.println("PIPE {ph} " + (System.currentTimeMillis() - pipeT[0]) / 1000.0); pipeT[0] = System.currentTimeMillis();'
     euler = ""
     if params.get("euler", True):
-        euler = EULER_WRAP.replace("@@TXT@@", _euler_text(ccm, params))
+        euler = _asc(EULER_WRAP).replace("@@TXT@@", _euler_text(ccm, params))
     rep = {
         "CASO": Path(case_dir).name, "MODO": mode, "CAD": _j(Path(cad_dir).resolve().as_posix()),
         "ZNOM": _arr([z["region"] for z in zones]), "ZSTP": _arr([z["step"] for z in zones]),
@@ -806,13 +825,13 @@ def macro_body(case_dir: str, cad_dir: str, ccm: dict, mode: str = "rapida", par
         "RHO": _num(rho), "MU": _num(mu), "FLUJO": _num(flujo), "PTOTAL": _num(params.get("ptotal", 0.0)),
         "RPMABS": _num(abs(zones[zr]["rpm"])), "BASE": _num(base), "PRISMAS": str(prismas),
     }
-    out = TEMPLATE
+    out = _asc(TEMPLATE)
     for k, v in rep.items():
         out = out.replace(f"@@{k}@@", v)
     out = out.replace("@@MODELOS_EXTRA@@", "\n".join(extra))
     out = out.replace("@@EULER@@", euler)
     post_on, iter_on = bool(params.get("post")), bool(params.get("iterar"))
-    out = out.replace("@@ESCENA@@", ESCENA if params.get("escena", True) and not post_on else "")  # con post, la escena sale con datos
+    out = out.replace("@@ESCENA@@", _asc(ESCENA) if params.get("escena", True) and not post_on else "")  # con post, la escena sale con datos
     it_txt = ""
     if iter_on:  # la validación de Euler va tras el bucle estable (si no hay post, que la trae post_body)
         it_txt = iterate_body(case_dir, params) + ("\n" + euler_check_body(params) if params.get("euler", True) and not post_on else "") + "@@PIPE:iterar@@"
@@ -979,6 +998,17 @@ def selftest() -> int:
     check(full.count('createScene("presion_alabes")') == 1, "con post no se duplica la escena previa de presión")
     err = compile_java(full, "full", tmp)
     check(err in (None, "SKIP"), "javac macro rápida con iterar+post" + ("" if err in (None, "SKIP") else "\n" + str(err)))
+    # marcadores en ASCII puro (la consola cp1252 los rompía: «iteraciÃ³n»): nada fuera de ASCII en la macro entera ni en las recetas
+    no_asc = [ln.strip()[:70] for ln in (full + solo + post_body(str(tmp / "caso")) + "".join(recetas().values())).splitlines()
+              if any(ord(c) > 127 for c in ln) and "println" in ln]
+    check(not no_asc, f"todo sim.println de la macro y de las recetas es ASCII puro ({no_asc[:2]})")
+    k_stop = full[full.index('sim.println("ITER_STOP'):].splitlines()[0]
+    check(all(x in k_stop for x in ("iteraciones ", "iteracion ", "variacion_max_pct ", "meseta ")) and not any(ord(c) > 127 for c in full.split("// ===== pipeline", 1)[-1]),
+          "ITER_STOP lleva claves ASCII (iteracion, variacion_max_pct) y la macro generada no trae un solo caracter no ASCII")
+    check("?" not in _asc("máx−mín ≥ Δ «x» … ñ°"), "_asc mapea los simbolos habituales (sin interrogaciones)")
+    k_can = full[full.index('if (pxCancelado[0] && pxCur >= 1)'):full.index('sim.println("ITER_STOP')]
+    check('"RESULT\\t" + pxK' in k_can and '"H", "M", "P_hid", "P_eje", "eta"' in k_can and "createScene" not in k_can and full.index("pxCancelado[0] && pxCur") < full.index("ITER_STOP"),
+          "cancelado: la macro imprime los RESULT parciales (H, M, eta, H_Euler...) antes de ITER_STOP, sin escenas")
     check("pxMax = 300," in macro_body(str(tmp / "c"), cad, ccm, "rapida", {"iterar": 300}), "iterar=300 cambia el máximo")
     sin = macro_body(str(tmp / "c"), cad, ccm, "rapida", {})
     check("ITER_STOP" not in sin and "POST_SECONDS" not in sin and 'createScene("presion_alabes")' in sin, "por defecto la macro no itera ni hace post")
