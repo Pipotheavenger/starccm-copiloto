@@ -2071,7 +2071,7 @@ def read_progreso() -> dict:
 def _progreso_vivo(p: dict | None = None, max_age: float = 10.0) -> bool:
     """¿Hay una corrida escribiendo progreso ahora (no terminada, latido reciente, proceso dueño vivo)?"""
     p = read_progreso() if p is None else p
-    return bool(p) and not p.get("terminado") and time.time() - float(p.get("t") or 0) < max_age and _pid_alive(int(p.get("pid") or 0))
+    return bool(p) and not p.get("terminado") and time.time() - float(p.get("t") or 0) < max_age and _owner_alive(p)  # pid + hora de creación
 
 
 def _cancel_requested() -> bool:

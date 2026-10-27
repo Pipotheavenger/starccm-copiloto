@@ -653,6 +653,7 @@ class Panel:
         self.vis: tuple = (False, False, False, False)  # vigilante, horas, idle_warning, progreso
         self.cli_t0: dict[str, float] = {}
         self.cancel_pending = False  # cancel «pendiente» en vigilancia
+        self.orphan_key = None  # (caso, fase) de la macro sin dueño ya avisada
         self.auto_cancel = False  # el cancel lo pidió Detener (no el usuario): si no para, avisa del solver cobrando
         self.empty = None
         root.title("Copiloto STAR-CCM+")
@@ -957,6 +958,23 @@ class Panel:
         pr = self.prog
         return bool((pr and (pr["active"] or pr["abierto"])) or lock_info(self.repo, self.sdir))
 
+    def watch_orphan(self, pr) -> bool:
+        """Macro sin dueño: progreso.json sin terminar y sin actualizar (el MCP que la lanzó murió: panel cerrado, CLI matada)
+        con el solver vivo. Sigue corriendo y cobrando; nadie más lo avisaría. Una vez por macro: aviso + «Parar la macro»."""
+        if (not pr or pr["active"] or not pr["abierto"] or self.runner.busy or self.cancel_pending or "cancel" in self.cli_active
+                or self.closed or not read_status(self.repo, self.sdir)["solver"]):
+            return False
+        key = (pr["caso"], pr["fase"])
+        if self.orphan_key != key:
+            self.orphan_key = key
+            self.say(f"Hay una macro sin dueño en el solver ({pr['caso'] or '?'}, fase «{pr['fase']}»): nadie la vigila y la "
+                     "licencia sigue cobrando. Puedes pararla (sin apagar) o apagar el solver.", "err")
+            self.cancel_btn = self.chat_button("Parar la macro", lambda: self.direct("cancel"), "detener")
+            self.put("  ")
+            self.stop_btn = self.chat_button("Apagar solver", lambda: self.twice("huerfana", self.stop_btn, "Apagar solver", self.on_off_now), "apagar")
+            self.put("\n")
+        return True
+
     def watch_pending(self):
         """Cancel «pendiente»: el estado sigue visible hasta que progreso.json diga terminado; avisa al terminar."""
         if not self.cancel_pending or self.closed:
@@ -1246,7 +1264,8 @@ class Panel:
     def refresh_progress(self, reschedule=True):
         pr = self.prog = read_progress(self.repo, self.sdir)
         self.watch_pending()
-        show = bool(pr and (pr["active"] or (self.cancel_pending and pr["abierto"])))
+        orphan = self.watch_orphan(pr)
+        show = bool(pr and (pr["active"] or ((self.cancel_pending or orphan) and pr["abierto"])))
         if show:
             self.p_title.config(text=f"● {pr['caso'] or 'Cálculo'} · {pr['fase'].capitalize()}")
             self.p_rest.config(text=fresta(pr["resta"]))
@@ -1405,7 +1424,10 @@ def selftest():
         old = time.time() - 300
         os.utime(pj, (old, old))
         p.refresh_progress(reschedule=False)
-        check(p.card.winfo_manager() == "" and read_progress(trepo, tmp_sd)["active"] is False, "progreso.json abandonado (> 45 s): la tarjeta se oculta")
+        viva = read_status(trepo, tmp_sd)["solver"]  # con el solver vivo, abandonado = macro sin dueño: tarjeta y aviso (no se oculta)
+        check(read_progress(trepo, tmp_sd)["active"] is False and (p.card.winfo_manager() == "pack" and p.orphan_key is not None if viva
+                                                                   else p.card.winfo_manager() == ""),
+              "progreso.json abandonado (> 45 s): no «activo»; tarjeta oculta sin solver, o aviso de macro sin dueño con solver vivo")
         # vigilante caído
         sj.write_text(json.dumps({**base, "idle_checked": (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds")}))
         p.refresh()
@@ -1638,6 +1660,19 @@ def selftest():
         os.utime(pj, (time.time() - 300, time.time() - 300))
         p.refresh_progress(reschedule=False)
         check(not p.progress_active() and p.prog["abierto"], "progreso viejo sin terminar: no «activo» pero sí «abierto»")
+        # macro sin dueño con el solver vivo (panel reabierto, CLI muerta): aviso UNA vez, tarjeta y «Parar la macro» -> cancel
+        if read_status(trepo, tmp_sd)["solver"]:
+            p.orphan_key = None
+            n0, n_c = len(txt()), ncalls("cancel")
+            p.refresh_progress(reschedule=False)
+            p.refresh_progress(reschedule=False)
+            t_o = txt()[n0:]
+            check(t_o.count("macro sin dueño") == 1 and p.card.winfo_manager() == "pack" and p.cancel_btn.cget("text") == "Parar la macro",
+                  "macro sin dueño: un solo aviso, tarjeta visible y botón «Parar la macro»")
+            p.cancel_btn.invoke()
+            check(spin(lambda: ncalls("cancel") == n_c + 1 and not p.cli_active, 10), "«Parar la macro» llama a --cli cancel")
+        else:
+            check(False, "macro sin dueño: el selftest necesita el solver falso vivo en este punto")
         n_c = ncalls("cancel")
         p.on_send("x")
         spin(lambda: p.runner.busy, 5)
