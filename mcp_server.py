@@ -209,19 +209,28 @@ def _state() -> dict:
     return {}
 
 
-def _write_state(d: dict) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(f".{os.getpid()}.tmp")  # un tmp por proceso: el vigilante y el MCP escriben a la vez (visto: WinError 5)
-    tmp.write_text(json.dumps(d, indent=1, ensure_ascii=False), encoding="utf-8")
-    for i in range(6):  # Windows: replace falla un instante si otro proceso lo está leyendo
+def _replace_retry(tmp: Path, dst: Path, tries: int = 8) -> None:
+    """os.replace con reintentos: en Windows falla con WinError 5 si otro proceso tiene `dst` abierto un instante (visto con el
+    vigilante, que moría en su primer latido y dejaba el solver sin apagado por inactividad)."""
+    for i in range(tries):
         try:
-            tmp.replace(STATE_FILE)
+            os.replace(tmp, dst)
             return
         except PermissionError:
-            if i == 5:
-                tmp.unlink(missing_ok=True)
+            if i == tries - 1:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
                 raise
-            time.sleep(0.05 * (i + 1))
+            time.sleep(0.03 * (i + 1))
+
+
+def _write_state(d: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")  # un tmp por proceso: el vigilante y el MCP escriben a la vez (visto: WinError 5)
+    tmp.write_text(json.dumps(d, indent=1, ensure_ascii=False), encoding="utf-8")
+    _replace_retry(tmp, STATE_FILE)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -361,9 +370,9 @@ def _write_panel_estado() -> None:
     except (OSError, ValueError):
         pass
     try:
-        tmp = PANEL_ESTADO.with_suffix(".tmp")
+        tmp = PANEL_ESTADO.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(d, indent=1, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, PANEL_ESTADO)
+        _replace_retry(tmp, PANEL_ESTADO)
     except OSError:
         pass
 
@@ -715,7 +724,7 @@ def _vigilante_main(port: int) -> int:
         f.parent.mkdir(parents=True, exist_ok=True)
         tmp = f.with_suffix(f".{threading.get_ident()}.tmp")  # un tmp por hilo: el latido y el chequeo escriben a la vez
         tmp.write_text(json.dumps({"pid": me, "port": port, "t": time.time(), "every_s": VIGILANTE_S}), encoding="utf-8")
-        os.replace(tmp, f)
+        _replace_retry(tmp, f)
 
     def latido() -> None:  # hilo aparte: un _idle_stop → server_stop largo (guardar un .sim grande) no puede hacerlo pasar por muerto
         while not parar.wait(min(5.0, VIGILANTE_S)):
@@ -724,7 +733,10 @@ def _vigilante_main(port: int) -> int:
             except OSError:
                 pass
 
-    beat()
+    try:
+        beat()
+    except OSError as e:  # el latido del hilo lo reintenta en 5 s: no morir por un archivo ocupado
+        _log(f"vigilante {me}: primer latido falló ({e}); sigo")
     threading.Thread(target=latido, daemon=True).start()
     _log(f"vigilante {me} vigila el puerto {port} (cada {VIGILANTE_S:g} s, apaga a los {IDLE_MIN:g} min sin GUI)")
     last, gone_since = 0.0, None
@@ -1596,11 +1608,11 @@ def abort_file() -> Path:
 
 def _write_json_atomic(path: Path, d: dict) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
     for _ in range(4):  # (Windows: replace falla un instante si el panel lo tiene abierto)
         try:
             tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, path)
+            _replace_retry(tmp, path, tries=3)
             return True
         except OSError:
             time.sleep(0.05)

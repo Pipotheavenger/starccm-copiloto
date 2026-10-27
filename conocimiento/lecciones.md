@@ -223,6 +223,11 @@ Fechas 2026-10-23 salvo indicación. Las del remoto y la UI web: `conocimiento/C
   archivo exista y deje de crecer (informe PDF = receta `informe-detalle`, reflexión + try/catch).
 
 ### Servidor y operación
+- 2026-10-26 · Camino del panel probado con solver real (`tests/real_panel_e2e.py`): `claude -p` → MCP → pump_case; «Detener» a
+  la iteración 100 mata la CLI y su MCP (dueño del turno); `--cli cancel` ve el dueño muerto, pone ABORT y la macro para en 13 s
+  con el servidor vivo; apagado 6,6 s. Corrida completa: 162 s de punta a punta.
+- 2026-10-26 · En Windows `os.replace` sobre un JSON que otro proceso tiene abierto falla con WinError 5. El vigilante moría en su
+  primer latido y el solver quedaba sin apagado por inactividad. Todos los JSON de estado usan `_replace_retry` y un tmp por hilo.
 - 2026-10-26 · Cancelar con el solver real (BombaRapida, 3 pruebas): el criterio «Stop File» activo (`STOPFILE` en la salida)
   no cortó el `step(50)` en curso: siguió de la 101 a la 150. Respaldo `getSimulationIterator().stop()` desde un segundo cliente
   batch con el residente en `step()`: el servidor murió («Connection reset») las dos veces. Ahora el bucle de la macro mira ABORT
