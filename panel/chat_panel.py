@@ -497,7 +497,9 @@ def fmt_cli(tool: str, res: dict) -> tuple[str, bool]:
             return f"{label}: " + str(res.get("reason") or res.get("mensaje") or res.get("msg") or
                                       "pendiente: la macro parará al terminar la fase en curso"), True
         if res["cancelled"]:
-            return f"{label}: paró en la iteración {res.get('iteracion', '?')}", True
+            if res.get("iteracion") is None:  # cancel durante importar/mallar: la macro paró antes de iterar
+                return f"{label}: paró antes de iterar" + (f" (al terminar la fase «{res['fase']}»)" if res.get("fase") else ""), True
+            return f"{label}: paró en la iteración {res['iteracion']}", True
         if res.get("reason"):
             return f"{label}: {res['reason']}", res.get("ok", True) is not False
     for k in ("msg", "mensaje", "message", "resumen", "summary", "status", "estado"):
@@ -1003,6 +1005,8 @@ class Panel:
         w, act = stop_warning(self.repo, self.sdir), self.progress_active()
         if (not w and not act) or self.closed:
             return
+        if self.auto_cancel:  # el cancel ya está pedido: su resultado (paró / pendiente / no paró) dice si sigue cobrando
+            return
         if w:
             self.say(w, "err")
         if act and self.auto_cancel:
@@ -1444,6 +1448,9 @@ def selftest():
         check(cli_cmd("cancel", {"a": 1})[-3:] == ["--cli", "cancel", '{"a": 1}'], "cli_cmd: mcp_server.py --cli herramienta json")
         txt, ok = fmt_cli("cancel", {"ok": True, "cancelado": True})
         check(ok and txt.startswith("Parar iteraciones:") and fmt_cli("gui_attach", {"error": "x"}) == ("Abrir GUI: x", False), "fmt_cli: texto del resultado")
+        check(fmt_cli("cancel", {"cancelled": True, "iteracion": None, "fase": "mallar"})[0] == "Parar iteraciones: paró antes de iterar (al terminar la fase «mallar»)"
+              and fmt_cli("cancel", {"cancelled": True, "iteracion": 104})[0] == "Parar iteraciones: paró en la iteración 104",
+              "fmt_cli: cancel en la malla dice «paró antes de iterar» (visto con el solver real: «iteración None»)")
         # Detener con progreso activo: ofrece «Parar iteraciones»
         pj.write_text(json.dumps({"caso": "BombaX", "fase": "iterando", "iteracion": 10, "iteraciones": 250}))
         p.refresh_progress(reschedule=False)

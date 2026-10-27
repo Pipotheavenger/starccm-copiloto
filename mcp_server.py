@@ -3143,6 +3143,7 @@ def pump_case(case: str, cad_dir: str, mode: str = "rapida", ccm: str = "", para
                "stdout": r["stdout"][-3000:], **_err(r)}
         if r.get("cancelled") or "ITER_STOP\tcancelled" in r["stdout"]:  # la macro vio el ABORT y paró sola: sin post, servidor intacto
             out.update(ok=False, cancelled=True, stopped="cancelled", resultados=dict(out["parsed"].get("RESULT") or {}))
+            out.setdefault("error", "cancelado por el usuario: sin post; `resultados` es la solución parcial (no convergida)")
             if r.get("abandoned"):
                 out["macro_abandonada"] = r.get("exception")
             if "ITER_STOP\tcancelled" in r["stdout"]:
